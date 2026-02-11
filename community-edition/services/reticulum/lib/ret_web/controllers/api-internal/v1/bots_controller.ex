@@ -47,13 +47,15 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     end
   end
 
-  defp normalize_integer(value, _default) when is_integer(value), do: value
+  defp normalize_integer(value, _default) when is_integer(value), do: value |> max(0) |> min(5)
 
   defp normalize_integer(value, default) when is_binary(value) do
     case Integer.parse(value) do
       {parsed, ""} -> parsed
       _ -> default
     end
+    |> max(0)
+    |> min(5)
   end
 
   defp normalize_integer(_, default), do: default

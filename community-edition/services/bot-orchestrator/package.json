@@ -4,9 +4,13 @@
   "private": true,
   "main": "app.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "runner": "node run-bot.js"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "docopt": "^0.6.2",
+    "express": "^4.21.2",
+    "puppeteer-core": "^24.28.0",
+    "query-string": "^9.3.1"
   }
 }

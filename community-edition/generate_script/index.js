@@ -198,6 +198,15 @@ function main() {
       {"schema": "yaml-1.1"} // required to load yes/no as boolean values
     );
 
+    // Backward compatibility for older local files that still use OPENAI.
+    if (!processedConfig.OPENAI_API_KEY && processedConfig.OPENAI) {
+      processedConfig.OPENAI_API_KEY = processedConfig.OPENAI;
+    }
+
+    if (!processedConfig.BOT_ACCESS_KEY) {
+      processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
+    }
+
     // Generate keys and certificate
     const { privateKey, publicKey } = generateKeys();
     const { pemCert, pemPrivateKey } = generateCertificate(config.HUB_DOMAIN);

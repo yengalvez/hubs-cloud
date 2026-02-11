@@ -9,22 +9,152 @@ const BOT_ACCESS_KEY = process.env.BOT_ACCESS_KEY || "";
 const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
 const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org/hub.html";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
+const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://api.openai.com/v1/responses";
+const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 9_000);
+const MAX_ACTIVE_ROOMS = parsePositiveInt(process.env.MAX_ACTIVE_ROOMS, 1);
+const MAX_BOTS_PER_ROOM = parsePositiveInt(process.env.MAX_BOTS_PER_ROOM, 5);
+const CHAT_RATE_LIMIT_MS = parsePositiveInt(process.env.CHAT_RATE_LIMIT_MS, 700);
 
 const roomConfigs = new Map();
 const roomRunners = new Map();
+const queuedRunnerHubs = [];
+const lastChatAt = new Map();
 
-function authorized(req) {
-  if (!BOT_ACCESS_KEY) return true;
-  return req.get("x-ret-bot-access-key") === BOT_ACCESS_KEY;
+function parsePositiveInt(raw, fallback) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
 }
 
-function authMiddleware(req, res, next) {
-  if (!authorized(req)) {
-    res.status(401).json({ error: "unauthorized" });
-    return;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function trimReply(reply) {
+  if (typeof reply !== "string") return "";
+  return reply.trim().slice(0, 500);
+}
+
+function normalizeWaypointName(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase();
+}
+
+function sanitizeKnownWaypoints(context) {
+  const source = context && Array.isArray(context.waypoints) ? context.waypoints : [];
+  const unique = new Set();
+
+  for (let i = 0; i < source.length; i++) {
+    const waypoint = normalizeWaypointName(source[i]);
+    if (!waypoint) continue;
+    if (!waypoint.startsWith("spawbot-")) continue;
+    unique.add(waypoint);
   }
 
-  next();
+  return Array.from(unique);
+}
+
+function sanitizeAction(action, knownWaypoints) {
+  if (!action || typeof action !== "object") return null;
+  if (action.type !== "go_to_waypoint") return null;
+
+  const waypoint = normalizeWaypointName(action.waypoint);
+  if (!waypoint || !waypoint.startsWith("spawbot-")) return null;
+
+  if (knownWaypoints.length > 0 && !knownWaypoints.includes(waypoint)) {
+    return null;
+  }
+
+  return {
+    type: "go_to_waypoint",
+    waypoint
+  };
+}
+
+function extractFirstJsonObject(text) {
+  if (typeof text !== "string") return null;
+  const source = text.trim();
+
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        return source.slice(start, i + 1);
+      }
+      if (depth < 0) return null;
+    }
+  }
+
+  return null;
+}
+
+function extractOutputText(responsePayload) {
+  if (typeof responsePayload?.output_text === "string" && responsePayload.output_text.trim()) {
+    return responsePayload.output_text.trim();
+  }
+
+  const output = Array.isArray(responsePayload?.output) ? responsePayload.output : [];
+
+  for (let i = 0; i < output.length; i++) {
+    const item = output[i];
+    const content = Array.isArray(item?.content) ? item.content : [];
+
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      if (typeof block?.text === "string" && block.text.trim()) {
+        return block.text.trim();
+      }
+    }
+  }
+
+  return "";
+}
+
+function parseStructuredReply(responseText, knownWaypoints) {
+  const jsonPayload = extractFirstJsonObject(responseText);
+  if (!jsonPayload) return null;
+
+  try {
+    const parsed = JSON.parse(jsonPayload);
+    const reply = trimReply(parsed.reply);
+    if (!reply) return null;
+
+    return {
+      reply,
+      action: sanitizeAction(parsed.action, knownWaypoints)
+    };
+  } catch (_err) {
+    return null;
+  }
 }
 
 function normalizeMobility(value) {
@@ -38,7 +168,7 @@ function normalizeConfig(input) {
 
   return {
     enabled: !!source.enabled,
-    count: Number.isFinite(count) ? Math.max(0, Math.min(10, Math.floor(count))) : 0,
+    count: Number.isFinite(count) ? clamp(Math.floor(count), 0, MAX_BOTS_PER_ROOM) : 0,
     mobility: normalizeMobility(source.mobility),
     chat_enabled: !!source.chat_enabled
   };
@@ -48,15 +178,18 @@ function detectWaypointAction(message, context) {
   if (!message || typeof message !== "string") return null;
 
   const text = message.toLowerCase();
-  const match = text.match(/spawbot-[a-z0-9_-]+/);
-  if (match) {
-    return {
-      type: "go_to_waypoint",
-      waypoint: match[0]
-    };
+  const knownWaypoints = sanitizeKnownWaypoints(context);
+  const spawbotMatch = text.match(/spawbot-[a-z0-9_-]+/);
+  if (spawbotMatch) {
+    return sanitizeAction(
+      {
+        type: "go_to_waypoint",
+        waypoint: spawbotMatch[0]
+      },
+      knownWaypoints
+    );
   }
 
-  const knownWaypoints = (context && Array.isArray(context.waypoints) && context.waypoints) || [];
   if ((text.includes("move") || text.includes("ve") || text.includes("go")) && knownWaypoints.length) {
     return {
       type: "go_to_waypoint",
@@ -78,20 +211,151 @@ function mobilityReply(config) {
   }
 }
 
-function runnerKey(hubSid) {
-  return `runner:${hubSid}`;
+function deterministicResponse({ message, botId, botsConfig, context }) {
+  let reply = `${botId}: I received "${message}".`;
+  if (message.toLowerCase().includes("mobility") || message.toLowerCase().includes("movilidad")) {
+    reply = mobilityReply(botsConfig);
+  }
+
+  return {
+    reply,
+    action: detectWaypointAction(message, context)
+  };
+}
+
+async function callOpenAI({ hubSid, botId, message, botsConfig, context }) {
+  if (!OPENAI_API_KEY) return null;
+
+  const knownWaypoints = sanitizeKnownWaypoints(context);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+
+  try {
+    const systemPrompt = [
+      "You are a room bot in a social 3D metaverse.",
+      "Reply in one short sentence.",
+      "Return ONLY strict JSON: {\"reply\": string, \"action\": null|{\"type\":\"go_to_waypoint\",\"waypoint\":\"spawbot-*\"}}.",
+      "Never include markdown.",
+      "Set action to null unless the user asks to move/go to a spawbot waypoint."
+    ].join(" ");
+
+    const userPayload = {
+      hub_sid: hubSid,
+      bot_id: botId,
+      mobility: botsConfig.mobility,
+      message: message.slice(0, 600),
+      known_waypoints: knownWaypoints
+    };
+
+    const requestBody = {
+      model: OPENAI_MODEL,
+      max_output_tokens: 180,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }]
+        },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: JSON.stringify(userPayload) }]
+        }
+      ]
+    };
+
+    const response = await fetch(OPENAI_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`openai_status_${response.status}:${errorBody.slice(0, 200)}`);
+    }
+
+    const responsePayload = await response.json();
+    const responseText = extractOutputText(responsePayload);
+    if (!responseText) {
+      throw new Error("openai_empty_output");
+    }
+
+    const parsed = parseStructuredReply(responseText, knownWaypoints);
+    if (!parsed) {
+      throw new Error("openai_invalid_json_output");
+    }
+
+    return parsed;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function chatRateLimited(hubSid, botId) {
+  const key = `${hubSid}:${botId}`;
+  const now = Date.now();
+  const previous = lastChatAt.get(key) || 0;
+
+  if (now - previous < CHAT_RATE_LIMIT_MS) {
+    return true;
+  }
+
+  lastChatAt.set(key, now);
+  return false;
+}
+
+function runnerStateForHub(hubSid) {
+  if (roomRunners.has(hubSid)) return "running";
+  if (queuedRunnerHubs.includes(hubSid)) return "queued_capacity";
+  return "stopped";
 }
 
 function canAutostartRunners() {
   return RUNNER_AUTOSTART && !!RUNNER_SCRIPT;
 }
 
+function canStartMoreRunners() {
+  return roomRunners.size < MAX_ACTIVE_ROOMS;
+}
+
+function enqueueHub(hubSid) {
+  if (!queuedRunnerHubs.includes(hubSid)) {
+    queuedRunnerHubs.push(hubSid);
+  }
+}
+
+function dequeueHub(hubSid) {
+  const index = queuedRunnerHubs.indexOf(hubSid);
+  if (index >= 0) {
+    queuedRunnerHubs.splice(index, 1);
+  }
+}
+
+function fillQueuedRunnerSlots() {
+  if (!canAutostartRunners()) return;
+
+  while (queuedRunnerHubs.length > 0 && canStartMoreRunners()) {
+    const hubSid = queuedRunnerHubs.shift();
+    const room = roomConfigs.get(hubSid);
+    if (!room || !room.bots.enabled || room.bots.count <= 0) continue;
+
+    const started = startRunner(hubSid);
+    if (!started) {
+      queuedRunnerHubs.unshift(hubSid);
+      break;
+    }
+  }
+}
+
 function stopRunner(hubSid) {
-  const key = runnerKey(hubSid);
-  const info = roomRunners.get(key);
+  dequeueHub(hubSid);
+  const info = roomRunners.get(hubSid);
   if (!info) return;
 
-  roomRunners.delete(key);
+  roomRunners.delete(hubSid);
   clearTimeout(info.restartTimer);
 
   if (info.process && !info.process.killed) {
@@ -100,10 +364,9 @@ function stopRunner(hubSid) {
 }
 
 function startRunner(hubSid) {
-  if (!canAutostartRunners()) return;
-
-  const key = runnerKey(hubSid);
-  if (roomRunners.has(key)) return;
+  if (!canAutostartRunners()) return false;
+  if (roomRunners.has(hubSid)) return true;
+  if (!canStartMoreRunners()) return false;
 
   const args = [RUNNER_SCRIPT, "--url", HUBS_BASE_URL, "--room", hubSid, "--runner"];
   const child = spawn("node", args, { stdio: "inherit" });
@@ -113,20 +376,87 @@ function startRunner(hubSid) {
     restartDelayMs: 3000,
     restartTimer: null
   };
-  roomRunners.set(key, info);
+  roomRunners.set(hubSid, info);
 
   child.on("exit", () => {
-    const room = roomConfigs.get(hubSid);
-    roomRunners.delete(key);
+    roomRunners.delete(hubSid);
+    clearTimeout(info.restartTimer);
 
+    const room = roomConfigs.get(hubSid);
     if (room && room.bots && room.bots.enabled && room.bots.count > 0 && canAutostartRunners()) {
-      info.restartTimer = setTimeout(() => startRunner(hubSid), info.restartDelayMs);
+      if (canStartMoreRunners()) {
+        info.restartTimer = setTimeout(() => {
+          const restarted = startRunner(hubSid);
+          if (!restarted) {
+            enqueueHub(hubSid);
+          }
+          fillQueuedRunnerSlots();
+        }, info.restartDelayMs);
+      } else {
+        enqueueHub(hubSid);
+      }
     }
+
+    fillQueuedRunnerSlots();
   });
+
+  return true;
+}
+
+function ensureRunnerState(hubSid) {
+  const room = roomConfigs.get(hubSid);
+
+  if (!room || !room.bots.enabled || room.bots.count <= 0) {
+    stopRunner(hubSid);
+    return "stopped";
+  }
+
+  if (roomRunners.has(hubSid)) {
+    dequeueHub(hubSid);
+    return "running";
+  }
+
+  if (!canAutostartRunners()) {
+    dequeueHub(hubSid);
+    return "stopped";
+  }
+
+  if (canStartMoreRunners()) {
+    const started = startRunner(hubSid);
+    if (started) return "running";
+  }
+
+  enqueueHub(hubSid);
+  return "queued_capacity";
+}
+
+function authorized(req) {
+  if (!BOT_ACCESS_KEY) return true;
+  return req.get("x-ret-bot-access-key") === BOT_ACCESS_KEY;
+}
+
+function authMiddleware(req, res, next) {
+  if (!authorized(req)) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+
+  next();
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, rooms: roomConfigs.size });
+  res.json({
+    ok: true,
+    rooms: roomConfigs.size,
+    active_rooms: roomRunners.size,
+    queued_rooms: queuedRunnerHubs.length,
+    max_active_rooms: MAX_ACTIVE_ROOMS,
+    max_bots_per_room: MAX_BOTS_PER_ROOM,
+    llm_enabled: !!OPENAI_API_KEY,
+    model: OPENAI_MODEL,
+    active_hubs: Array.from(roomRunners.keys()),
+    queued_hubs: [...queuedRunnerHubs]
+  });
 });
 
 app.post("/internal/bots/room-config", authMiddleware, (req, res) => {
@@ -143,13 +473,10 @@ app.post("/internal/bots/room-config", authMiddleware, (req, res) => {
     updatedAt: Date.now()
   });
 
-  if (bots.enabled && bots.count > 0) {
-    startRunner(hubSid);
-  } else {
-    stopRunner(hubSid);
-  }
+  const runnerState = ensureRunnerState(hubSid);
+  fillQueuedRunnerSlots();
 
-  res.json({ ok: true, hub_sid: hubSid, bots });
+  res.json({ ok: true, hub_sid: hubSid, bots, runner_state: runnerState });
 });
 
 app.post("/internal/bots/room-stop", authMiddleware, (req, res) => {
@@ -162,15 +489,17 @@ app.post("/internal/bots/room-stop", authMiddleware, (req, res) => {
 
   roomConfigs.delete(hubSid);
   stopRunner(hubSid);
-  res.json({ ok: true, hub_sid: hubSid });
+  fillQueuedRunnerSlots();
+
+  res.json({ ok: true, hub_sid: hubSid, runner_state: "stopped" });
 });
 
-app.post("/internal/bots/chat", authMiddleware, (req, res) => {
+app.post("/internal/bots/chat", authMiddleware, async (req, res) => {
   const body = req.body || {};
   const hubSid = body.hub_sid;
   const botId = body.bot_id;
   const message = typeof body.message === "string" ? body.message.trim() : "";
-  const context = body.context || {};
+  const context = body.context && typeof body.context === "object" ? body.context : {};
 
   if (!hubSid || typeof hubSid !== "string") {
     res.status(400).json({ error: "hub_sid is required" });
@@ -188,24 +517,43 @@ app.post("/internal/bots/chat", authMiddleware, (req, res) => {
   }
 
   const roomConfig = roomConfigs.get(hubSid);
-  const botsConfig = (roomConfig && roomConfig.bots) || {
-    enabled: true,
-    count: 1,
-    mobility: "medium",
-    chat_enabled: true
-  };
+  const botsConfig =
+    (roomConfig && roomConfig.bots) ||
+    normalizeConfig({
+      enabled: true,
+      count: 1,
+      mobility: "medium",
+      chat_enabled: true
+    });
 
-  let reply = `${botId}: I received \"${message}\".`;
-  if (message.toLowerCase().includes("mobility") || message.toLowerCase().includes("movilidad")) {
-    reply = mobilityReply(botsConfig);
+  if (chatRateLimited(hubSid, botId)) {
+    res.json({
+      reply: "Please wait a moment before sending another message.",
+      action: null,
+      rate_limited: true
+    });
+    return;
   }
 
-  const action = detectWaypointAction(message, context);
+  const fallback = deterministicResponse({ message, botId, botsConfig, context });
 
-  res.json({
-    reply,
-    action
-  });
+  if (!OPENAI_API_KEY) {
+    res.json(fallback);
+    return;
+  }
+
+  try {
+    const response = await callOpenAI({ hubSid, botId, message, botsConfig, context });
+    if (!response || !response.reply) {
+      res.json(fallback);
+      return;
+    }
+
+    res.json(response);
+  } catch (error) {
+    console.warn("OpenAI bot chat failed. Falling back to deterministic response.", error.message);
+    res.json(fallback);
+  }
 });
 
 app.listen(PORT, () => {

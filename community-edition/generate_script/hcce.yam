@@ -33,6 +33,7 @@ stringData:
   SKETCHFAB_API_KEY: "$SKETCHFAB_API_KEY"
   TENOR_API_KEY: "$TENOR_API_KEY"
   BOT_ACCESS_KEY: "$BOT_ACCESS_KEY"
+  OPENAI_API_KEY: "$OPENAI_API_KEY"
   PSQL: "$PSQL"
   PERMS_KEY: '$PERMS_KEY'
   PGRST_JWT_SECRET: '$PGRST_JWT_SECRET'
@@ -660,6 +661,23 @@ spec:
             secretKeyRef:
               name: configs
               key: BOT_ACCESS_KEY
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: OPENAI_API_KEY
+        - name: OPENAI_MODEL
+          value: gpt-5-nano
+        - name: RUNNER_AUTOSTART
+          value: "true"
+        - name: RUNNER_SCRIPT
+          value: /app/run-bot.js
+        - name: HUBS_BASE_URL
+          value: https://$HUB_DOMAIN/hub.html
+        - name: MAX_ACTIVE_ROOMS
+          value: "1"
+        - name: MAX_BOTS_PER_ROOM
+          value: "5"
         livenessProbe:
           httpGet:
             path: /health
