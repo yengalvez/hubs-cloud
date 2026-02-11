@@ -551,6 +551,10 @@ app.post("/internal/bots/chat", authMiddleware, async (req, res) => {
       return;
     }
 
+    if (!response.action) {
+      response.action = detectWaypointAction(message, context);
+    }
+
     res.json(response);
   } catch (error) {
     console.warn("OpenAI bot chat failed. Falling back to deterministic response.", error.message);
