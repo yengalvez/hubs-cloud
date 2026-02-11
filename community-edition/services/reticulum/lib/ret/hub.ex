@@ -417,6 +417,7 @@ defmodule Ret.Hub do
   def add_attrs_to_changeset(changeset, attrs) do
     changeset
     |> cast(attrs, [:name, :description, :user_data, :room_size])
+    |> update_change(:user_data, &normalize_user_data/1)
     |> validate_required([:name])
     |> validate_length(:name, max: 64)
     |> validate_length(:description, max: 64_000)
@@ -425,6 +426,90 @@ defmodule Ret.Hub do
       less_than_or_equal_to: AppConfig.get_cached_config_value("features|max_room_size")
     )
     |> HubSlug.maybe_generate_slug()
+  end
+
+  defp normalize_user_data(nil), do: nil
+
+  defp normalize_user_data(%{} = user_data) do
+    bots = map_get(user_data, "bots")
+
+    case normalize_bots_config(bots) do
+      nil ->
+        user_data
+        |> Map.delete("bots")
+        |> Map.delete(:bots)
+
+      normalized ->
+        user_data
+        |> Map.delete(:bots)
+        |> Map.put("bots", normalized)
+    end
+  end
+
+  defp normalize_user_data(_), do: nil
+
+  defp normalize_bots_config(nil), do: nil
+
+  defp normalize_bots_config(%{} = bots) do
+    enabled = normalize_bool(map_get(bots, "enabled", false), false)
+    count = normalize_integer(map_get(bots, "count", 0), 0, 10, 0)
+    mobility = normalize_mobility(map_get(bots, "mobility", "medium"))
+    chat_enabled = normalize_bool(map_get(bots, "chat_enabled", false), false)
+
+    %{
+      "enabled" => enabled,
+      "count" => count,
+      "mobility" => mobility,
+      "chat_enabled" => chat_enabled
+    }
+  end
+
+  defp normalize_bots_config(_), do: nil
+
+  defp normalize_mobility("low"), do: "low"
+  defp normalize_mobility("high"), do: "high"
+  defp normalize_mobility("medium"), do: "medium"
+  defp normalize_mobility(_), do: "medium"
+
+  defp normalize_integer(value, min, max, _default) when is_integer(value) do
+    value
+    |> max(min)
+    |> min(max)
+  end
+
+  defp normalize_integer(value, min, max, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, _} -> normalize_integer(parsed, min, max, default)
+      _ -> default
+    end
+  end
+
+  defp normalize_integer(_, _min, _max, default), do: default
+
+  defp normalize_bool(value, _default) when is_boolean(value), do: value
+  defp normalize_bool("true", _default), do: true
+  defp normalize_bool("false", _default), do: false
+  defp normalize_bool(1, _default), do: true
+  defp normalize_bool(0, _default), do: false
+  defp normalize_bool(_value, default), do: default
+
+  defp map_get(map, key, default \\ nil) do
+    atom_key =
+      if is_binary(key) do
+        try do
+          String.to_existing_atom(key)
+        rescue
+          ArgumentError -> nil
+        end
+      else
+        key
+      end
+
+    cond do
+      Map.has_key?(map, key) -> Map.get(map, key, default)
+      atom_key != nil and Map.has_key?(map, atom_key) -> Map.get(map, atom_key, default)
+      true -> default
+    end
   end
 
   def member_permissions_from_attrs(%{} = attrs) do

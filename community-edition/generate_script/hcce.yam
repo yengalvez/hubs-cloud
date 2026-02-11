@@ -32,6 +32,7 @@ stringData:
   PHX_KEY: "$PHX_KEY"
   SKETCHFAB_API_KEY: "$SKETCHFAB_API_KEY"
   TENOR_API_KEY: "$TENOR_API_KEY"
+  BOT_ACCESS_KEY: "$BOT_ACCESS_KEY"
   PSQL: "$PSQL"
   PERMS_KEY: '$PERMS_KEY'
   PGRST_JWT_SECRET: '$PGRST_JWT_SECRET'
@@ -295,9 +296,13 @@ data:
     oauth_token_key = ""
 
     [ret]
-    bot_access_key = ""
+    bot_access_key = "<BOT_ACCESS_KEY>"
     # pgrest_host = ""
     # ita_host = ""
+
+    [ret."Elixir.Ret.BotOrchestrator"]
+    endpoint = "http://bot-orchestrator.<POD_NS>:5001"
+    access_key = "<BOT_ACCESS_KEY>"
 
     [ret."Elixir.Ret.MediaResolver"]
     ytdl_host = "<YTDL_HOST>"
@@ -551,6 +556,11 @@ spec:
             secretKeyRef:
               name: configs
               key: TENOR_API_KEY
+        - name: turkeyCfg_BOT_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: BOT_ACCESS_KEY
         - name: turkeyCfg_YTDL_HOST
           value: "http://ytdl:5000"
         - name: turkeyCfg_PHOTOMNEMONIC
@@ -616,6 +626,66 @@ spec:
     targetPort: 4000
   selector:
     app: reticulum
+---
+####################################################################################
+################################ bot-orchestrator ##################################
+####################################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bot-orchestrator
+  namespace: $Namespace
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bot-orchestrator
+  template:
+    metadata:
+      labels:
+        app: bot-orchestrator
+    spec:
+      containers:
+      - name: bot-orchestrator
+        image: $Container_Dockerhub_Username/bot-orchestrator:$Container_Tag
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5001
+          name: http
+        env:
+        - name: BOT_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: BOT_ACCESS_KEY
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5001
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bot-orchestrator
+  namespace: $Namespace
+spec:
+  selector:
+    app: bot-orchestrator
+  ports:
+  - name: http
+    protocol: TCP
+    port: 5001
+    targetPort: 5001
 ---
 ########################################################################
 ######################   pgsql   #######################################

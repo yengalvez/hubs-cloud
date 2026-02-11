@@ -164,6 +164,7 @@ defmodule RetWeb.Router do
       resources "/scenes", Api.V1.SceneController, only: [:create, :update]
       resources "/avatars", Api.V1.AvatarController, only: [:create, :update, :delete]
       resources "/hubs", Api.V1.HubController, only: [:update]
+      post "/hubs/:hub_sid/bots/:bot_id/chat", Api.V1.BotController, :chat
       resources "/assets", Api.V1.AssetsController, only: [:create, :delete]
 
       post "/twitter/tweets", Api.V1.TwitterController, :tweets
@@ -209,6 +210,7 @@ defmodule RetWeb.Router do
     scope "/v1", as: :api_internal_v1 do
       get "/presence", ApiInternal.V1.PresenceController, :show
       get "/presence/range_max", ApiInternal.V1.PresenceController, :range_max
+      get "/hubs/active_with_bots", ApiInternal.V1.BotsController, :active_with_bots
       get "/storage", ApiInternal.V1.StorageController, :show
       post "/rewrite_assets", ApiInternal.V1.RewriteAssetsController, :post
       put "/change_email_for_login", ApiInternal.V1.LoginEmailController, :update

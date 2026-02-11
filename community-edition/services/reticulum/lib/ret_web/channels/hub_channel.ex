@@ -11,6 +11,7 @@ defmodule RetWeb.HubChannel do
     HubInvite,
     Account,
     AccountFavorite,
+    BotOrchestrator,
     Identity,
     Repo,
     RoomObject,
@@ -535,6 +536,7 @@ defmodule RetWeb.HubChannel do
         hub.member_permissions != payload |> Hub.member_permissions_from_attrs()
 
       room_size_changed = hub.room_size != payload["room_size"]
+      user_data_changed = hub.user_data != payload["user_data"]
       can_change_promotion = account |> can?(update_hub_promotion(hub))
 
       promotion_changed =
@@ -556,20 +558,24 @@ defmodule RetWeb.HubChannel do
           else: stale_fields
 
       stale_fields = if room_size_changed, do: ["room_size" | stale_fields], else: stale_fields
+      stale_fields = if user_data_changed, do: ["user_data" | stale_fields], else: stale_fields
 
       stale_fields =
         if promotion_changed, do: ["allow_promotion" | stale_fields], else: stale_fields
 
       stale_fields = if entry_mode_changed, do: ["entry_mode" | stale_fields], else: stale_fields
 
-      hub
-      |> Hub.add_attrs_to_changeset(payload)
-      |> Hub.add_member_permissions_to_changeset(payload)
-      |> Hub.maybe_add_promotion_to_changeset(account, hub, payload)
-      |> Hub.maybe_add_entry_mode_to_changeset(payload)
-      |> Repo.update!()
-      |> Repo.preload(Hub.hub_preloads())
-      |> broadcast_hub_refresh!(socket, stale_fields)
+      updated_hub =
+        hub
+        |> Hub.add_attrs_to_changeset(payload)
+        |> Hub.add_member_permissions_to_changeset(payload)
+        |> Hub.maybe_add_promotion_to_changeset(account, hub, payload)
+        |> Hub.maybe_add_entry_mode_to_changeset(payload)
+        |> Repo.update!()
+        |> Repo.preload(Hub.hub_preloads())
+
+      sync_bot_orchestrator(updated_hub)
+      broadcast_hub_refresh!(updated_hub, socket, stale_fields)
     end
 
     {:noreply, socket}
@@ -1498,6 +1504,75 @@ defmodule RetWeb.HubChannel do
     else
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp sync_bot_orchestrator(%Hub{} = hub) do
+    bots = normalize_bots_config(hub.user_data)
+
+    if bots["enabled"] && bots["count"] > 0 do
+      _ =
+        BotOrchestrator.room_config(%{
+          hub_sid: hub.hub_sid,
+          bots: bots
+        })
+    else
+      _ =
+        BotOrchestrator.room_stop(%{
+          hub_sid: hub.hub_sid
+        })
+    end
+
+    :ok
+  end
+
+  defp normalize_bots_config(user_data) do
+    bots = map_get(user_data || %{}, "bots") || %{}
+
+    %{
+      "enabled" => normalize_bool(map_get(bots, "enabled")),
+      "count" => normalize_integer(map_get(bots, "count")),
+      "mobility" => normalize_mobility(map_get(bots, "mobility")),
+      "chat_enabled" => normalize_bool(map_get(bots, "chat_enabled"))
+    }
+  end
+
+  defp normalize_integer(value) when is_integer(value), do: value
+
+  defp normalize_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} -> parsed
+      _ -> 0
+    end
+  end
+
+  defp normalize_integer(_), do: 0
+
+  defp normalize_bool(true), do: true
+  defp normalize_bool("true"), do: true
+  defp normalize_bool(1), do: true
+  defp normalize_bool(_), do: false
+
+  defp normalize_mobility("low"), do: "low"
+  defp normalize_mobility("high"), do: "high"
+  defp normalize_mobility(_), do: "medium"
+
+  defp map_get(map, key) do
+    atom_key =
+      if is_binary(key) do
+        try do
+          String.to_existing_atom(key)
+        rescue
+          ArgumentError -> nil
+        end
+      else
+        key
+      end
+
+    cond do
+      is_map(map) and Map.has_key?(map, key) -> Map.get(map, key)
+      is_map(map) and atom_key != nil and Map.has_key?(map, atom_key) -> Map.get(map, atom_key)
+      true -> nil
     end
   end
 

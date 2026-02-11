@@ -56,3 +56,4 @@ When running [`render_hcce.sh`](../render_hcce.sh), you can specify your registr
 - [Postgrest](./postgrest/Dockerfile)
 - [Haproxy](./haproxy/Dockerfile)
 - [Pgbouncer](./pgbouncer/Dockerfile)
+- [Bot Orchestrator](./bot-orchestrator/Dockerfile)

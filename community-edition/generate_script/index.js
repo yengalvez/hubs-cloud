@@ -177,6 +177,12 @@ function handleImageOverrides(processedConfig, replacedContent) {
           yamlDocuments[index] = new YAML.Document(jsDoc);
         }
       }
+      else if (jsDoc.metadata.name === "bot-orchestrator") {
+        if (processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE) {
+          jsDoc.spec.template.spec.containers[0].image = processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE;
+          yamlDocuments[index] = new YAML.Document(jsDoc);
+        }
+      }
     }
   });
 
