@@ -572,7 +572,7 @@ spec:
           value: "1000"
         livenessProbe:
           httpGet:
-            path: /health
+            path: /?skipadmin
             port: 4001
             scheme: HTTP
           initialDelaySeconds: 30
