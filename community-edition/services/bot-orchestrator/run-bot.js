@@ -34,11 +34,16 @@ function log(...objs) {
     ]
   });
 
-  const page = await browser.newPage();
-  await page.setBypassCSP(true);
-  page.on("console", msg => log("PAGE:", msg.text()));
-  page.on("error", err => log("ERROR:", err.toString().split("\n")[0]));
-  page.on("pageerror", err => log("PAGE ERROR:", err.toString().split("\n")[0]));
+  const createPage = async () => {
+    const page = await browser.newPage();
+    await page.setBypassCSP(true);
+    page.on("console", msg => log("PAGE:", msg.text()));
+    page.on("error", err => log("ERROR:", err.toString().split("\n")[0]));
+    page.on("pageerror", err => log("PAGE ERROR:", err.toString().split("\n")[0]));
+    return page;
+  };
+
+  let page = await createPage();
 
   const baseUrl = options["--url"] || "https://meta-hubs.org/hub.html";
   const roomOption = options["--room"];
@@ -61,18 +66,42 @@ function log(...objs) {
   const url = `${baseUrl}${separator}${query}`;
   log("Runner URL:", url);
 
-  const navigate = async () => {
-    try {
-      log("Launching room runner...");
-      await page.goto(url, { waitUntil: "networkidle2" });
-      await page.mouse.click(100, 100);
-    } catch (e) {
-      log("Navigation error:", e.message);
-      setTimeout(navigate, 1500);
+  const navigateWithRetry = async (maxRetries = 8) => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        log(`Launching room runner (attempt ${attempt}/${maxRetries})...`);
+        await page.goto(url, { waitUntil: "networkidle2" });
+        await page.mouse.click(100, 100);
+        return;
+      } catch (e) {
+        log("Navigation error:", e.message);
+        try {
+          if (!page.isClosed()) {
+            await page.close();
+          }
+        } catch (_closeErr) {}
+
+        page = await createPage();
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
+
+    log("Runner failed to start after retries, exiting.");
+    process.exit(1);
   };
 
-  await navigate();
+  await navigateWithRetry();
+
+  const shutdown = async signal => {
+    log(`Received ${signal}, shutting down runner.`);
+    try {
+      await browser.close();
+    } catch (_err) {}
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   setInterval(async () => {
     try {
