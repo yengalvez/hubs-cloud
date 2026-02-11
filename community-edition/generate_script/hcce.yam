@@ -673,7 +673,7 @@ spec:
         - name: RUNNER_SCRIPT
           value: /app/run-bot.js
         - name: HUBS_BASE_URL
-          value: https://$HUB_DOMAIN/hub.html
+          value: https://$HUB_DOMAIN
         - name: MAX_ACTIVE_ROOMS
           value: "1"
         - name: MAX_BOTS_PER_ROOM

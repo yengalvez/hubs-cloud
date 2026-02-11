@@ -8,7 +8,7 @@ const PORT = Number(process.env.PORT || 5001);
 const BOT_ACCESS_KEY = process.env.BOT_ACCESS_KEY || "";
 const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
-const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org/hub.html";
+const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://api.openai.com/v1/responses";

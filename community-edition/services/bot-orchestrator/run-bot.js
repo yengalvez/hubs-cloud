@@ -45,7 +45,7 @@ function log(...objs) {
 
   let page = await createPage();
 
-  const baseUrl = options["--url"] || "https://meta-hubs.org/hub.html";
+  const baseUrl = options["--url"] || "https://meta-hubs.org";
   const roomOption = options["--room"];
 
   const params = {
@@ -57,13 +57,24 @@ function log(...objs) {
     params.bot_runner = true;
   }
 
-  if (roomOption) {
-    params.hub_id = roomOption;
-  }
+  const buildRunnerUrl = () => {
+    const url = new URL(baseUrl);
+    const isLegacyHubHtml = /\/hub\.html$/i.test(url.pathname);
 
-  const query = new URLSearchParams(params).toString();
-  const separator = baseUrl.includes("?") ? "&" : "?";
-  const url = `${baseUrl}${separator}${query}`;
+    if (roomOption) {
+      if (isLegacyHubHtml) {
+        params.hub_id = roomOption;
+      } else {
+        const basePath = url.pathname.replace(/\/+$/, "");
+        url.pathname = `${basePath}/${roomOption}`.replace(/\/{2,}/g, "/");
+      }
+    }
+
+    url.search = new URLSearchParams(params).toString();
+    return url.toString();
+  };
+
+  const url = buildRunnerUrl();
   log("Runner URL:", url);
 
   const navigateWithRetry = async (maxRetries = 8) => {
