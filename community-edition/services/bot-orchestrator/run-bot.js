@@ -4,7 +4,7 @@ Usage:
     ./run-bot.js [options]
 Options:
     -h --help            Show this screen
-    -u --url=<url>       URL [default: https://meta-hubs.org/hub.html]
+    -u --url=<url>       URL [default: https://meta-hubs.org]
     -r --room=<room>     Room id
     --runner             Enable room bot-runner mode for this process
 `;
@@ -16,6 +16,8 @@ const puppeteer = require("puppeteer-core");
 
 const executablePath =
   process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || "/usr/bin/chromium";
+const NAVIGATION_TIMEOUT_MS = Number(process.env.RUNNER_NAV_TIMEOUT_MS || 120000);
+const STARTUP_TIMEOUT_MS = Number(process.env.RUNNER_STARTUP_TIMEOUT_MS || 120000);
 
 function log(...objs) {
   console.log.call(null, [new Date().toISOString()].concat(objs).join(" "));
@@ -37,6 +39,8 @@ function log(...objs) {
   const createPage = async () => {
     const page = await browser.newPage();
     await page.setBypassCSP(true);
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+    page.setDefaultTimeout(NAVIGATION_TIMEOUT_MS);
     page.on("console", msg => log("PAGE:", msg.text()));
     page.on("error", err => log("ERROR:", err.toString().split("\n")[0]));
     page.on("pageerror", err => log("PAGE ERROR:", err.toString().split("\n")[0]));
@@ -81,8 +85,26 @@ function log(...objs) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         log(`Launching room runner (attempt ${attempt}/${maxRetries})...`);
-        await page.goto(url, { waitUntil: "networkidle2" });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
         await page.mouse.click(100, 100);
+        await page.waitForFunction(
+          () => {
+            const scene = document.querySelector("a-scene");
+            return !!scene;
+          },
+          { timeout: STARTUP_TIMEOUT_MS }
+        );
+        await page.waitForFunction(
+          () => {
+            const scene = window.APP?.scene || document.querySelector("a-scene");
+            const entered = !!(scene && scene.is && scene.is("entered"));
+            const connection = window.NAF && window.NAF.connection;
+            const connected = !!(connection && typeof connection.isConnected === "function" && connection.isConnected());
+            return entered && connected;
+          },
+          { timeout: STARTUP_TIMEOUT_MS }
+        );
+        log("Runner startup complete (scene entered + network connected).");
         return;
       } catch (e) {
         log("Navigation error:", e.message);
