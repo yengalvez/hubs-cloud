@@ -249,7 +249,9 @@ async function callOpenAI({ hubSid, botId, message, botsConfig, context }) {
 
     const requestBody = {
       model: OPENAI_MODEL,
-      max_output_tokens: 180,
+      max_output_tokens: 320,
+      reasoning: { effort: "low" },
+      text: { verbosity: "low" },
       input: [
         {
           role: "system",
