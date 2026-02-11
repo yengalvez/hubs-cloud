@@ -60,6 +60,15 @@ function convertPemToJwk(publicKey) {
   return JSON.stringify(jwk);
 }
 
+function normalizePemPrivateKey(value) {
+  if (!value || typeof value !== "string") return "";
+  return value
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
 function generatePersistentVolumes(processedConfig, replacedContent) {
   const yamlDocuments = YAML.parseAllDocuments(replacedContent);
   let outputIdx = 2;
@@ -207,8 +216,17 @@ function main() {
       processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
     }
 
-    // Generate keys and certificate
-    const { privateKey, publicKey } = generateKeys();
+    // Keep PERMS_KEY stable across runs. Rotate only when missing.
+    let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);
+    if (!privateKey) {
+      ({ privateKey } = generateKeys());
+    }
+
+    const publicKey = crypto
+      .createPublicKey(privateKey)
+      .export({ type: "spki", format: "pem" });
+
+    // Generate certs for ingress TLS init.
     const { pemCert, pemPrivateKey } = generateCertificate(config.HUB_DOMAIN);
 
     processedConfig.PGRST_JWT_SECRET = convertPemToJwk(publicKey);
