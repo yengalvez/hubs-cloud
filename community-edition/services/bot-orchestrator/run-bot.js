@@ -13,7 +13,6 @@ const docopt = require("docopt").docopt;
 const options = docopt(doc);
 
 const puppeteer = require("puppeteer-core");
-const querystring = require("query-string");
 
 const executablePath =
   process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || "/usr/bin/chromium";
@@ -57,7 +56,9 @@ function log(...objs) {
     params.hub_id = roomOption;
   }
 
-  const url = `${baseUrl}?${querystring.stringify(params)}`;
+  const query = new URLSearchParams(params).toString();
+  const separator = baseUrl.includes("?") ? "&" : "?";
+  const url = `${baseUrl}${separator}${query}`;
   log("Runner URL:", url);
 
   const navigate = async () => {
