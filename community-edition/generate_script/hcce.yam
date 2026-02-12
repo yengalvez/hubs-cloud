@@ -1325,7 +1325,8 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
       - name: haproxy
-        image: $Container_Dockerhub_Username/haproxy:$Container_Tag
+        # Use HAProxyTech ingress controller (v3.x) for Kubernetes v1.34+ compatibility.
+        image: haproxytech/kubernetes-ingress:3.2
         args:
         - --configmap=$Namespace/haproxy-config
         - --https-bind-port=4443
@@ -1333,14 +1334,6 @@ spec:
         - --configmap-tcp-services=$Namespace/haproxy-tcp-config
         - --ingress.class=haproxy
         - --log=warning #error warning info debug trace
-        securityContext:
-          runAsUser:  1000
-          runAsGroup: 1000
-          capabilities:
-            drop:
-              - ALL
-            add:
-              - NET_BIND_SERVICE
         livenessProbe:
           httpGet:
             path: /healthz
@@ -1445,6 +1438,14 @@ rules:
     - list
     - watch
     - update
+  - apiGroups:
+    - apiextensions.k8s.io
+    resources:
+    - customresourcedefinitions
+    verbs:
+    - get
+    - list
+    - watch
   - apiGroups:
     - "discovery.k8s.io"
     resources:
