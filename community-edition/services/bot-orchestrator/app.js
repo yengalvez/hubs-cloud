@@ -9,6 +9,10 @@ const BOT_ACCESS_KEY = process.env.BOT_ACCESS_KEY || "";
 const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
 const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
+const RET_INTERNAL_ENDPOINT = (process.env.RET_INTERNAL_ENDPOINT || "http://ret:4001").replace(/\/+$/, "");
+const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/active_with_bots";
+const RET_INTERNAL_ACCESS_HEADER = process.env.RET_INTERNAL_ACCESS_HEADER || "x-ret-dashboard-access-key";
+const RET_SYNC_INTERVAL_MS = parsePositiveInt(process.env.RET_SYNC_INTERVAL_MS, 30_000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://api.openai.com/v1/responses";
@@ -432,6 +436,62 @@ function ensureRunnerState(hubSid) {
   return "queued_capacity";
 }
 
+async function syncActiveRoomsFromReticulum() {
+  const headers = {};
+  if (BOT_ACCESS_KEY) {
+    headers[RET_INTERNAL_ACCESS_HEADER] = BOT_ACCESS_KEY;
+  }
+
+  const endpoint = `${RET_INTERNAL_ENDPOINT}${RET_INTERNAL_PATH}`;
+
+  let response;
+  try {
+    response = await fetch(endpoint, { headers });
+  } catch (error) {
+    console.warn("Active room bot sync failed.", error.message);
+    return;
+  }
+
+  if (!response.ok) {
+    console.warn("Active room bot sync returned non-OK status.", response.status);
+    return;
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    console.warn("Active room bot sync returned invalid JSON.", error.message);
+    return;
+  }
+
+  const hubs = Array.isArray(payload && payload.hubs) ? payload.hubs : [];
+  let synced = 0;
+
+  for (let i = 0; i < hubs.length; i++) {
+    const entry = hubs[i];
+    const hubSid = entry && typeof entry.hub_sid === "string" ? entry.hub_sid : "";
+    if (!hubSid) continue;
+
+    const bots = normalizeConfig(entry && entry.bots);
+    if (!bots.enabled || bots.count <= 0) continue;
+
+    roomConfigs.set(hubSid, {
+      bots,
+      updatedAt: Date.now()
+    });
+
+    ensureRunnerState(hubSid);
+    synced += 1;
+  }
+
+  if (synced > 0) {
+    console.log(`Synced ${synced} bot-enabled room(s) from reticulum.`);
+  }
+
+  fillQueuedRunnerSlots();
+}
+
 function authorized(req) {
   if (!BOT_ACCESS_KEY) return true;
   return req.get("x-ret-bot-access-key") === BOT_ACCESS_KEY;
@@ -564,4 +624,16 @@ app.post("/internal/bots/chat", authMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`bot-orchestrator listening on :${PORT}`);
+
+  if (RUNNER_AUTOSTART) {
+    syncActiveRoomsFromReticulum().catch(error => {
+      console.warn("Initial active room sync failed.", error.message);
+    });
+
+    setInterval(() => {
+      syncActiveRoomsFromReticulum().catch(error => {
+        console.warn("Periodic active room sync failed.", error.message);
+      });
+    }, RET_SYNC_INTERVAL_MS);
+  }
 });
