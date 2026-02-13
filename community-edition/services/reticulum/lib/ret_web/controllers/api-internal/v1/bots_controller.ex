@@ -5,14 +5,20 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
 
   alias Ret.{Hub, Repo}
 
-  @active_window_secs 900
-
   def active_with_bots(conn, _params) do
-    cutoff = DateTime.utc_now() |> DateTime.add(-@active_window_secs, :second)
+    # Use Presence as the source of truth for "active rooms".
+    #
+    # Relying on `hubs.last_active_at` is brittle because that column is not
+    # consistently updated by all room activity paths in our deployment.
+    present_hub_sids =
+      RetWeb.Presence.present_hub_sids()
+      |> Enum.filter(& &1)
+      |> Enum.reject(&(&1 == "admin"))
+      |> Enum.uniq()
 
     hubs =
       Hub
-      |> where([h], h.last_active_at > ^cutoff)
+      |> where([h], h.hub_sid in ^present_hub_sids)
       |> select([h], %{hub_sid: h.hub_sid, user_data: h.user_data, last_active_at: h.last_active_at})
       |> Repo.all()
       |> Enum.map(&to_bot_hub_entry/1)
