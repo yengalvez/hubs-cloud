@@ -114,7 +114,7 @@ defmodule RetWeb.Api.V1.BotController do
   defp normalize_context(%{} = context), do: context
   defp normalize_context(_), do: %{}
 
-  defp normalize_integer(value, _default) when is_integer(value), do: value |> max(0) |> min(5)
+  defp normalize_integer(value, _default) when is_integer(value), do: value |> max(0) |> min(10)
 
   defp normalize_integer(value, default) when is_binary(value) do
     case Integer.parse(value) do
@@ -122,7 +122,7 @@ defmodule RetWeb.Api.V1.BotController do
       _ -> default
     end
     |> max(0)
-    |> min(5)
+    |> min(10)
   end
 
   defp normalize_integer(_, default), do: default

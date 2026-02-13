@@ -1537,7 +1537,7 @@ defmodule RetWeb.HubChannel do
     }
   end
 
-  defp normalize_integer(value) when is_integer(value), do: value |> max(0) |> min(5)
+  defp normalize_integer(value) when is_integer(value), do: value |> max(0) |> min(10)
 
   defp normalize_integer(value) when is_binary(value) do
     case Integer.parse(value) do
@@ -1545,7 +1545,7 @@ defmodule RetWeb.HubChannel do
       _ -> 0
     end
     |> max(0)
-    |> min(5)
+    |> min(10)
   end
 
   defp normalize_integer(_), do: 0

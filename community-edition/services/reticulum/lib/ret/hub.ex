@@ -452,7 +452,7 @@ defmodule Ret.Hub do
 
   defp normalize_bots_config(%{} = bots) do
     enabled = normalize_bool(map_get(bots, "enabled", false), false)
-    count = normalize_integer(map_get(bots, "count", 0), 0, 5, 0)
+    count = normalize_integer(map_get(bots, "count", 0), 0, 10, 0)
     mobility = normalize_mobility(map_get(bots, "mobility", "medium"))
     chat_enabled = normalize_bool(map_get(bots, "chat_enabled", false), false)
 
