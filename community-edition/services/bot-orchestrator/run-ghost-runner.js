@@ -316,7 +316,15 @@ function getHubsComponents(node) {
   if (!node || typeof node !== "object") return null;
   const ext = node.extensions;
   if (!ext || typeof ext !== "object") return null;
-  return ext.HUBS_components || ext["HUBS_components"] || null;
+  // Spoke/Hubs scenes typically export glTF nodes with MOZ_hubs_components.
+  // Keep HUBS_components as a fallback for older exports.
+  return (
+    ext.MOZ_hubs_components ||
+    ext["MOZ_hubs_components"] ||
+    ext.HUBS_components ||
+    ext["HUBS_components"] ||
+    null
+  );
 }
 
 function extractWaypointsAndColliders(gltf) {
