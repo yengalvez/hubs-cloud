@@ -216,6 +216,29 @@ function main() {
       processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
     }
 
+    // Runner defaults (safe, reversible). These must exist because the template uses $VARS.
+    if (!processedConfig.RUNNER_BACKEND) {
+      processedConfig.RUNNER_BACKEND = "chromium";
+    }
+    if (String(processedConfig.RUNNER_BACKEND).toLowerCase().trim() !== "ghost") {
+      processedConfig.RUNNER_BACKEND = "chromium";
+    }
+    if (!processedConfig.RUNNER_BACKEND_CANARY_HUBS) {
+      processedConfig.RUNNER_BACKEND_CANARY_HUBS = "";
+    }
+    if (!processedConfig.GHOST_RUNNER_SCRIPT) {
+      processedConfig.GHOST_RUNNER_SCRIPT = "/app/run-ghost-runner.js";
+    }
+    if (!processedConfig.GHOST_RAYCAST_MODE) {
+      processedConfig.GHOST_RAYCAST_MODE = "spoke_colliders";
+    }
+    if (!processedConfig.MAX_ACTIVE_ROOMS) {
+      processedConfig.MAX_ACTIVE_ROOMS = "5";
+    }
+    if (!processedConfig.MAX_BOTS_PER_ROOM) {
+      processedConfig.MAX_BOTS_PER_ROOM = "10";
+    }
+
     // Keep PERMS_KEY stable across runs. Rotate only when missing.
     let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);
     if (!privateKey) {

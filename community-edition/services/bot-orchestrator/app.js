@@ -8,6 +8,13 @@ const PORT = Number(process.env.PORT || 5001);
 const BOT_ACCESS_KEY = process.env.BOT_ACCESS_KEY || "";
 const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
+const RUNNER_BACKEND = (process.env.RUNNER_BACKEND || "chromium").trim().toLowerCase();
+const RUNNER_BACKEND_CANARY_HUBS = (process.env.RUNNER_BACKEND_CANARY_HUBS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+const CANARY_HUB_SET = new Set(RUNNER_BACKEND_CANARY_HUBS);
+const GHOST_RUNNER_SCRIPT = process.env.GHOST_RUNNER_SCRIPT || "";
 const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
 const RET_INTERNAL_ENDPOINT = (process.env.RET_INTERNAL_ENDPOINT || "http://ret:4001").replace(/\/+$/, "");
 const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/configured_with_bots";
@@ -17,8 +24,10 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://api.openai.com/v1/responses";
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 9_000);
-const MAX_ACTIVE_ROOMS = parsePositiveInt(process.env.MAX_ACTIVE_ROOMS, 1);
-const MAX_BOTS_PER_ROOM = parsePositiveInt(process.env.MAX_BOTS_PER_ROOM, 5);
+const MAX_ACTIVE_ROOMS = parsePositiveInt(process.env.MAX_ACTIVE_ROOMS, 5);
+// Safety: Chromium runners are extremely expensive. Keep a hard cap of 1 chromium runner.
+const MAX_CHROMIUM_ROOMS = parsePositiveInt(process.env.MAX_CHROMIUM_ROOMS, 1);
+const MAX_BOTS_PER_ROOM = parsePositiveInt(process.env.MAX_BOTS_PER_ROOM, 10);
 const CHAT_RATE_LIMIT_MS = parsePositiveInt(process.env.CHAT_RATE_LIMIT_MS, 700);
 
 const roomConfigs = new Map();
@@ -39,6 +48,36 @@ function clamp(value, min, max) {
 function trimReply(reply) {
   if (typeof reply !== "string") return "";
   return reply.trim().slice(0, 500);
+}
+
+function normalizedBackend(value) {
+  if (typeof value !== "string") return "chromium";
+  const v = value.trim().toLowerCase();
+  return v === "ghost" ? "ghost" : "chromium";
+}
+
+function backendForHub(hubSid) {
+  if (CANARY_HUB_SET.has(hubSid)) return "ghost";
+  return normalizedBackend(RUNNER_BACKEND);
+}
+
+function maxActiveForBackend(backend) {
+  return backend === "chromium" ? MAX_CHROMIUM_ROOMS : MAX_ACTIVE_ROOMS;
+}
+
+function activeRoomsForBackend(backend) {
+  let count = 0;
+  roomRunners.forEach(info => {
+    if (info && info.backend === backend) count += 1;
+  });
+  return count;
+}
+
+function runnerScriptForBackend(backend) {
+  if (backend === "ghost") {
+    return GHOST_RUNNER_SCRIPT || "/app/run-ghost-runner.js";
+  }
+  return RUNNER_SCRIPT || "/app/run-bot.js";
 }
 
 function normalizeWaypointName(value) {
@@ -320,11 +359,16 @@ function runnerStateForHub(hubSid) {
 }
 
 function canAutostartRunners() {
-  return RUNNER_AUTOSTART && !!RUNNER_SCRIPT;
+  return RUNNER_AUTOSTART && (!!RUNNER_SCRIPT || !!GHOST_RUNNER_SCRIPT);
 }
 
-function canStartMoreRunners() {
-  return roomRunners.size < MAX_ACTIVE_ROOMS;
+function canStartMoreRunnersForBackend(backend) {
+  return activeRoomsForBackend(backend) < maxActiveForBackend(backend);
+}
+
+function canStartRunnerForHub(hubSid) {
+  const backend = backendForHub(hubSid);
+  return canStartMoreRunnersForBackend(backend);
 }
 
 function enqueueHub(hubSid) {
@@ -343,14 +387,32 @@ function dequeueHub(hubSid) {
 function fillQueuedRunnerSlots() {
   if (!canAutostartRunners()) return;
 
-  while (queuedRunnerHubs.length > 0 && canStartMoreRunners()) {
-    const hubSid = queuedRunnerHubs.shift();
-    const room = roomConfigs.get(hubSid);
-    if (!room || !room.bots.enabled || room.bots.count <= 0) continue;
+  // Scan the queue and start any hub whose backend has capacity. This avoids
+  // blocking ghost rooms behind an expensive chromium hub.
+  let startedAny = true;
+  while (startedAny) {
+    startedAny = false;
 
-    const started = startRunner(hubSid);
-    if (!started) {
-      queuedRunnerHubs.unshift(hubSid);
+    for (let i = 0; i < queuedRunnerHubs.length; i++) {
+      const hubSid = queuedRunnerHubs[i];
+      const room = roomConfigs.get(hubSid);
+      if (!room || !room.bots.enabled || room.bots.count <= 0) {
+        queuedRunnerHubs.splice(i, 1);
+        i -= 1;
+        continue;
+      }
+
+      if (!canStartRunnerForHub(hubSid)) continue;
+
+      queuedRunnerHubs.splice(i, 1);
+      const started = startRunner(hubSid);
+      if (!started) {
+        // Put it back at the front and stop trying for now.
+        queuedRunnerHubs.unshift(hubSid);
+        return;
+      }
+
+      startedAny = true;
       break;
     }
   }
@@ -372,13 +434,16 @@ function stopRunner(hubSid) {
 function startRunner(hubSid) {
   if (!canAutostartRunners()) return false;
   if (roomRunners.has(hubSid)) return true;
-  if (!canStartMoreRunners()) return false;
+  const backend = backendForHub(hubSid);
+  if (!canStartMoreRunnersForBackend(backend)) return false;
 
-  const args = [RUNNER_SCRIPT, "--url", HUBS_BASE_URL, "--room", hubSid, "--runner"];
+  const script = runnerScriptForBackend(backend);
+  const args = [script, "--url", HUBS_BASE_URL, "--room", hubSid, "--runner"];
   const child = spawn("node", args, { stdio: "inherit" });
 
   const info = {
     process: child,
+    backend,
     restartDelayMs: 3000,
     restartTimer: null
   };
@@ -390,7 +455,7 @@ function startRunner(hubSid) {
 
     const room = roomConfigs.get(hubSid);
     if (room && room.bots && room.bots.enabled && room.bots.count > 0 && canAutostartRunners()) {
-      if (canStartMoreRunners()) {
+      if (canStartRunnerForHub(hubSid)) {
         info.restartTimer = setTimeout(() => {
           const restarted = startRunner(hubSid);
           if (!restarted) {
@@ -427,7 +492,7 @@ function ensureRunnerState(hubSid) {
     return "stopped";
   }
 
-  if (canStartMoreRunners()) {
+  if (canStartRunnerForHub(hubSid)) {
     const started = startRunner(hubSid);
     if (started) return "running";
   }
@@ -523,15 +588,24 @@ function authMiddleware(req, res, next) {
 }
 
 app.get("/health", (_req, res) => {
+  const runner_backends = {};
+  roomRunners.forEach((info, hubSid) => {
+    runner_backends[hubSid] = info && info.backend ? info.backend : "unknown";
+  });
+
   res.json({
     ok: true,
     rooms: roomConfigs.size,
     active_rooms: roomRunners.size,
     queued_rooms: queuedRunnerHubs.length,
     max_active_rooms: MAX_ACTIVE_ROOMS,
+    max_chromium_rooms: MAX_CHROMIUM_ROOMS,
     max_bots_per_room: MAX_BOTS_PER_ROOM,
     llm_enabled: !!OPENAI_API_KEY,
     model: OPENAI_MODEL,
+    runner_backend_default: normalizedBackend(RUNNER_BACKEND),
+    runner_backend_canary_hubs: RUNNER_BACKEND_CANARY_HUBS,
+    runner_backends,
     active_hubs: Array.from(roomRunners.keys()),
     queued_hubs: [...queuedRunnerHubs]
   });

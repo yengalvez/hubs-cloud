@@ -10,7 +10,10 @@
   "dependencies": {
     "docopt": "^0.6.2",
     "express": "^4.21.2",
+    "gl-matrix": "^3.4.4",
+    "phoenix": "github:gfodor/phoenix-js#master",
     "puppeteer-core": "^24.28.0",
-    "query-string": "^9.3.1"
+    "query-string": "^9.3.1",
+    "ws": "^8.18.0"
   }
 }

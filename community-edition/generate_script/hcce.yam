@@ -670,14 +670,22 @@ spec:
           value: gpt-5-nano
         - name: RUNNER_AUTOSTART
           value: "true"
+        - name: RUNNER_BACKEND
+          value: "$RUNNER_BACKEND"
+        - name: RUNNER_BACKEND_CANARY_HUBS
+          value: "$RUNNER_BACKEND_CANARY_HUBS"
         - name: RUNNER_SCRIPT
           value: /app/run-bot.js
+        - name: GHOST_RUNNER_SCRIPT
+          value: "$GHOST_RUNNER_SCRIPT"
+        - name: GHOST_RAYCAST_MODE
+          value: "$GHOST_RAYCAST_MODE"
         - name: HUBS_BASE_URL
           value: https://$HUB_DOMAIN
         - name: MAX_ACTIVE_ROOMS
-          value: "1"
+          value: "$MAX_ACTIVE_ROOMS"
         - name: MAX_BOTS_PER_ROOM
-          value: "10"
+          value: "$MAX_BOTS_PER_ROOM"
         livenessProbe:
           httpGet:
             path: /health
