@@ -5,6 +5,27 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
 
   alias Ret.{Hub, Repo}
 
+  def configured_with_bots(conn, _params) do
+    # Used by the bot-orchestrator to rehydrate desired runner state after restarts.
+    # This lists hubs by config (user_data.bots) rather than Presence.
+    hubs =
+      Hub
+      |> where(
+        [h],
+        fragment("COALESCE((?->'bots'->>'enabled')::boolean, false) = true", h.user_data)
+      )
+      |> where([h], fragment("COALESCE((?->'bots'->>'count')::int, 0) > 0", h.user_data))
+      |> where([h], h.hub_sid != "admin")
+      |> select([h], %{hub_sid: h.hub_sid, user_data: h.user_data, last_active_at: h.last_active_at})
+      |> Repo.all()
+      |> Enum.map(&to_bot_hub_entry/1)
+      |> Enum.filter(& &1)
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Poison.encode!(%{hubs: hubs}))
+  end
+
   def active_with_bots(conn, _params) do
     # Use Presence as the source of truth for "active rooms".
     #

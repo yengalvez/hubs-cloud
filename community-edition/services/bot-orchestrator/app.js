@@ -10,7 +10,7 @@ const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
 const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
 const RET_INTERNAL_ENDPOINT = (process.env.RET_INTERNAL_ENDPOINT || "http://ret:4001").replace(/\/+$/, "");
-const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/active_with_bots";
+const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/configured_with_bots";
 const RET_INTERNAL_ACCESS_HEADER = process.env.RET_INTERNAL_ACCESS_HEADER || "x-ret-dashboard-access-key";
 const RET_SYNC_INTERVAL_MS = parsePositiveInt(process.env.RET_SYNC_INTERVAL_MS, 30_000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -442,19 +442,35 @@ async function syncActiveRoomsFromReticulum() {
     headers[RET_INTERNAL_ACCESS_HEADER] = BOT_ACCESS_KEY;
   }
 
-  const endpoint = `${RET_INTERNAL_ENDPOINT}${RET_INTERNAL_PATH}`;
+  const primaryEndpoint = `${RET_INTERNAL_ENDPOINT}${RET_INTERNAL_PATH}`;
+  const fallbackEndpoint = `${RET_INTERNAL_ENDPOINT}/api-internal/v1/hubs/active_with_bots`;
 
   let response;
   try {
-    response = await fetch(endpoint, { headers });
+    response = await fetch(primaryEndpoint, { headers });
   } catch (error) {
     console.warn("Active room bot sync failed.", error.message);
     return;
   }
 
   if (!response.ok) {
-    console.warn("Active room bot sync returned non-OK status.", response.status);
-    return;
+    console.warn(
+      "Active room bot sync returned non-OK status.",
+      response.status,
+      "primary=",
+      RET_INTERNAL_PATH,
+      "falling back to active_with_bots"
+    );
+    try {
+      response = await fetch(fallbackEndpoint, { headers });
+    } catch (error) {
+      console.warn("Active room bot fallback sync failed.", error.message);
+      return;
+    }
+    if (!response.ok) {
+      console.warn("Active room bot fallback sync returned non-OK status.", response.status);
+      return;
+    }
   }
 
   let payload;

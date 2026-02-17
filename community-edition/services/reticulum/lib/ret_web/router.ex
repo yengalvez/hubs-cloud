@@ -211,6 +211,7 @@ defmodule RetWeb.Router do
       get "/presence", ApiInternal.V1.PresenceController, :show
       get "/presence/range_max", ApiInternal.V1.PresenceController, :range_max
       get "/hubs/active_with_bots", ApiInternal.V1.BotsController, :active_with_bots
+      get "/hubs/configured_with_bots", ApiInternal.V1.BotsController, :configured_with_bots
       get "/storage", ApiInternal.V1.StorageController, :show
       post "/rewrite_assets", ApiInternal.V1.RewriteAssetsController, :post
       put "/change_email_for_login", ApiInternal.V1.LoginEmailController, :update
