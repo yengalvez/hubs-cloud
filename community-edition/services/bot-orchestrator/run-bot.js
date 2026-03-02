@@ -18,12 +18,34 @@ const executablePath =
   process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 const NAVIGATION_TIMEOUT_MS = Number(process.env.RUNNER_NAV_TIMEOUT_MS || 120000);
 const STARTUP_TIMEOUT_MS = Number(process.env.RUNNER_STARTUP_TIMEOUT_MS || 120000);
+const HEALTH_CHECK_INTERVAL_MS = Number(process.env.RUNNER_HEALTH_CHECK_INTERVAL_MS || 15000);
+const HEALTH_FAILURE_EXIT_THRESHOLD = Number(process.env.RUNNER_HEALTH_FAILURE_EXIT_THRESHOLD || 6);
+const FATAL_PAGE_ERROR_PATTERNS = [
+  /getServerTime/i,
+  /reading 'systems'/i,
+  /reading 'occupants'/i,
+  /reading 'adapter'/i,
+  /reading 'connection'/i
+];
 
 function log(...objs) {
   console.log.call(null, [new Date().toISOString()].concat(objs).join(" "));
 }
 
 (async () => {
+  let shuttingDown = false;
+  const requestExit = async (code, reason, browserRef) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(reason);
+    try {
+      if (browserRef) {
+        await browserRef.close();
+      }
+    } catch (_err) {}
+    process.exit(code);
+  };
+
   const browser = await puppeteer.launch({
     executablePath,
     ignoreHTTPSErrors: true,
@@ -42,8 +64,25 @@ function log(...objs) {
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     page.setDefaultTimeout(NAVIGATION_TIMEOUT_MS);
     page.on("console", msg => log("PAGE:", msg.text()));
-    page.on("error", err => log("ERROR:", err.toString().split("\n")[0]));
-    page.on("pageerror", err => log("PAGE ERROR:", err.toString().split("\n")[0]));
+    page.on("error", err => {
+      const message = err.toString().split("\n")[0];
+      log("ERROR:", message);
+      if (!shuttingDown) {
+        requestExit(1, `Runner page crashed: ${message}`, browser);
+      }
+    });
+    page.on("pageerror", err => {
+      const message = err.toString().split("\n")[0];
+      log("PAGE ERROR:", message);
+      if (!shuttingDown && FATAL_PAGE_ERROR_PATTERNS.some(pattern => pattern.test(message))) {
+        requestExit(1, `Runner fatal page error detected: ${message}`, browser);
+      }
+    });
+    page.on("close", () => {
+      if (!shuttingDown) {
+        requestExit(1, "Runner page closed unexpectedly.", browser);
+      }
+    });
     return page;
   };
 
@@ -125,8 +164,54 @@ function log(...objs) {
 
   await navigateWithRetry();
 
+  browser.on("disconnected", () => {
+    if (!shuttingDown) {
+      requestExit(1, "Browser disconnected unexpectedly.", null);
+    }
+  });
+
+  let consecutiveHealthFailures = 0;
+  const healthCheckInterval = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      const health = await page.evaluate(() => {
+        const scene = window.APP?.scene || document.querySelector("a-scene");
+        const connection = window.NAF?.connection;
+        const adapter = connection?.adapter;
+        const entered = !!(scene && scene.is && scene.is("entered"));
+        const connected =
+          !!(connection && typeof connection.isConnected === "function" && connection.isConnected());
+        const hasSystems = !!(scene && scene.systems);
+        const occupants = adapter && adapter.occupants ? Object.keys(adapter.occupants).length : 0;
+        const bots = document.querySelectorAll("[bot-info]").length;
+
+        return { entered, connected, hasSystems, occupants, bots };
+      });
+
+      const healthy = !!(health && health.entered && health.connected && health.hasSystems);
+      if (!healthy) {
+        throw new Error(`unhealthy_state:${JSON.stringify(health || {})}`);
+      }
+
+      consecutiveHealthFailures = 0;
+      log("Runner metrics:", JSON.stringify(health));
+    } catch (e) {
+      consecutiveHealthFailures += 1;
+      log(
+        "Runner health check error:",
+        e.message,
+        `(failure ${consecutiveHealthFailures}/${HEALTH_FAILURE_EXIT_THRESHOLD})`
+      );
+      if (consecutiveHealthFailures >= HEALTH_FAILURE_EXIT_THRESHOLD) {
+        clearInterval(healthCheckInterval);
+        await requestExit(1, "Runner unhealthy for too long, restarting.", browser);
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+
   const shutdown = async signal => {
     log(`Received ${signal}, shutting down runner.`);
+    clearInterval(healthCheckInterval);
     try {
       await browser.close();
     } catch (_err) {}
@@ -136,15 +221,5 @@ function log(...objs) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  setInterval(async () => {
-    try {
-      const metrics = await page.evaluate(() => ({
-        occupants: Object.keys(NAF.connection.adapter.occupants).length,
-        bots: document.querySelectorAll("[bot-info]").length
-      }));
-      log("Runner metrics:", JSON.stringify(metrics));
-    } catch (e) {
-      log("Runner metrics read error:", e.message);
-    }
-  }, 60_000);
+  // Keep process alive; health checks above handle recovery.
 })();

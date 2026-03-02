@@ -703,6 +703,14 @@ function removeEntityPayload(networkId) {
   }
 
   const channel = socket.channel(`hub:${hubSid}`, joinParams);
+  channel.onError(() => {
+    log("Phoenix channel error, exiting for orchestrator restart.");
+    process.exit(1);
+  });
+  channel.onClose(() => {
+    log("Phoenix channel closed, exiting for orchestrator restart.");
+    process.exit(1);
+  });
 
   const joinData = await new Promise((resolve, reject) => {
     channel
