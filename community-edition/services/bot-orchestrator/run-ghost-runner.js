@@ -1016,8 +1016,9 @@ function removeEntityPayload(networkId) {
   // Update config on hub refresh (room settings).
   channel.on("hub_refresh", payload => {
     const refreshedHub = payload && Array.isArray(payload.hubs) ? payload.hubs[0] : null;
-    if (!refreshedHub || !refreshedHub.user_data) return;
-    const nextConfig = normalizeBotsConfig((refreshedHub.user_data && refreshedHub.user_data.bots) || {});
+    const userData = refreshedHub && refreshedHub.user_data;
+    if (!userData || typeof userData !== "object" || !Object.prototype.hasOwnProperty.call(userData, "bots")) return;
+    const nextConfig = normalizeBotsConfig(userData.bots || {});
     botsConfig = nextConfig;
   });
 
@@ -1025,14 +1026,24 @@ function removeEntityPayload(networkId) {
   const presence = new Presence(channel);
   presence.onSync(() => {
     const keys = presence.list(key => key) || [];
+    const currentOccupants = new Set();
+
     for (let i = 0; i < keys.length; i++) {
       const k = keys[i];
       if (!k || k === sessionId) continue;
+      currentOccupants.add(k);
       if (knownOccupants.has(k)) continue;
       knownOccupants.add(k);
       // Broadcast a full sync for immediate visibility.
       broadcastFullSync(timekeeper.nowMs());
     }
+
+    // Drop occupants that left so reconnects trigger a new full sync.
+    knownOccupants.forEach(k => {
+      if (!currentOccupants.has(k)) {
+        knownOccupants.delete(k);
+      }
+    });
   });
 
   // Fetch scene waypoints/colliders and featured avatars.
