@@ -661,6 +661,12 @@ function removeEntityPayload(networkId) {
   const raycastMode = (process.env.GHOST_RAYCAST_MODE || "spoke_colliders").trim().toLowerCase();
   const pathStartDelayMs = Number(process.env.PATH_START_DELAY_MS || 450);
   const minWalkDurationMs = Number(process.env.MIN_WALK_DURATION_MS || 600);
+  const fullSyncBurstRepeats = clamp(Number(process.env.GHOST_FULL_SYNC_BURST_REPEATS || 6), 1, 20);
+  const fullSyncBurstIntervalMs = Math.max(250, Number(process.env.GHOST_FULL_SYNC_BURST_INTERVAL_MS || 750));
+  const fullSyncBurstInitialDelayMs = Math.max(
+    0,
+    Number(process.env.GHOST_FULL_SYNC_BURST_INITIAL_DELAY_MS || 250)
+  );
 
   const wsPkg = require("ws");
   global.WebSocket = wsPkg; // required for phoenix in Node
@@ -741,8 +747,20 @@ function removeEntityPayload(networkId) {
   const bots = new Map();
   const reservedTargets = new Map();
   const knownOccupants = new Set();
+  const fullSyncTimers = new Set();
+
+  const scheduleTimeout = (fn, delayMs) => {
+    const timer = setTimeout(() => {
+      fullSyncTimers.delete(timer);
+      fn();
+    }, delayMs);
+    fullSyncTimers.add(timer);
+    return timer;
+  };
 
   const reconcileBots = nowMs => {
+    let changed = false;
+
     if (!botsConfig.enabled || botsConfig.count <= 0) {
       if (bots.size > 0) {
         bots.forEach(record => {
@@ -750,8 +768,9 @@ function removeEntityPayload(networkId) {
         });
         bots.clear();
         reservedTargets.clear();
+        changed = true;
       }
-      return;
+      return changed;
     }
 
     const desired = clamp(botsConfig.count, 0, 10);
@@ -764,6 +783,7 @@ function removeEntityPayload(networkId) {
       reservedTargets.delete(record.reservedTargetName);
       sendNaf(channel, removeEntityPayload(record.networkId));
       bots.delete(botId);
+      changed = true;
     }
 
     // Add missing bots.
@@ -813,12 +833,16 @@ function removeEntityPayload(networkId) {
         reservedTargetName: null,
         path: null
       });
+
+      changed = true;
     }
 
     // Update mobility on existing bots.
     bots.forEach(record => {
       record.mobility = botsConfig.mobility;
     });
+
+    return changed;
   };
 
   const updateRecordPositionFromPath = (record, nowMs) => {
@@ -1007,6 +1031,22 @@ function removeEntityPayload(networkId) {
     });
   };
 
+  const scheduleFullSyncBurst = reason => {
+    if (!bots.size) return;
+
+    log(
+      `[ghost] full sync burst scheduled reason=${reason} bots=${bots.size} repeats=${fullSyncBurstRepeats} intervalMs=${fullSyncBurstIntervalMs}`
+    );
+
+    for (let i = 0; i < fullSyncBurstRepeats; i++) {
+      const delayMs = fullSyncBurstInitialDelayMs + i * fullSyncBurstIntervalMs;
+      scheduleTimeout(() => {
+        if (!bots.size) return;
+        broadcastFullSync(timekeeper.nowMs());
+      }, delayMs);
+    }
+  };
+
   // Handle commands from bot chat.
   channel.on("message", payload => {
     if (!payload || payload.type !== "bot_command") return;
@@ -1042,8 +1082,9 @@ function removeEntityPayload(networkId) {
       currentOccupants.add(k);
       if (knownOccupants.has(k)) continue;
       knownOccupants.add(k);
-      // Broadcast a full sync for immediate visibility.
-      broadcastFullSync(timekeeper.nowMs());
+      // A single first-sync can land before late joiners are fully ready to instantiate templates.
+      // Burst a few guaranteed first-syncs so bots materialize reliably without relying on a heavy Chromium client.
+      scheduleFullSyncBurst(`late-join:${k}`);
     }
 
     // Drop occupants that left so reconnects trigger a new full sync.
@@ -1109,7 +1150,10 @@ function removeEntityPayload(networkId) {
     // Reconcile bots periodically so config changes take effect.
     if (now - lastConfigRefreshAt >= CONFIG_REFRESH_INTERVAL_MS) {
       lastConfigRefreshAt = now;
-      reconcileBots(now);
+      const changed = reconcileBots(now);
+      if (changed) {
+        scheduleFullSyncBurst("reconcile");
+      }
     }
 
     if (now - lastFeaturedRefreshAt >= FEATURED_REFRESH_INTERVAL_MS) {
@@ -1132,7 +1176,10 @@ function removeEntityPayload(networkId) {
     });
   };
 
-  reconcileBots(timekeeper.nowMs());
+  const initialChanged = reconcileBots(timekeeper.nowMs());
+  if (initialChanged) {
+    scheduleFullSyncBurst("startup");
+  }
   broadcastFullSync(timekeeper.nowMs());
 
   const interval = setInterval(tick, 100);
@@ -1140,6 +1187,8 @@ function removeEntityPayload(networkId) {
   const shutdown = signal => {
     log(`Received ${signal}, shutting down ghost runner.`);
     clearInterval(interval);
+    fullSyncTimers.forEach(timer => clearTimeout(timer));
+    fullSyncTimers.clear();
     try {
       bots.forEach(record => {
         sendNaf(channel, removeEntityPayload(record.networkId));
