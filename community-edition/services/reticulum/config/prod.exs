@@ -144,6 +144,10 @@ config :sentry,
 
 config :ret, Ret.RoomAssigner, balancer_weights: [{600, 1}, {300, 50}, {0, 500}]
 
+config :ret, Ret.BotOrchestrator,
+  endpoint: "http://bot-orchestrator:5001",
+  access_key: ""
+
 config :ret, Ret.Locking,
   lock_timeout_ms: 1000 * 60 * 15,
   session_lock_db: [

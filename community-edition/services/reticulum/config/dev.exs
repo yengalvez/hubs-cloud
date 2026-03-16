@@ -118,6 +118,10 @@ config :ret,
   upload_encryption_key: "a8dedeb57adafa7821027d546f016efef5a501bd",
   bot_access_key: ""
 
+config :ret, Ret.BotOrchestrator,
+  endpoint: "http://localhost:5001",
+  access_key: ""
+
 config :ret, Ret.PageOriginWarmer, insecure_ssl: true
 
 config :ret, Ret.HttpUtils, insecure_ssl: true

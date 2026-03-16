@@ -30,6 +30,8 @@ features.default_room_id = { category = "features", type = "string", name = "Hom
 features.enable_spoke = { category = "features", type = "boolean", name = "Enable Scene Editor", description = "Enable Scene Editor for all visitors."}
 features.enable_lobby_ghosts = { category = "features", type = "boolean", name = "Enable Lobby Ghosts", description = "Allow people in the lobby to explore the room while remaining invisible and inaudible." }
 features.public_api_access = { category = "features", type = "boolean", name = "Public API Access", description = "Enables a publicly-accessible API for managing backend resources programmatically.", internal = "false" }
+features.enable_room_bots = { category = "features", type = "boolean", name = "Enable Room Bots", description = "Enable room-level bot controls and runtime bot entities.", internal = "true" }
+features.enable_bot_chat = { category = "features", type = "boolean", name = "Enable Bot Chat", description = "Enable private bot chat UI and backend integration.", internal = "true" }
 
 features.permissive_rooms = { category = "rooms", type = "boolean", name = "Permissive Rooms", description = "Enable full content creation permissions on new rooms." }
 features.disable_room_creation = { category = "rooms", type = "boolean", name = "Disable room creation", description = "Disable creating rooms for non-administrators." }

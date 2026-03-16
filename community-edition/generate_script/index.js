@@ -60,6 +60,15 @@ function convertPemToJwk(publicKey) {
   return JSON.stringify(jwk);
 }
 
+function normalizePemPrivateKey(value) {
+  if (!value || typeof value !== "string") return "";
+  return value
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
 function generatePersistentVolumes(processedConfig, replacedContent) {
   const yamlDocuments = YAML.parseAllDocuments(replacedContent);
   let outputIdx = 2;
@@ -177,6 +186,12 @@ function handleImageOverrides(processedConfig, replacedContent) {
           yamlDocuments[index] = new YAML.Document(jsDoc);
         }
       }
+      else if (jsDoc.metadata.name === "bot-orchestrator") {
+        if (processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE) {
+          jsDoc.spec.template.spec.containers[0].image = processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE;
+          yamlDocuments[index] = new YAML.Document(jsDoc);
+        }
+      }
     }
   });
 
@@ -192,8 +207,49 @@ function main() {
       {"schema": "yaml-1.1"} // required to load yes/no as boolean values
     );
 
-    // Generate keys and certificate
-    const { privateKey, publicKey } = generateKeys();
+    // Backward compatibility for older local files that still use OPENAI.
+    if (!processedConfig.OPENAI_API_KEY && processedConfig.OPENAI) {
+      processedConfig.OPENAI_API_KEY = processedConfig.OPENAI;
+    }
+
+    if (!processedConfig.BOT_ACCESS_KEY) {
+      processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
+    }
+
+    // Runner defaults (safe, reversible). These must exist because the template uses $VARS.
+    if (!processedConfig.RUNNER_BACKEND) {
+      processedConfig.RUNNER_BACKEND = "chromium";
+    }
+    if (String(processedConfig.RUNNER_BACKEND).toLowerCase().trim() !== "ghost") {
+      processedConfig.RUNNER_BACKEND = "chromium";
+    }
+    if (!processedConfig.RUNNER_BACKEND_CANARY_HUBS) {
+      processedConfig.RUNNER_BACKEND_CANARY_HUBS = "";
+    }
+    if (!processedConfig.GHOST_RUNNER_SCRIPT) {
+      processedConfig.GHOST_RUNNER_SCRIPT = "/app/run-ghost-runner.js";
+    }
+    if (!processedConfig.GHOST_RAYCAST_MODE) {
+      processedConfig.GHOST_RAYCAST_MODE = "spoke_colliders";
+    }
+    if (!processedConfig.MAX_ACTIVE_ROOMS) {
+      processedConfig.MAX_ACTIVE_ROOMS = "5";
+    }
+    if (!processedConfig.MAX_BOTS_PER_ROOM) {
+      processedConfig.MAX_BOTS_PER_ROOM = "10";
+    }
+
+    // Keep PERMS_KEY stable across runs. Rotate only when missing.
+    let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);
+    if (!privateKey) {
+      ({ privateKey } = generateKeys());
+    }
+
+    const publicKey = crypto
+      .createPublicKey(privateKey)
+      .export({ type: "spki", format: "pem" });
+
+    // Generate certs for ingress TLS init.
     const { pemCert, pemPrivateKey } = generateCertificate(config.HUB_DOMAIN);
 
     processedConfig.PGRST_JWT_SECRET = convertPemToJwk(publicKey);

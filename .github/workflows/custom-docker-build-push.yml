@@ -13,6 +13,8 @@ on:
         type: string
       Override_Image_Tag:
         type: string
+      Override_Repo_Name:
+        type: string
       Override_Dockerfile:
         type: string
       Override_Code_Path:
@@ -29,6 +31,7 @@ env:
   Registry_Base_URL: ${{ inputs.Override_Registry_Base_URL || vars.REGISTRY_BASE_URL || 'ghcr.io' }}
   Registry_Namespace: ${{ inputs.Override_Registry_Namespace || vars.REGISTRY_NAMESPACE || github.repository_owner }}
   Image_Tag: ${{ inputs.Override_Image_Tag || github.ref_name }}
+  Repo_Name: ${{ inputs.Override_Repo_Name || 'bot-orchestrator' }}
   Dockerfile: ${{ inputs.Override_Dockerfile || 'community-edition/services/bot-orchestrator/Dockerfile' }}
   Code_Path: ${{ inputs.Override_Code_Path || 'community-edition/services/bot-orchestrator' }}
   Use_Build_Cache: ${{ inputs.Use_Build_Cache }}
@@ -69,11 +72,6 @@ jobs:
           echo "::add-mask::$PASSWORD"
           echo "Registry_Password=$PASSWORD" >> "$GITHUB_ENV"
 
-      - name: Set image name
-        run: |
-          REPO_NAME="bot-orchestrator"
-          echo "repo_name=$REPO_NAME" >> "$GITHUB_ENV"
-
       - name: Sanitize image tag
         run: |
           TAG="${{ env.Image_Tag }}"
@@ -101,9 +99,9 @@ jobs:
         with:
           context: repo/${{ env.Code_Path }}
           file: repo/${{ env.Dockerfile }}
-          tags: ${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:${{ env.Image_Tag }}-latest,${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:${{ env.Image_Tag }}-${{ github.run_number }}
-          cache-from: type=registry,ref=${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:buildcache
-          cache-to: type=registry,ref=${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          tags: ${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:${{ env.Image_Tag }}-latest,${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:${{ env.Image_Tag }}-${{ github.run_number }}
+          cache-from: type=registry,ref=${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:buildcache
+          cache-to: type=registry,ref=${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
           push: true
 
       - name: Docker Build and Push (no cache)
@@ -112,5 +110,5 @@ jobs:
         with:
           context: repo/${{ env.Code_Path }}
           file: repo/${{ env.Dockerfile }}
-          tags: ${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:${{ env.Image_Tag }}-latest,${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.repo_name }}:${{ env.Image_Tag }}-${{ github.run_number }}
+          tags: ${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:${{ env.Image_Tag }}-latest,${{ env.Registry_Base_URL }}/${{ env.Registry_Namespace }}/${{ env.Repo_Name }}:${{ env.Image_Tag }}-${{ github.run_number }}
           push: true
