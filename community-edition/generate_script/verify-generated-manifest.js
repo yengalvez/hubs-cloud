@@ -95,6 +95,23 @@ if (!fs.existsSync(manifestPath)) {
     fail("manifest must create exactly one LoadBalancer Service named lb");
   }
 
+  const persistentVolumeClaims = resources.filter(resource => resource.kind === "PersistentVolumeClaim");
+  const expectedClaims = new Set(["pgsql-pvc", "ret-pvc"]);
+  if (
+    persistentVolumeClaims.length !== expectedClaims.size ||
+    persistentVolumeClaims.some(claim => !expectedClaims.has(claim.metadata?.name))
+  ) {
+    fail("manifest must create exactly the pgsql-pvc and ret-pvc PersistentVolumeClaims");
+  }
+  for (const claim of persistentVolumeClaims) {
+    if (claim.spec?.storageClassName !== "do-block-storage") {
+      fail(`PersistentVolumeClaim/${claim.metadata?.name} must use do-block-storage`);
+    }
+    if (String(claim.spec?.resources?.requests?.storage) !== "10Gi") {
+      fail(`PersistentVolumeClaim/${claim.metadata?.name} must request exactly 10Gi`);
+    }
+  }
+
   if (!errors.length) {
     console.log(`Manifest verification passed (${resources.length} resources).`);
   }
