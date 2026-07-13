@@ -1,5 +1,4 @@
 const crypto = require("crypto");
-const forge = require("node-forge");
 const path = require("path");
 const YAML = require("yaml");
 const pemJwk = require("pem-jwk");
@@ -20,38 +19,6 @@ function generateKeys() {
   });
 
   return { publicKey, privateKey };
-}
-
-// Generate a self-signed certificate
-function generateCertificate(hub_domain) {
-  // Create a new certificate
-  const { publicKey, privateKey } = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = publicKey;
-
-  // Set certificate attributes
-  cert.serialNumber = "01";
-  cert.validity.notBefore = new Date();
-  cert.validity.notAfter = new Date();
-  cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1);
-
-  const attrs = [
-    {
-      name: "commonName",
-      value: hub_domain,
-    }
-  ];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-
-  // Sign the certificate with its own private key
-  cert.sign(privateKey, forge.md.sha256.create());
-
-  // Convert the certificate and private key to PEM format
-  const pemCert = forge.pki.certificateToPem(cert);
-  const pemPrivateKey = forge.pki.privateKeyToPem(privateKey);
-
-  return { pemCert, pemPrivateKey };
 }
 
 // Function to convert PEM to JWK
@@ -249,13 +216,8 @@ function main() {
       .createPublicKey(privateKey)
       .export({ type: "spki", format: "pem" });
 
-    // Generate certs for ingress TLS init.
-    const { pemCert, pemPrivateKey } = generateCertificate(config.HUB_DOMAIN);
-
     processedConfig.PGRST_JWT_SECRET = convertPemToJwk(publicKey);
     processedConfig.PERMS_KEY = privateKey.replace(/\n/g, "\\\\n");
-    processedConfig.initCert = Buffer.from(pemCert).toString('base64').replace(/\n/g, "");
-    processedConfig.initKey = Buffer.from(pemPrivateKey).toString('base64').replace(/\n/g, "");
 
     // generate the hcce.yaml file
     const template = utils.readTemplate("/generate_script", "hcce.yam");
@@ -271,6 +233,7 @@ function main() {
 
   } catch (error) {
     console.error("Error in main function:", error);
+    process.exitCode = 1;
   }
 }
 

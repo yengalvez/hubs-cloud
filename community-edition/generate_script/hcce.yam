@@ -48,10 +48,13 @@ metadata:
   namespace: $Namespace
   annotations:
     kubernetes.io/ingress.class: haproxy
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    haproxy.org/ssl-redirect: "true"
     haproxy.org/response-set-header: |
       access-control-allow-origin "https://$HUB_DOMAIN"
     haproxy.org/path-rewrite: /api-internal(.*) /_drop_
 spec:
+  ingressClassName: haproxy
   tls:
   - hosts:
       - $HUB_DOMAIN
@@ -146,9 +149,12 @@ metadata:
   namespace: $Namespace
   annotations:
     kubernetes.io/ingress.class: haproxy
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    haproxy.org/ssl-redirect: "true"
     haproxy.org/server-ssl: "true"
     haproxy.org/load-balance: "url_param roomId"
 spec:
+  ingressClassName: haproxy
   tls:
   - hosts:
       - stream.$HUB_DOMAIN
@@ -172,8 +178,11 @@ metadata:
   namespace: $Namespace
   annotations:
     kubernetes.io/ingress.class: haproxy
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    haproxy.org/ssl-redirect: "true"
     haproxy.org/path-rewrite: /nearspark/(.*) /\1
 spec:
+  ingressClassName: haproxy
   tls:
   - hosts:
       - cors.$HUB_DOMAIN
@@ -1288,7 +1297,8 @@ data:
   backend-config-snippet: |
     option forwardfor
     option http-pretend-keepalive
-  ssl-redirect: "true"
+  # Keep ACME HTTP-01 solver ingresses reachable; application ingresses opt in above.
+  ssl-redirect: "false"
   timeout-client: 30m
   timeout-client-fin: 1h
   timeout-server: 30m
@@ -1296,16 +1306,6 @@ data:
   timeout-connect: 3s
   #access logging -- can be enabled at runtime
   syslog-server: 'address:stdout, format: raw, facility:daemon'
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cert-hcce
-  namespace: $Namespace
-type: kubernetes.io/tls
-data:
-  tls.crt: $initCert
-  tls.key: $initKey
 ---
 ######################################################################################
 ###################################### haproxy #######################################
@@ -1458,6 +1458,18 @@ rules:
     - "discovery.k8s.io"
     resources:
     - '*'
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - "gateway.networking.k8s.io"
+    resources:
+    - gateways
+    - gatewayclasses
+    - httproutes
+    - referencegrants
+    - tcproutes
     verbs:
     - get
     - list
