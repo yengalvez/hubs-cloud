@@ -10,8 +10,22 @@ defmodule Ret.BotOrchestrator do
   def room_stop(%{} = payload), do: post_json("/internal/bots/room-stop", payload)
 
   defp post_json(path, payload) do
+    case access_key() do
+      key when is_binary(key) and byte_size(key) >= 32 ->
+        do_post_json(path, payload, key)
+
+      _ ->
+        Logger.error(
+          "Bot orchestrator access key is missing or too short; request blocked path=#{path}"
+        )
+
+        {:error, :missing_access_key}
+    end
+  end
+
+  defp do_post_json(path, payload, access_key) do
     url = "#{endpoint()}#{path}"
-    headers = [{"Content-Type", "application/json"}] ++ auth_header()
+    headers = [{"Content-Type", "application/json"}, {"x-ret-bot-access-key", access_key}]
 
     case HTTPoison.post(url, Poison.encode!(payload), headers,
            timeout: @request_timeout_ms,
@@ -21,10 +35,8 @@ defmodule Ret.BotOrchestrator do
       when status_code >= 200 and status_code < 300 ->
         {:ok, decode_json(body)}
 
-      {:ok, %HTTPoison.Response{status_code: status_code, body: body}} ->
-        Logger.warning(
-          "Bot orchestrator request failed with status=#{status_code} path=#{path} body=#{String.slice(body || "", 0, 300)}"
-        )
+      {:ok, %HTTPoison.Response{status_code: status_code}} ->
+        Logger.warning("Bot orchestrator request failed with status=#{status_code} path=#{path}")
 
         {:error, {:http_error, status_code}}
 
@@ -44,20 +56,13 @@ defmodule Ret.BotOrchestrator do
     end
   end
 
-  defp auth_header do
-    case access_key() do
-      "" -> []
-      nil -> []
-      key -> [{"x-ret-bot-access-key", key}]
-    end
-  end
-
   defp endpoint do
     (Application.get_env(:ret, __MODULE__)[:endpoint] || "http://bot-orchestrator:5001")
     |> String.trim_trailing("/")
   end
 
   defp access_key do
-    Application.get_env(:ret, __MODULE__)[:access_key] || Application.get_env(:ret, :bot_access_key) || ""
+    Application.get_env(:ret, __MODULE__)[:access_key] ||
+      Application.get_env(:ret, :bot_access_key) || ""
   end
 end

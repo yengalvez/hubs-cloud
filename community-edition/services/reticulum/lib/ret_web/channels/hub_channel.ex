@@ -82,7 +82,7 @@ defmodule RetWeb.HubChannel do
     hub_requires_oauth = hub.hub_bindings |> Enum.empty?() |> Kernel.not()
 
     bot_access_key = Application.get_env(:ret, :bot_access_key)
-    has_valid_bot_access_key = !!(bot_access_key && params["bot_access_key"] == bot_access_key)
+    has_valid_bot_access_key = secure_compare(params["bot_access_key"], bot_access_key)
 
     account_has_provider_for_hub =
       account |> Ret.Account.matching_oauth_providers(hub) |> Enum.empty?() |> Kernel.not()
@@ -293,6 +293,10 @@ defmodule RetWeb.HubChannel do
 
   def handle_in("events:end_typing", _payload, socket),
     do: socket |> set_presence_flag(:typing, false)
+
+  # Only Reticulum emits bot commands, after the authenticated bot API has
+  # validated the room, bot id and model-proposed action.
+  def handle_in("message", %{"type" => "bot_command"}, socket), do: {:noreply, socket}
 
   def handle_in("message" = event, %{"type" => type} = payload, socket) do
     account = Guardian.Phoenix.Socket.current_resource(socket)
@@ -943,6 +947,12 @@ defmodule RetWeb.HubChannel do
     end
   end
 
+  defp secure_compare(value, expected) when is_binary(value) and is_binary(expected) do
+    byte_size(value) == byte_size(expected) and Plug.Crypto.secure_compare(value, expected)
+  end
+
+  defp secure_compare(_, _), do: false
+
   defp account_for_socket(socket) do
     case Guardian.Phoenix.Socket.current_resource(socket) do
       nil ->
@@ -1533,7 +1543,8 @@ defmodule RetWeb.HubChannel do
       "enabled" => normalize_bool(map_get(bots, "enabled")),
       "count" => normalize_integer(map_get(bots, "count")),
       "mobility" => normalize_mobility(map_get(bots, "mobility")),
-      "chat_enabled" => normalize_bool(map_get(bots, "chat_enabled"))
+      "chat_enabled" => normalize_bool(map_get(bots, "chat_enabled")),
+      "prompt" => normalize_bot_prompt(map_get(bots, "prompt"))
     }
   end
 
@@ -1558,6 +1569,12 @@ defmodule RetWeb.HubChannel do
   defp normalize_mobility("low"), do: "low"
   defp normalize_mobility("high"), do: "high"
   defp normalize_mobility(_), do: "medium"
+
+  defp normalize_bot_prompt(value) when is_binary(value) do
+    value |> String.trim() |> String.slice(0, 1_500)
+  end
+
+  defp normalize_bot_prompt(_), do: ""
 
   defp map_get(map, key) do
     atom_key =

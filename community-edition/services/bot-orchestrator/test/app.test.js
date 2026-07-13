@@ -1,0 +1,146 @@
+const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
+const { after, before, test } = require("node:test");
+
+process.env.BOT_ACCESS_KEY = "test-access-key-that-is-at-least-32-characters";
+process.env.OPENAI_API_KEY = "";
+process.env.RUNNER_AUTOSTART = "false";
+process.env.CHAT_RATE_LIMIT_MS = "1";
+process.env.CHAT_RATE_LIMIT_MAX_REQUESTS = "3";
+
+const { startServer, internals } = require("../app");
+
+let server;
+let baseUrl;
+
+before(async () => {
+  server = startServer(0);
+  if (!server.listening) {
+    await new Promise(resolve => server.once("listening", resolve));
+  }
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+});
+
+after(async () => {
+  await new Promise((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+});
+
+async function post(path, body, accessKey = process.env.BOT_ACCESS_KEY) {
+  return fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-ret-bot-access-key": accessKey
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+test("refuses to start without a strong internal access key", () => {
+  const result = spawnSync(process.execPath, ["-e", "require('./app').startServer(0)"], {
+    cwd: require("node:path").join(__dirname, ".."),
+    env: { ...process.env, BOT_ACCESS_KEY: "" },
+    encoding: "utf8"
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /BOT_ACCESS_KEY/);
+});
+
+test("protects internal endpoints and does not expose Express", async () => {
+  const unauthorized = await post("/internal/bots/room-config", { hub_sid: "room", bots: {} }, "wrong");
+  assert.equal(unauthorized.status, 401);
+
+  const health = await fetch(`${baseUrl}/health`);
+  assert.equal(health.status, 200);
+  assert.equal(health.headers.get("x-powered-by"), null);
+  assert.equal((await health.json()).runner_backend_default, "ghost");
+});
+
+test("keeps chat disabled until Reticulum supplies an enabled room config", async () => {
+  const response = await post("/internal/bots/chat", {
+    hub_sid: "room-a",
+    bot_id: "bot-1",
+    requester_id: "account-1",
+    message: "hola"
+  });
+
+  assert.equal(response.status, 403);
+});
+
+test("returns a privacy-safe fallback without echoing the user message", async () => {
+  const config = await post("/internal/bots/room-config", {
+    hub_sid: "room-a",
+    bots: { enabled: true, count: 2, mobility: "medium", chat_enabled: true, prompt: "Sé amable." }
+  });
+  assert.equal(config.status, 200);
+
+  const response = await post("/internal/bots/chat", {
+    hub_sid: "room-a",
+    bot_id: "bot-1",
+    requester_id: "account-1",
+    message: "mi dato privado es 1234",
+    context: { waypoints: ["spawbot-a", "invalid", "spawbot-a"] }
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.reply.includes("1234"), false);
+  assert.equal(body.action, null);
+});
+
+test("builds non-stored OpenAI requests with pseudonymous safety identifiers", () => {
+  const request = internals.buildOpenAIRequest({
+    hubSid: "room-a",
+    botId: "bot-1",
+    requesterId: "account-123",
+    message: "hola",
+    botsConfig: internals.normalizeConfig({
+      enabled: true,
+      count: 1,
+      mobility: "medium",
+      chat_enabled: true,
+      prompt: "Eres el recepcionista."
+    }),
+    context: { waypoints: ["spawbot-recepcion"] }
+  });
+
+  assert.equal(request.store, false);
+  assert.equal(request.safety_identifier.length, 64);
+  assert.equal(request.safety_identifier.includes("account-123"), false);
+  assert.match(request.input[0].content[0].text, /datos no confiables/);
+});
+
+test("only accepts navigation actions for a known spawbot waypoint", () => {
+  const unknown = internals.parseStructuredReply(
+    JSON.stringify({ reply: "Voy.", action: { type: "go_to_waypoint", waypoint: "spawbot-secret" } }),
+    ["spawbot-lobby"]
+  );
+  assert.equal(unknown.action, null);
+
+  const known = internals.parseStructuredReply(
+    JSON.stringify({ reply: "Voy.", action: { type: "go_to_waypoint", waypoint: "spawbot-lobby" } }),
+    ["spawbot-lobby"]
+  );
+  assert.deepEqual(known.action, { type: "go_to_waypoint", waypoint: "spawbot-lobby" });
+});
+
+test("removes stale room state after a complete Reticulum configuration snapshot", async () => {
+  const originalFetch = global.fetch;
+
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ hubs: [] })
+  });
+
+  try {
+    await internals.syncActiveRoomsFromReticulum();
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const health = await fetch(`${baseUrl}/health`);
+  const body = await health.json();
+  assert.equal(body.rooms, 0);
+});

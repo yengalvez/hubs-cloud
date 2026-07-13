@@ -220,4 +220,30 @@ defmodule Ret.HubTest do
 
     assert Repo.one(from HubRoleMembership, where: [hub_id: ^hub.hub_id])
   end
+
+  test "normalizes room bot limits and prompt", %{scene: scene} do
+    prompt = String.duplicate("a", 1_600)
+
+    changeset =
+      Hub.changeset(%Hub{}, scene, %{
+        name: "Bot Hub",
+        user_data: %{
+          "bots" => %{
+            "enabled" => true,
+            "count" => 99,
+            "mobility" => "invalid",
+            "chat_enabled" => true,
+            "prompt" => "  #{prompt}  "
+          }
+        }
+      })
+
+    bots = Ecto.Changeset.get_change(changeset, :user_data)["bots"]
+
+    assert bots["enabled"]
+    assert bots["count"] == 10
+    assert bots["mobility"] == "medium"
+    assert bots["chat_enabled"]
+    assert String.length(bots["prompt"]) == 1_500
+  end
 end

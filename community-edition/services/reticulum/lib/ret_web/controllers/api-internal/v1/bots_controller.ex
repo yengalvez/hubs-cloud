@@ -16,7 +16,11 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
       )
       |> where([h], fragment("COALESCE((?->'bots'->>'count')::int, 0) > 0", h.user_data))
       |> where([h], h.hub_sid != "admin")
-      |> select([h], %{hub_sid: h.hub_sid, user_data: h.user_data, last_active_at: h.last_active_at})
+      |> select([h], %{
+        hub_sid: h.hub_sid,
+        user_data: h.user_data,
+        last_active_at: h.last_active_at
+      })
       |> Repo.all()
       |> Enum.map(&to_bot_hub_entry/1)
       |> Enum.filter(& &1)
@@ -40,7 +44,11 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     hubs =
       Hub
       |> where([h], h.hub_sid in ^present_hub_sids)
-      |> select([h], %{hub_sid: h.hub_sid, user_data: h.user_data, last_active_at: h.last_active_at})
+      |> select([h], %{
+        hub_sid: h.hub_sid,
+        user_data: h.user_data,
+        last_active_at: h.last_active_at
+      })
       |> Repo.all()
       |> Enum.map(&to_bot_hub_entry/1)
       |> Enum.filter(& &1)
@@ -58,6 +66,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     if enabled && count > 0 do
       mobility = normalize_mobility(map_get(bots, "mobility"))
       chat_enabled = normalize_bool(map_get(bots, "chat_enabled"))
+      prompt = normalize_bot_prompt(map_get(bots, "prompt"))
 
       %{
         hub_sid: hub_sid,
@@ -65,7 +74,8 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
           enabled: enabled,
           count: count,
           mobility: mobility,
-          chat_enabled: chat_enabled
+          chat_enabled: chat_enabled,
+          prompt: prompt
         },
         last_active_at: NaiveDateTime.to_iso8601(last_active_at)
       }
@@ -95,6 +105,12 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
   defp normalize_mobility("low"), do: "low"
   defp normalize_mobility("high"), do: "high"
   defp normalize_mobility(_), do: "medium"
+
+  defp normalize_bot_prompt(value) when is_binary(value) do
+    value |> String.trim() |> String.slice(0, 1_500)
+  end
+
+  defp normalize_bot_prompt(_), do: ""
 
   defp map_get(map, key) do
     atom_key =

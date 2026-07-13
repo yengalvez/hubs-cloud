@@ -6,6 +6,8 @@ defmodule RetWeb.Api.V1.BotController do
   alias Ret.{AppConfig, BotOrchestrator, Hub, Repo}
 
   @max_message_length 800
+  @max_waypoints 64
+  @max_waypoint_length 64
 
   def chat(conn, %{"hub_sid" => hub_sid, "bot_id" => bot_id, "message" => message} = params)
       when is_binary(message) do
@@ -19,7 +21,7 @@ defmodule RetWeb.Api.V1.BotController do
            |> Repo.preload([:created_by_account, :hub_bindings, :hub_role_memberships]) do
         %Hub{} = hub ->
           if account |> can?(join_hub(hub)) do
-            chat_with_hub(conn, hub, bot_id, message, params["context"])
+            chat_with_hub(conn, account, hub, bot_id, message, params["context"])
           else
             conn |> send_resp(401, "unauthorized")
           end
@@ -32,7 +34,7 @@ defmodule RetWeb.Api.V1.BotController do
 
   def chat(conn, _params), do: conn |> send_resp(400, "message is required")
 
-  defp chat_with_hub(conn, hub, bot_id, message, context) do
+  defp chat_with_hub(conn, account, hub, bot_id, message, context) do
     with {:ok, bots} <- validate_bots_config(hub.user_data),
          :ok <- validate_bot_id(bot_id, bots["count"]),
          :ok <- validate_message(message),
@@ -40,11 +42,21 @@ defmodule RetWeb.Api.V1.BotController do
            BotOrchestrator.chat(%{
              hub_sid: hub.hub_sid,
              bot_id: bot_id,
+             requester_id: to_string(account.account_id),
              message: String.trim(message),
              context: normalize_context(context)
            }) do
-      reply = map_get(response, "reply") || "No reply from bot."
+      reply = map_get(response, "reply") || "El bot no ha devuelto una respuesta."
       action = normalize_action(map_get(response, "action"))
+
+      if action do
+        RetWeb.Endpoint.broadcast("hub:#{hub.hub_sid}", "message", %{
+          type: "bot_command",
+          body: Map.put(action, "bot_id", bot_id),
+          session_id: "reticulum",
+          from_session_id: "reticulum"
+        })
+      end
 
       conn
       |> put_resp_content_type("application/json")
@@ -77,9 +89,20 @@ defmodule RetWeb.Api.V1.BotController do
     mobility = normalize_mobility(map_get(bots, "mobility"))
 
     cond do
-      !enabled or count <= 0 -> {:error, :bots_disabled}
-      !chat_enabled -> {:error, :chat_disabled}
-      true -> {:ok, %{"enabled" => enabled, "chat_enabled" => chat_enabled, "count" => count, "mobility" => mobility}}
+      !enabled or count <= 0 ->
+        {:error, :bots_disabled}
+
+      !chat_enabled ->
+        {:error, :chat_disabled}
+
+      true ->
+        {:ok,
+         %{
+           "enabled" => enabled,
+           "chat_enabled" => chat_enabled,
+           "count" => count,
+           "mobility" => mobility
+         }}
     end
   end
 
@@ -98,7 +121,9 @@ defmodule RetWeb.Api.V1.BotController do
     case type do
       "go_to_waypoint" ->
         waypoint = map_get(action, "waypoint")
-        if is_binary(waypoint) and waypoint != "" do
+
+        if is_binary(waypoint) and String.starts_with?(waypoint, "spawbot-") and
+             String.length(waypoint) <= @max_waypoint_length do
           %{"type" => "go_to_waypoint", "waypoint" => waypoint}
         else
           nil
@@ -111,7 +136,22 @@ defmodule RetWeb.Api.V1.BotController do
 
   defp normalize_action(_), do: nil
 
-  defp normalize_context(%{} = context), do: context
+  defp normalize_context(%{} = context) do
+    waypoints =
+      (map_get(context, "waypoints") || [])
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(
+        &(String.trim(&1)
+          |> String.downcase()
+          |> String.slice(0, @max_waypoint_length))
+      )
+      |> Enum.filter(&String.starts_with?(&1, "spawbot-"))
+      |> Enum.uniq()
+      |> Enum.take(@max_waypoints)
+
+    %{"waypoints" => waypoints}
+  end
+
   defp normalize_context(_), do: %{}
 
   defp normalize_integer(value, _default) when is_integer(value), do: value |> max(0) |> min(10)

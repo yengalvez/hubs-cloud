@@ -455,12 +455,14 @@ defmodule Ret.Hub do
     count = normalize_integer(map_get(bots, "count", 0), 0, 10, 0)
     mobility = normalize_mobility(map_get(bots, "mobility", "medium"))
     chat_enabled = normalize_bool(map_get(bots, "chat_enabled", false), false)
+    prompt = normalize_bot_prompt(map_get(bots, "prompt", ""))
 
     %{
       "enabled" => enabled,
       "count" => count,
       "mobility" => mobility,
-      "chat_enabled" => chat_enabled
+      "chat_enabled" => chat_enabled,
+      "prompt" => prompt
     }
   end
 
@@ -470,6 +472,12 @@ defmodule Ret.Hub do
   defp normalize_mobility("high"), do: "high"
   defp normalize_mobility("medium"), do: "medium"
   defp normalize_mobility(_), do: "medium"
+
+  defp normalize_bot_prompt(value) when is_binary(value) do
+    value |> String.trim() |> String.slice(0, 1_500)
+  end
+
+  defp normalize_bot_prompt(_), do: ""
 
   defp normalize_integer(value, min, max, _default) when is_integer(value) do
     value

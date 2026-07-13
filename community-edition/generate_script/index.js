@@ -218,10 +218,10 @@ function main() {
 
     // Runner defaults (safe, reversible). These must exist because the template uses $VARS.
     if (!processedConfig.RUNNER_BACKEND) {
-      processedConfig.RUNNER_BACKEND = "chromium";
+      processedConfig.RUNNER_BACKEND = "ghost";
     }
-    if (String(processedConfig.RUNNER_BACKEND).toLowerCase().trim() !== "ghost") {
-      processedConfig.RUNNER_BACKEND = "chromium";
+    if (String(processedConfig.RUNNER_BACKEND).toLowerCase().trim() !== "chromium") {
+      processedConfig.RUNNER_BACKEND = "ghost";
     }
     if (!processedConfig.RUNNER_BACKEND_CANARY_HUBS) {
       processedConfig.RUNNER_BACKEND_CANARY_HUBS = "";

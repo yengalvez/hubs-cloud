@@ -1,0 +1,3 @@
+# Generated from the private deployment source of truth. Never commit real values.
+community-edition/input-values.yaml
+community-edition/hcce.yaml
