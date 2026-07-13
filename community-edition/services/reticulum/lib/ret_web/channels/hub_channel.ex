@@ -947,7 +947,8 @@ defmodule RetWeb.HubChannel do
     end
   end
 
-  defp secure_compare(value, expected) when is_binary(value) and is_binary(expected) do
+  defp secure_compare(value, expected)
+       when is_binary(value) and is_binary(expected) and byte_size(expected) >= 32 do
     byte_size(value) == byte_size(expected) and Plug.Crypto.secure_compare(value, expected)
   end
 
