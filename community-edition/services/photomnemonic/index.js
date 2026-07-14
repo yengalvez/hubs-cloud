@@ -1,92 +1,58 @@
-const { urlAllowed, GetBrowser,CloseBrowser } = require("./utils");
+"use strict";
 
-function sleep(miliseconds = 100) {
-  return new Promise(resolve => setTimeout(resolve, miliseconds));
-}
+const { getBrowser, closeBrowser } = require("./utils");
+const { installRequestGuard, safeUrlForLog, validatePublicHttpUrl } = require("./url-policy");
 
-async function screenshot(url) {
-  let data, meta;
-  let loaded = false;
+const NAVIGATION_TIMEOUT_MS = 12_000;
+const RENDER_SETTLE_MS = 300;
 
-  console.log("screenshot, url: ", url)
-
-  t0 = new Date().getTime()
-  const loading = async (startTime = Date.now()) => {
-    if (!loaded && Date.now() - startTime < 12 * 1000) {
-      await sleep(100);
-      await loading(startTime);
-    }
-  };
-
-  const browser = await GetBrowser()
-  console.log("GetBrowser -- @: ", new Date().getTime()-t0, "ms")
-
+async function screenshot(rawUrl) {
+  const url = await validatePublicHttpUrl(rawUrl);
+  const browser = await getBrowser();
   const page = await browser.newPage();
-  // console.log("browser.newPage() -- @: ", new Date().getTime()-t0, "ms")
-
-  await page.goto(url);
-  const pageTitle = await page.title();
-  console.log( "pageTitle: ",pageTitle, ", @: ", new Date().getTime()-t0, "ms")
-
-  for (let i = 0; i < 20; i++) {
-    try{
-      data = await page.screenshot({ encoding: "base64" });
-      // console.log( "screenshot @: ", new Date().getTime()-t0, "ms")
-      return {data,meta};
-    }
-    catch (e){
-      console.log(e)
-    } 
-    await sleep(500)   
-    }
-
-  console.log("Error failed to produce screenshot")
-  return
-}
-
-module.exports.handler = async function handler(event, context, callback) {
-
-
-  t0 = new Date().getTime()
-
-  const queryStringParameters = event.queryStringParameters || {};
-  const { url = "https://www.mozilla.org"} =
-    queryStringParameters;
-
-  if (!(await urlAllowed(url))) {
-    return callback(null, { statusCode: 403, body: "forbidden" });
-  }
-
-  let data;
-
-  const headers = {
-    "Content-Type": "image/png"
-  };
 
   try {
-    const result = await screenshot(url);
-    // console.log( "screenshot(url) took: ", new Date().getTime()-t0, "ms")
-    
-    data = result.data;
-    console.log( "data.length: ", data.length)
+    await installRequestGuard(page);
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+    page.setDefaultTimeout(5_000);
+    await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+    await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
+    await new Promise(resolve => setTimeout(resolve, RENDER_SETTLE_MS));
+    return await page.screenshot({ encoding: "base64", type: "png" });
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
 
-    // if (result.meta) {
-    //   headers["X-Photomnemonic-Meta"] = JSON.stringify(result.meta);
-    // }
+module.exports.handler = async function handler(event, _context, callback) {
+  const rawUrl = event?.queryStringParameters?.url || "https://www.mozilla.org";
+
+  try {
+    const data = await screenshot(rawUrl);
+    console.log(`screenshot complete for ${safeUrlForLog(rawUrl)}`);
+    callback(null, {
+      statusCode: 200,
+      body: data,
+      isBase64Encoded: true,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "image/png"
+      }
+    });
   } catch (error) {
-    console.error("Error capturing screenshot for", url, error);
-    return callback(error);
+    const statusCode = error?.code === "URL_NOT_ALLOWED" ? 403 : 502;
+    console.error(`screenshot rejected for ${safeUrlForLog(rawUrl)}`, error?.name || "Error");
+    callback(null, {
+      statusCode,
+      body: statusCode === 403 ? "forbidden" : "screenshot failed",
+      isBase64Encoded: false,
+      headers: { "Cache-Control": "no-store", "Content-Type": "text/plain" }
+    });
+  } finally {
+    if (process.env.AWS_LAMBDA_FUNCTION_NAME !== "turkey") {
+      await closeBrowser();
+    }
   }
-
-  if (process.env.AWS_LAMBDA_FUNCTION_NAME != "turkey"){
-    CloseBrowser()
-  }
-
-  console.log("done @", new Date().getTime()-t0, "ms")
-  return callback(null, {
-    statusCode: 200,
-    body: data,
-    isBase64Encoded: true,
-    headers
-  });
 };
+
+module.exports.screenshot = screenshot;

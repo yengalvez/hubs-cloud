@@ -67,6 +67,69 @@ function verifyIngressPolicy(resources, name, targetApp, allowedApps, port) {
   }
 }
 
+function verifyPhotomnemonicEgressPolicy(resources) {
+  const name = "photomnemonic-egress";
+  const policy = findResource(resources, "NetworkPolicy", name);
+  if (!policy) {
+    fail(`missing NetworkPolicy/${name}`);
+    return;
+  }
+  if (policy.spec?.podSelector?.matchLabels?.app !== "photomnemonic") {
+    fail(`NetworkPolicy/${name} must select app=photomnemonic`);
+  }
+  if (JSON.stringify(policy.spec?.policyTypes || []) !== JSON.stringify(["Egress"])) {
+    fail(`NetworkPolicy/${name} must isolate egress only`);
+  }
+
+  const rules = policy.spec?.egress || [];
+  const dnsRule = rules.find(rule =>
+    (rule.to || []).some(
+      peer =>
+        peer.namespaceSelector?.matchLabels?.["kubernetes.io/metadata.name"] === "kube-system" &&
+        peer.podSelector?.matchLabels?.["k8s-app"] === "kube-dns"
+    )
+  );
+  const dnsPorts = (dnsRule?.ports || [])
+    .map(port => `${port.protocol || "TCP"}:${port.port}`)
+    .sort();
+  if (JSON.stringify(dnsPorts) !== JSON.stringify(["TCP:53", "UDP:53"])) {
+    fail(`NetworkPolicy/${name} must allow only TCP/UDP 53 to kube-dns`);
+  }
+
+  const publicRule = rules.find(rule => (rule.to || []).some(peer => peer.ipBlock?.cidr === "0.0.0.0/0"));
+  const ipBlock = (publicRule?.to || []).find(peer => peer.ipBlock)?.ipBlock;
+  const expectedExcept = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4"
+  ].sort();
+  const actualExcept = [...(ipBlock?.except || [])].sort();
+  const publicPorts = (publicRule?.ports || [])
+    .map(port => `${port.protocol || "TCP"}:${port.port}`)
+    .sort();
+  if (
+    !ipBlock ||
+    JSON.stringify(actualExcept) !== JSON.stringify(expectedExcept) ||
+    JSON.stringify(publicPorts) !== JSON.stringify(["TCP:443", "TCP:80"])
+  ) {
+    fail(`NetworkPolicy/${name} must allow only public TCP/80,443 and exclude audited reserved IPv4 ranges`);
+  }
+  if (rules.length !== 2) {
+    fail(`NetworkPolicy/${name} must contain exactly DNS and public-web egress rules`);
+  }
+}
+
 function verifyResourceBudget(resources, deploymentName, containerName, expected) {
   const deployment = findResource(resources, "Deployment", deploymentName);
   const container = deployment?.spec?.template?.spec?.containers?.find(value => value.name === containerName);
@@ -289,6 +352,37 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
+  const photomnemonic = findResource(resources, "Deployment", "photomnemonic");
+  const photomnemonicContainer = photomnemonic?.spec?.template?.spec?.containers?.find(
+    container => container.name === "photomnemonic"
+  );
+  if (!photomnemonicContainer) {
+    fail("missing photomnemonic container");
+  } else {
+    const security = photomnemonicContainer.securityContext || {};
+    const droppedCapabilities = security.capabilities?.drop || [];
+    if (
+      security.runAsNonRoot !== true ||
+      Number(security.runAsUser) !== 1000 ||
+      Number(security.runAsGroup) !== 1000 ||
+      security.allowPrivilegeEscalation !== false ||
+      !droppedCapabilities.includes("ALL") ||
+      security.seccompProfile?.type !== "RuntimeDefault"
+    ) {
+      fail("photomnemonic container must use the audited non-root security context");
+    }
+    for (const [probeName, path] of [
+      ["startupProbe", "/_readyz"],
+      ["readinessProbe", "/_readyz"],
+      ["livenessProbe", "/_healthz"]
+    ]) {
+      const probe = photomnemonicContainer[probeName];
+      if (probe?.httpGet?.path !== path || Number(probe?.httpGet?.port) !== 5000) {
+        fail(`photomnemonic ${probeName} must use ${path}:5000`);
+      }
+    }
+  }
+
   for (const name of ["ret", "dialog", "nearspark"]) {
     const ingress = findResource(resources, "Ingress", name);
     if (!ingress) {
@@ -344,6 +438,7 @@ if (!fs.existsSync(manifestPath)) {
   verifyIngressPolicy(resources, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
   verifyIngressPolicy(resources, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);
   verifyIngressPolicy(resources, "photomnemonic-ingress", "photomnemonic", ["reticulum"], 5000);
+  verifyPhotomnemonicEgressPolicy(resources);
 
   if (findResource(resources, "Secret", "cert-hcce")) {
     fail("unused self-signed Secret/cert-hcce must not be generated");
