@@ -1195,11 +1195,9 @@ spec:
     matchLabels:
       app: dialog
   minReadySeconds: 15
+  # A single node cannot overlap revisions that both claim hostPort 4443.
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 1
+    type: Recreate
   template:
     metadata:
       labels:
@@ -1251,8 +1249,9 @@ spec:
     matchLabels:
       app: coturn
   minReadySeconds: 15
+  # A single node cannot overlap revisions that both claim hostPort 5349.
   strategy:
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       labels:

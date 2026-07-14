@@ -57,13 +57,13 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  for (const name of ["reticulum", "pgsql"]) {
+  for (const name of ["reticulum", "pgsql", "dialog", "coturn"]) {
     const deployment = findResource(resources, "Deployment", name);
     if (deployment?.spec?.strategy?.type !== "Recreate") {
-      fail(`Deployment/${name} must use Recreate for its single-writer persistent volume`);
+      fail(`Deployment/${name} must use Recreate for single-writer storage or exclusive host ports`);
     }
     if (deployment?.spec?.strategy?.rollingUpdate) {
-      fail(`Deployment/${name} must not define rollingUpdate for single-writer storage`);
+      fail(`Deployment/${name} must not define rollingUpdate for exclusive runtime resources`);
     }
   }
 
