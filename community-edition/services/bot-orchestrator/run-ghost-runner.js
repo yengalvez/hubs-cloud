@@ -28,8 +28,13 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function finiteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function normalizeAngleDeg(deg) {
-  const n = Number(deg) || 0;
+  const n = finiteNumber(deg);
   return ((n % 360) + 360) % 360;
 }
 
@@ -43,20 +48,38 @@ function safeJsonParse(text) {
 
 function parseVec3Like(value, fallback = [0, 0, 0]) {
   if (Array.isArray(value) && value.length >= 3) {
-    return [Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0];
+    return [
+      finiteNumber(value[0], fallback[0]),
+      finiteNumber(value[1], fallback[1]),
+      finiteNumber(value[2], fallback[2])
+    ];
   }
   if (value && typeof value === "object") {
-    return [Number(value.x) || 0, Number(value.y) || 0, Number(value.z) || 0];
+    return [
+      finiteNumber(value.x, fallback[0]),
+      finiteNumber(value.y, fallback[1]),
+      finiteNumber(value.z, fallback[2])
+    ];
   }
   return fallback;
 }
 
 function parseQuatLike(value, fallback = [0, 0, 0, 1]) {
   if (Array.isArray(value) && value.length >= 4) {
-    return [Number(value[0]) || 0, Number(value[1]) || 0, Number(value[2]) || 0, Number(value[3]) || 1];
+    return [
+      finiteNumber(value[0], fallback[0]),
+      finiteNumber(value[1], fallback[1]),
+      finiteNumber(value[2], fallback[2]),
+      finiteNumber(value[3], fallback[3])
+    ];
   }
   if (value && typeof value === "object") {
-    return [Number(value.x) || 0, Number(value.y) || 0, Number(value.z) || 0, Number(value.w) || 1];
+    return [
+      finiteNumber(value.x, fallback[0]),
+      finiteNumber(value.y, fallback[1]),
+      finiteNumber(value.z, fallback[2]),
+      finiteNumber(value.w, fallback[3])
+    ];
   }
   return fallback;
 }
@@ -162,102 +185,282 @@ function resolveUrl(baseUrl, maybeRelative) {
   return new URL(maybeRelative, baseUrl).toString();
 }
 
+function parsePositiveInteger(value, fallback, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return clamp(parsed, min, max);
+}
+
+function isLoopbackHostname(hostname) {
+  const normalized = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function createSceneFetchPolicy(baseUrl, overrides = {}) {
+  const base = new URL(baseUrl);
+  const allowHttp =
+    overrides.allowHttp !== undefined
+      ? !!overrides.allowHttp
+      : process.env.GHOST_SCENE_ALLOW_HTTP === "true" ||
+        (base.protocol === "http:" && isLoopbackHostname(base.hostname));
+  const configuredHosts =
+    overrides.allowedHosts !== undefined ? overrides.allowedHosts : process.env.GHOST_SCENE_ALLOWED_HOSTS || "";
+  const extraHosts = (Array.isArray(configuredHosts) ? configuredHosts : String(configuredHosts).split(","))
+    .map(value => String(value).trim().toLowerCase())
+    .filter(Boolean);
+
+  return {
+    base,
+    allowedHosts: new Set([base.host.toLowerCase(), ...extraHosts]),
+    allowHttp,
+    maxRedirects: parsePositiveInteger(overrides.maxRedirects, 3, 0, 5),
+    timeoutMs: parsePositiveInteger(
+      overrides.timeoutMs || process.env.GHOST_SCENE_FETCH_TIMEOUT_MS,
+      10_000,
+      1_000,
+      60_000
+    ),
+    maxSceneBytes: parsePositiveInteger(
+      overrides.maxSceneBytes || process.env.GHOST_SCENE_MAX_BYTES,
+      64 * 1024 * 1024,
+      1024,
+      256 * 1024 * 1024
+    ),
+    maxJsonBytes: parsePositiveInteger(
+      overrides.maxJsonBytes || process.env.GHOST_SCENE_MAX_JSON_BYTES,
+      4 * 1024 * 1024,
+      1024,
+      16 * 1024 * 1024
+    ),
+    maxNodes: parsePositiveInteger(
+      overrides.maxNodes || process.env.GHOST_SCENE_MAX_NODES,
+      50_000,
+      1,
+      250_000
+    ),
+    maxEdges: parsePositiveInteger(
+      overrides.maxEdges || process.env.GHOST_SCENE_MAX_EDGES,
+      200_000,
+      1,
+      1_000_000
+    ),
+    fetchImpl: overrides.fetchImpl || fetch
+  };
+}
+
+function validateSceneUrl(value, policy) {
+  const url = new URL(value, policy.base);
+  const protocolAllowed = url.protocol === "https:" || (url.protocol === "http:" && policy.allowHttp);
+
+  if (!protocolAllowed) throw new Error("scene_url_protocol_not_allowed");
+  if (url.username || url.password) throw new Error("scene_url_credentials_not_allowed");
+  if (!policy.allowedHosts.has(url.host.toLowerCase())) throw new Error("scene_url_host_not_allowed");
+
+  return url;
+}
+
+async function fetchWithScenePolicy(value, init, policy) {
+  let current = validateSceneUrl(value, policy);
+
+  for (let redirectCount = 0; redirectCount <= policy.maxRedirects; redirectCount++) {
+    const response = await policy.fetchImpl(current.toString(), {
+      ...init,
+      redirect: "manual",
+      signal: AbortSignal.timeout(policy.timeoutMs)
+    });
+
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return response;
+    }
+
+    const location = response.headers.get("location");
+    if (!location) throw new Error("scene_redirect_missing_location");
+    if (redirectCount === policy.maxRedirects) throw new Error("scene_redirect_limit");
+    if (response.body && typeof response.body.cancel === "function") await response.body.cancel();
+    current = validateSceneUrl(new URL(location, current).toString(), policy);
+  }
+
+  throw new Error("scene_redirect_limit");
+}
+
+async function readResponseBodyLimited(response, maxBytes) {
+  const contentLength = Number.parseInt(response.headers.get("content-length") || "", 10);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error("scene_response_too_large");
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > maxBytes) throw new Error("scene_response_too_large");
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  while (true) {
+    // eslint-disable-next-line no-await-in-loop
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel("scene_response_too_large");
+      throw new Error("scene_response_too_large");
+    }
+    chunks.push(value);
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  chunks.forEach(chunk => {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+  return merged.buffer;
+}
+
 function isGlb(buffer) {
   if (!buffer || buffer.byteLength < 4) return false;
   const u8 = new Uint8Array(buffer, 0, 4);
   return u8[0] === 0x67 && u8[1] === 0x6c && u8[2] === 0x54 && u8[3] === 0x46; // "glTF"
 }
 
-function parseGlbJson(buffer) {
+function validateGltfShape(gltf, policy) {
+  if (!gltf || typeof gltf !== "object" || Array.isArray(gltf)) throw new Error("gltf_invalid_root");
+  const nodes = Array.isArray(gltf.nodes) ? gltf.nodes : [];
+  if (nodes.length > policy.maxNodes) throw new Error("gltf_too_many_nodes");
+
+  let edgeCount = 0;
+  nodes.forEach(node => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) throw new Error("gltf_invalid_node");
+    const transforms = [
+      [node.matrix, 16],
+      [node.translation, 3],
+      [node.rotation, 4],
+      [node.scale, 3]
+    ];
+    transforms.forEach(([transform, expectedLength]) => {
+      if (transform === undefined) return;
+      if (
+        !Array.isArray(transform) ||
+        transform.length !== expectedLength ||
+        transform.some(value => !Number.isFinite(Number(value)))
+      ) {
+        throw new Error("gltf_invalid_transform");
+      }
+    });
+
+    const children = Array.isArray(node && node.children) ? node.children : [];
+    edgeCount += children.length;
+    if (edgeCount > policy.maxEdges) throw new Error("gltf_too_many_edges");
+    children.forEach(child => {
+      if (!Number.isInteger(child) || child < 0 || child >= nodes.length) throw new Error("gltf_invalid_child_index");
+    });
+  });
+
+  return gltf;
+}
+
+function parseGlbJson(buffer, policy) {
   const view = new DataView(buffer);
   if (view.byteLength < 20) throw new Error("glb_too_small");
+  if (view.getUint32(0, true) !== 0x46546c67) throw new Error("glb_invalid_magic");
+  if (view.getUint32(4, true) !== 2) throw new Error("glb_unsupported_version");
+  const declaredLength = view.getUint32(8, true);
+  if (declaredLength < 20) throw new Error("glb_invalid_length");
+  if (declaredLength > policy.maxSceneBytes) throw new Error("scene_response_too_large");
   const chunkLength = view.getUint32(12, true);
+  if (chunkLength > policy.maxJsonBytes) throw new Error("gltf_json_too_large");
   const chunkType = view.getUint32(16, true);
   // JSON chunk type
   if (chunkType !== 0x4e4f534a) throw new Error("glb_missing_json_chunk");
   const jsonStart = 20;
   const jsonEnd = jsonStart + chunkLength;
+  if (jsonEnd > declaredLength) throw new Error("glb_invalid_length");
   if (jsonEnd > view.byteLength) throw new Error("glb_incomplete_json_chunk");
   const jsonBytes = new Uint8Array(buffer, jsonStart, chunkLength);
   const jsonText = new TextDecoder("utf-8").decode(jsonBytes);
   const parsed = safeJsonParse(jsonText);
   if (!parsed) throw new Error("glb_invalid_json");
-  return parsed;
+  return validateGltfShape(parsed, policy);
 }
 
-async function fetchMaybeRange(url, maxInitialBytes = 256 * 1024) {
-  const res = await fetch(url, {
+async function fetchMaybeRange(url, policy, maxInitialBytes = 256 * 1024) {
+  const res = await fetchWithScenePolicy(url, {
     headers: { Range: `bytes=0-${maxInitialBytes - 1}` }
-  });
+  }, policy);
+  if (res.status !== 200 && res.status !== 206) throw new Error(`scene_http_${res.status}`);
 
   // Some servers ignore Range and return 200 with full body.
   if (res.status !== 206) {
     return {
       status: res.status,
-      buffer: await res.arrayBuffer(),
+      buffer: await readResponseBodyLimited(res, policy.maxSceneBytes),
       ranged: false
     };
   }
 
   return {
     status: res.status,
-    buffer: await res.arrayBuffer(),
+    buffer: await readResponseBodyLimited(res, maxInitialBytes),
     ranged: true
   };
 }
 
-async function fetchGltfJson(sceneUrl) {
+async function fetchGltfJson(sceneUrl, policy) {
   // Try to minimize startup time by fetching only the GLB JSON chunk via range requests.
-  const first = await fetchMaybeRange(sceneUrl);
+  const first = await fetchMaybeRange(sceneUrl, policy);
 
   if (!first.buffer || first.buffer.byteLength === 0) throw new Error("scene_empty");
 
   if (!isGlb(first.buffer)) {
-    // Not a GLB: fetch full and parse as text JSON.
-    const fullRes = await fetch(sceneUrl);
-    const text = await fullRes.text();
+    const jsonBuffer = first.ranged
+      ? await readResponseBodyLimited(await fetchWithScenePolicy(sceneUrl, {}, policy), policy.maxJsonBytes)
+      : first.buffer;
+    if (jsonBuffer.byteLength > policy.maxJsonBytes) throw new Error("gltf_json_too_large");
+    const text = new TextDecoder("utf-8").decode(new Uint8Array(jsonBuffer));
     const parsed = safeJsonParse(text);
     if (!parsed) throw new Error("gltf_invalid_json");
-    return parsed;
+    return validateGltfShape(parsed, policy);
   }
 
   // GLB: parse header + JSON chunk length from the partial buffer.
   const view = new DataView(first.buffer);
-  if (view.byteLength < 20) {
-    // Too small even for header; fetch full.
-    const full = await (await fetch(sceneUrl)).arrayBuffer();
-    return parseGlbJson(full);
-  }
+  if (view.byteLength < 20) throw new Error("glb_too_small");
+  if (view.getUint32(4, true) !== 2) throw new Error("glb_unsupported_version");
+  const declaredLength = view.getUint32(8, true);
+  if (declaredLength < 20) throw new Error("glb_invalid_length");
+  if (declaredLength > policy.maxSceneBytes) throw new Error("scene_response_too_large");
 
   const chunkLength = view.getUint32(12, true);
+  if (chunkLength > policy.maxJsonBytes) throw new Error("gltf_json_too_large");
   const needed = 20 + chunkLength;
+  if (needed > declaredLength) throw new Error("glb_invalid_length");
 
   if (needed <= view.byteLength) {
-    return parseGlbJson(first.buffer);
+    return parseGlbJson(first.buffer, policy);
   }
 
-  // JSON chunk doesn't fit into our partial buffer; fetch a larger range, capped.
-  const cap = 2 * 1024 * 1024;
-  if (!first.ranged || needed > cap) {
-    const full = await (await fetch(sceneUrl)).arrayBuffer();
-    return parseGlbJson(full);
-  }
+  if (!first.ranged) throw new Error("glb_incomplete_json_chunk");
 
-  const secondRes = await fetch(sceneUrl, { headers: { Range: `bytes=0-${needed - 1}` } });
-  if (secondRes.status !== 206) {
-    const full = await (await fetch(sceneUrl)).arrayBuffer();
-    return parseGlbJson(full);
-  }
+  const secondRes = await fetchWithScenePolicy(
+    sceneUrl,
+    { headers: { Range: `bytes=0-${needed - 1}` } },
+    policy
+  );
+  if (secondRes.status !== 200 && secondRes.status !== 206) throw new Error(`scene_http_${secondRes.status}`);
 
-  const secondBuf = await secondRes.arrayBuffer();
-  return parseGlbJson(secondBuf);
+  const secondBuf = await readResponseBodyLimited(
+    secondRes,
+    secondRes.status === 206 ? needed : policy.maxSceneBytes
+  );
+  return parseGlbJson(secondBuf, policy);
 }
 
 function nodeLocalMatrix(node) {
   const out = mat4.create();
   if (node && Array.isArray(node.matrix) && node.matrix.length === 16) {
     // glTF matrices are column-major, same as gl-matrix.
-    for (let i = 0; i < 16; i++) out[i] = Number(node.matrix[i]) || 0;
+    for (let i = 0; i < 16; i++) out[i] = Number(node.matrix[i]);
     return out;
   }
 
@@ -266,6 +469,8 @@ function nodeLocalMatrix(node) {
   const s = parseVec3Like(node && node.scale, [1, 1, 1]);
 
   const qt = quat.fromValues(r[0], r[1], r[2], r[3]);
+  if (quat.squaredLength(qt) < 1e-12) throw new Error("gltf_invalid_rotation");
+  quat.normalize(qt, qt);
   const vt = vec3.fromValues(t[0], t[1], t[2]);
   const vs = vec3.fromValues(s[0], s[1], s[2]);
   mat4.fromRotationTranslationScale(out, qt, vt, vs);
@@ -280,32 +485,49 @@ function computeWorldNodeMatrices(gltf) {
   const roots = (rootScene && Array.isArray(rootScene.nodes) ? rootScene.nodes : []).filter(n => Number.isFinite(n));
 
   const world = new Array(nodes.length);
-  const visited = new Array(nodes.length).fill(false);
+  const state = new Uint8Array(nodes.length); // 0=unseen, 1=visiting, 2=complete
 
-  const dfs = (nodeIndex, parentWorld) => {
-    if (!Number.isFinite(nodeIndex) || nodeIndex < 0 || nodeIndex >= nodes.length) return;
-    const node = nodes[nodeIndex];
-    const local = nodeLocalMatrix(node);
-    const w = mat4.create();
-    mat4.multiply(w, parentWorld, local);
-    world[nodeIndex] = w;
-    visited[nodeIndex] = true;
+  const traverse = (rootIndex, parentWorld) => {
+    const stack = [{ nodeIndex: rootIndex, parentWorld, exiting: false }];
 
-    const children = Array.isArray(node && node.children) ? node.children : [];
-    for (let i = 0; i < children.length; i++) {
-      dfs(children[i], w);
+    while (stack.length) {
+      const frame = stack.pop();
+      const { nodeIndex } = frame;
+      if (!Number.isInteger(nodeIndex) || nodeIndex < 0 || nodeIndex >= nodes.length) {
+        throw new Error("gltf_invalid_child_index");
+      }
+
+      if (frame.exiting) {
+        state[nodeIndex] = 2;
+        continue;
+      }
+      if (state[nodeIndex] === 1) throw new Error("gltf_node_cycle");
+      if (state[nodeIndex] === 2) continue;
+
+      const node = nodes[nodeIndex];
+      const local = nodeLocalMatrix(node);
+      const w = mat4.create();
+      mat4.multiply(w, frame.parentWorld, local);
+      world[nodeIndex] = w;
+      state[nodeIndex] = 1;
+      stack.push({ nodeIndex, parentWorld: frame.parentWorld, exiting: true });
+
+      const children = Array.isArray(node && node.children) ? node.children : [];
+      for (let i = children.length - 1; i >= 0; i--) {
+        stack.push({ nodeIndex: children[i], parentWorld: w, exiting: false });
+      }
     }
   };
 
   const identity = mat4.create();
   for (let i = 0; i < roots.length; i++) {
-    dfs(roots[i], identity);
+    traverse(roots[i], identity);
   }
 
   // Some exports may have nodes not reachable from scene roots; compute them as identity-based.
   for (let i = 0; i < nodes.length; i++) {
-    if (!visited[i]) {
-      dfs(i, identity);
+    if (state[i] === 0) {
+      traverse(i, identity);
     }
   }
 
@@ -647,10 +869,11 @@ function removeEntityPayload(networkId) {
   return { dataType: "r", data: { networkId } };
 }
 
-(async () => {
+async function main() {
   const options = docopt(doc);
 
   const baseUrl = options["--url"] || "https://meta-hubs.org";
+  const sceneFetchPolicy = createSceneFetchPolicy(baseUrl);
   const hubSid = options["--room"];
   if (!hubSid) {
     log("Missing --room");
@@ -1096,15 +1319,25 @@ function removeEntityPayload(networkId) {
   });
 
   // Fetch scene waypoints/colliders and featured avatars.
-  const sceneUrl = hub && hub.scene && hub.scene.model_url ? resolveUrl(baseUrl, hub.scene.model_url) : "";
-  if (!sceneUrl) {
+  const rawSceneUrl = hub && hub.scene && hub.scene.model_url ? resolveUrl(baseUrl, hub.scene.model_url) : "";
+  let sceneUrl = "";
+  let sceneUrlRejected = false;
+  if (rawSceneUrl) {
+    try {
+      sceneUrl = validateSceneUrl(rawSceneUrl, sceneFetchPolicy).toString();
+    } catch (err) {
+      sceneUrlRejected = true;
+      log("Rejected scene model_url. Bots will use origin fallback.", err.message);
+    }
+  }
+  if (!sceneUrl && !sceneUrlRejected) {
     log("No scene model_url found in hub payload. Bots will use origin fallback.");
   } else {
     log("Scene URL:", sceneUrl);
   }
 
   const initScenePromise = sceneUrl
-    ? fetchGltfJson(sceneUrl)
+    ? fetchGltfJson(sceneUrl, sceneFetchPolicy)
         .then(gltf => {
           const extracted = extractWaypointsAndColliders(gltf);
           const points = pickSpawnAndPatrolPoints(extracted);
@@ -1205,4 +1438,24 @@ function removeEntityPayload(networkId) {
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
-})();
+}
+
+if (require.main === module) {
+  main().catch(err => {
+    log("Ghost runner failed:", err && err.message ? err.message : "unknown_error");
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  main,
+  internals: {
+    computeWorldNodeMatrices,
+    createSceneFetchPolicy,
+    extractWaypointsAndColliders,
+    fetchGltfJson,
+    parseGlbJson,
+    validateGltfShape,
+    validateSceneUrl
+  }
+};

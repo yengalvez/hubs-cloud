@@ -689,6 +689,16 @@ spec:
           value: "$GHOST_RUNNER_SCRIPT"
         - name: GHOST_RAYCAST_MODE
           value: "$GHOST_RAYCAST_MODE"
+        - name: GHOST_SCENE_FETCH_TIMEOUT_MS
+          value: "10000"
+        - name: GHOST_SCENE_MAX_BYTES
+          value: "67108864"
+        - name: GHOST_SCENE_MAX_JSON_BYTES
+          value: "4194304"
+        - name: GHOST_SCENE_MAX_NODES
+          value: "50000"
+        - name: GHOST_SCENE_MAX_EDGES
+          value: "200000"
         - name: HUBS_BASE_URL
           value: https://$HUB_DOMAIN
         - name: MAX_ACTIVE_ROOMS

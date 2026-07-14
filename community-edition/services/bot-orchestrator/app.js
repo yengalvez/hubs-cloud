@@ -223,6 +223,27 @@ function extractOutputText(responsePayload) {
   return "";
 }
 
+function responseWasRefused(responsePayload) {
+  const output = Array.isArray(responsePayload?.output) ? responsePayload.output : [];
+
+  return output.some(item =>
+    (Array.isArray(item?.content) ? item.content : []).some(
+      block => block?.type === "refusal" || (typeof block?.refusal === "string" && block.refusal.trim())
+    )
+  );
+}
+
+function parseOpenAIResponsePayload(responsePayload, knownWaypoints) {
+  if (responseWasRefused(responsePayload)) {
+    return {
+      reply: "No puedo ayudar con esa petición. Prueba con otra pregunta.",
+      action: null
+    };
+  }
+
+  return parseStructuredReply(extractOutputText(responsePayload), knownWaypoints);
+}
+
 function parseStructuredReply(responseText, knownWaypoints) {
   const jsonPayload = extractFirstJsonObject(responseText);
   if (!jsonPayload) return null;
@@ -262,8 +283,16 @@ function normalizeConfig(input) {
 function detectWaypointAction(message, context) {
   if (!message || typeof message !== "string") return null;
 
-  const text = message.toLowerCase();
+  const text = message
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
   const knownWaypoints = sanitizeKnownWaypoints(context);
+  const movementIntent = /(?:^|[^a-z0-9_])(?:go|move|walk|ve|vete|vaya|vayas|anda|camina|dirigete|muevete|desplazate)(?=$|[^a-z0-9_])/u.test(
+    text
+  );
+  if (!movementIntent) return null;
+
   const spawbotMatch = text.match(/spawbot-[a-z0-9_-]+/);
   if (spawbotMatch) {
     return sanitizeAction(
@@ -275,7 +304,7 @@ function detectWaypointAction(message, context) {
     );
   }
 
-  if ((text.includes("move") || text.includes("ve") || text.includes("go")) && knownWaypoints.length) {
+  if (knownWaypoints.length) {
     return {
       type: "go_to_waypoint",
       waypoint: knownWaypoints[Math.floor(Math.random() * knownWaypoints.length)]
@@ -339,7 +368,36 @@ function buildOpenAIRequest({ hubSid, botId, message, botsConfig, context, reque
     safety_identifier: safetyIdentifierFor(requesterId),
     max_output_tokens: 320,
     reasoning: { effort: "low" },
-    text: { verbosity: "low" },
+    text: {
+      verbosity: "low",
+      format: {
+        type: "json_schema",
+        name: "bot_chat_response",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            reply: { type: "string" },
+            action: {
+              anyOf: [
+                {
+                  type: "object",
+                  properties: {
+                    type: { type: "string", enum: ["go_to_waypoint"] },
+                    waypoint: { type: "string" }
+                  },
+                  required: ["type", "waypoint"],
+                  additionalProperties: false
+                },
+                { type: "null" }
+              ]
+            }
+          },
+          required: ["reply", "action"],
+          additionalProperties: false
+        }
+      }
+    },
     input: [
       {
         role: "system",
@@ -404,12 +462,12 @@ async function callOpenAI({ hubSid, botId, message, botsConfig, context, request
     }
 
     const responsePayload = await response.json();
-    const responseText = extractOutputText(responsePayload);
-    if (!responseText) {
-      throw new Error("openai_empty_output");
+    if (responsePayload?.status && responsePayload.status !== "completed") {
+      throw new Error(`openai_response_${responsePayload.status}`);
     }
+    if (responsePayload?.error) throw new Error("openai_response_error");
 
-    const parsed = parseStructuredReply(responseText, knownWaypoints);
+    const parsed = parseOpenAIResponsePayload(responsePayload, knownWaypoints);
     if (!parsed) {
       throw new Error("openai_invalid_json_output");
     }
@@ -900,7 +958,9 @@ module.exports = {
   startServer,
   internals: {
     buildOpenAIRequest,
+    detectWaypointAction,
     normalizeConfig,
+    parseOpenAIResponsePayload,
     parseStructuredReply,
     sanitizeKnownWaypoints,
     safetyIdentifierFor,

@@ -109,6 +109,28 @@ test("builds non-stored OpenAI requests with pseudonymous safety identifiers", (
   assert.equal(request.safety_identifier.length, 64);
   assert.equal(request.safety_identifier.includes("account-123"), false);
   assert.match(request.input[0].content[0].text, /datos no confiables/);
+  assert.equal(request.text.format.type, "json_schema");
+  assert.equal(request.text.format.strict, true);
+  assert.deepEqual(request.text.format.schema.required, ["reply", "action"]);
+  assert.equal(request.text.format.schema.additionalProperties, false);
+});
+
+test("handles OpenAI refusals without exposing provider text", () => {
+  const parsed = internals.parseOpenAIResponsePayload(
+    {
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "refusal", refusal: "provider-specific refusal details" }]
+        }
+      ]
+    },
+    []
+  );
+
+  assert.equal(parsed.reply.includes("provider-specific"), false);
+  assert.equal(parsed.action, null);
 });
 
 test("only accepts navigation actions for a known spawbot waypoint", () => {
@@ -123,6 +145,21 @@ test("only accepts navigation actions for a known spawbot waypoint", () => {
     ["spawbot-lobby"]
   );
   assert.deepEqual(known.action, { type: "go_to_waypoint", waypoint: "spawbot-lobby" });
+});
+
+test("does not infer movement from substrings or a waypoint mention without an instruction", () => {
+  const context = { waypoints: ["spawbot-recepcion"] };
+
+  assert.equal(internals.detectWaypointAction("Hola. Salúdame brevemente.", context), null);
+  assert.equal(internals.detectWaypointAction("¿Qué es spawbot-recepcion?", context), null);
+  assert.deepEqual(internals.detectWaypointAction("Ve a spawbot-recepcion", context), {
+    type: "go_to_waypoint",
+    waypoint: "spawbot-recepcion"
+  });
+  assert.deepEqual(internals.detectWaypointAction("Dirígete a recepción", context), {
+    type: "go_to_waypoint",
+    waypoint: "spawbot-recepcion"
+  });
 });
 
 test("removes stale room state after a complete Reticulum configuration snapshot", async () => {
