@@ -1257,6 +1257,12 @@ spec:
       containers:
       - name: dialog
         image: $Container_Dockerhub_Username/dialog:$Container_Tag
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            memory: 512Mi
         imagePullPolicy: Always
         ports:
         - hostPort: 4443
