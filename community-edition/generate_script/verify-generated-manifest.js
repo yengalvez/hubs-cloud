@@ -123,6 +123,7 @@ if (!fs.existsSync(manifestPath)) {
     ["spoke", "spoke", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
     ["nearspark", "nearspark", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],
     ["photomnemonic", "photomnemonic", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
+    ["coturn", "coturn", { cpu: "25m", memory: "32Mi", memoryLimit: "512Mi" }],
     ["haproxy", "haproxy", { cpu: "100m", memory: "128Mi", memoryLimit: "512Mi" }]
   ];
   resourceBudgets.forEach(([deployment, container, expected]) =>

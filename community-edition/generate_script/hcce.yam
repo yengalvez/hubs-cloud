@@ -1311,6 +1311,12 @@ spec:
       containers:
       - name: coturn
         image: $Container_Dockerhub_Username/coturn:$Container_Tag
+        resources:
+          requests:
+            cpu: 25m
+            memory: 32Mi
+          limits:
+            memory: 512Mi
         imagePullPolicy: Always
         ports:
         - hostPort: 5349
