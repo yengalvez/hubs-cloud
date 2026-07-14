@@ -1278,6 +1278,7 @@ spec:
       labels:
         app: dialog
     spec:
+      automountServiceAccountToken: false
       hostNetwork: true
       containers:
       - name: dialog
