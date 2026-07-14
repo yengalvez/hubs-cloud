@@ -116,6 +116,8 @@ if (!fs.existsSync(manifestPath)) {
   }
 
   const resourceBudgets = [
+    ["reticulum", "reticulum", { cpu: "250m", memory: "2Gi", memoryLimit: "4Gi" }],
+    ["reticulum", "postgrest", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],
     ["bot-orchestrator", "bot-orchestrator", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
     ["pgsql", "postgresql", { cpu: "100m", memory: "256Mi", memoryLimit: "1Gi" }],
     ["pgbouncer", "pgbouncer", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
@@ -128,6 +130,16 @@ if (!fs.existsSync(manifestPath)) {
     ["coturn", "coturn", { cpu: "25m", memory: "32Mi", memoryLimit: "512Mi" }],
     ["haproxy", "haproxy", { cpu: "100m", memory: "128Mi", memoryLimit: "512Mi" }]
   ];
+  const budgetedContainers = new Set(resourceBudgets.map(([deployment, container]) => `${deployment}/${container}`));
+  const deploymentContainers = resources
+    .filter(resource => resource.kind === "Deployment")
+    .flatMap(deployment =>
+      (deployment.spec?.template?.spec?.containers || []).map(container => `${deployment.metadata?.name}/${container.name}`)
+    );
+  const unbudgetedContainers = deploymentContainers.filter(value => !budgetedContainers.has(value));
+  if (unbudgetedContainers.length) {
+    fail(`all Deployment containers need an audited resource budget: ${unbudgetedContainers.join(", ")}`);
+  }
   resourceBudgets.forEach(([deployment, container, expected]) =>
     verifyResourceBudget(resources, deployment, container, expected)
   );
