@@ -115,6 +115,27 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
+  const tokenlessDeployments = [
+    "bot-orchestrator",
+    "pgbouncer",
+    "pgbouncer-t",
+    "hubs",
+    "spoke",
+    "nearspark",
+    "photomnemonic"
+  ];
+  for (const name of tokenlessDeployments) {
+    const deployment = findResource(resources, "Deployment", name);
+    if (deployment?.spec?.template?.spec?.automountServiceAccountToken !== false) {
+      fail(`Deployment/${name} must disable service-account token automounting`);
+    }
+  }
+
+  const haproxyDeployment = findResource(resources, "Deployment", "haproxy");
+  if (haproxyDeployment?.spec?.template?.spec?.serviceAccountName !== "haproxy-sa") {
+    fail("Deployment/haproxy must keep its dedicated service account");
+  }
+
   const resourceBudgets = [
     ["reticulum", "reticulum", { cpu: "250m", memory: "2Gi", memoryLimit: "4Gi" }],
     ["reticulum", "postgrest", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],

@@ -675,6 +675,7 @@ spec:
       annotations:
         yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
     spec:
+      automountServiceAccountToken: false
       containers:
       - name: bot-orchestrator
         image: $Container_Dockerhub_Username/bot-orchestrator:$Container_Tag
@@ -848,6 +849,7 @@ spec:
       labels:
         app: pgbouncer
     spec:
+      automountServiceAccountToken: false
       containers:
       - image: $Container_Dockerhub_Username/pgbouncer:$Container_Tag
         resources:
@@ -903,6 +905,7 @@ spec:
       labels:
         app: pgbouncer-t
     spec:
+      automountServiceAccountToken: false
       containers:
       - image: $Container_Dockerhub_Username/pgbouncer:$Container_Tag
         resources:
@@ -970,6 +973,7 @@ spec:
       labels:
         app: hubs
     spec:
+      automountServiceAccountToken: false
       containers:
       - name: hubs
         image: $Container_Dockerhub_Username/hubs:$Container_Tag
@@ -1046,6 +1050,7 @@ spec:
       labels:
         app: spoke
     spec:
+      automountServiceAccountToken: false
       containers:
       - name: spoke
         image: $Container_Dockerhub_Username/spoke:$Container_Tag
@@ -1122,6 +1127,7 @@ spec:
       labels:
         app: nearspark
     spec:
+      automountServiceAccountToken: false
       containers:
       - name: nearspark
         image: $Container_Dockerhub_Username/nearspark:$Container_Tag
@@ -1223,6 +1229,7 @@ spec:
       labels:
         app: photomnemonic
     spec:
+      automountServiceAccountToken: false
       containers:
       - name: photomnemonic
         image: $Container_Dockerhub_Username/photomnemonic:$Container_Tag
