@@ -666,6 +666,12 @@ spec:
       containers:
       - name: bot-orchestrator
         image: $Container_Dockerhub_Username/bot-orchestrator:$Container_Tag
+        resources:
+          requests:
+            cpu: 25m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 5001
@@ -826,6 +832,12 @@ spec:
     spec:
       containers:
       - image: $Container_Dockerhub_Username/pgbouncer:$Container_Tag
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 128Mi
         imagePullPolicy: IfNotPresent
         name: pgbouncer
         env:
@@ -875,6 +887,12 @@ spec:
     spec:
       containers:
       - image: $Container_Dockerhub_Username/pgbouncer:$Container_Tag
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 128Mi
         imagePullPolicy: IfNotPresent
         name: pgbouncer-t
         env:
@@ -937,6 +955,12 @@ spec:
       containers:
       - name: hubs
         image: $Container_Dockerhub_Username/hubs:$Container_Tag
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 128Mi
         imagePullPolicy: IfNotPresent
         env:
         - name: turkeyCfg_thumbnail_server
@@ -1007,6 +1031,12 @@ spec:
       containers:
       - name: spoke
         image: $Container_Dockerhub_Username/spoke:$Container_Tag
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 128Mi
         imagePullPolicy: IfNotPresent
         env:
         - name: turkeyCfg_thumbnail_server
@@ -1077,6 +1107,12 @@ spec:
       containers:
       - name: nearspark
         image: $Container_Dockerhub_Username/nearspark:$Container_Tag
+        resources:
+          requests:
+            cpu: 25m
+            memory: 32Mi
+          limits:
+            memory: 256Mi
         ports:
         - containerPort: 5000
         imagePullPolicy: IfNotPresent
@@ -1172,6 +1208,12 @@ spec:
       containers:
       - name: photomnemonic
         image: $Container_Dockerhub_Username/photomnemonic:$Container_Tag
+        resources:
+          requests:
+            cpu: 25m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
         imagePullPolicy: IfNotPresent
 ---
 apiVersion: v1
@@ -1353,6 +1395,12 @@ spec:
       - name: haproxy
         # Use HAProxyTech ingress controller (v3.x) for Kubernetes v1.34+ compatibility.
         image: haproxytech/kubernetes-ingress:3.2
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
         args:
         - --configmap=$Namespace/haproxy-config
         - --https-bind-port=4443

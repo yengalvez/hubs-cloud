@@ -67,6 +67,29 @@ function verifyIngressPolicy(resources, name, targetApp, allowedApps, port) {
   }
 }
 
+function verifyResourceBudget(resources, deploymentName, containerName, expected) {
+  const deployment = findResource(resources, "Deployment", deploymentName);
+  const container = deployment?.spec?.template?.spec?.containers?.find(value => value.name === containerName);
+  if (!container) {
+    fail(`missing Deployment/${deploymentName} container ${containerName}`);
+    return;
+  }
+  const actual = container.resources || {};
+  if (
+    String(actual.requests?.cpu || "") !== expected.cpu ||
+    String(actual.requests?.memory || "") !== expected.memory ||
+    String(actual.limits?.memory || "") !== expected.memoryLimit
+  ) {
+    fail(
+      `Deployment/${deploymentName} container ${containerName} must request ${expected.cpu}/${expected.memory} ` +
+      `and limit memory to ${expected.memoryLimit}`
+    );
+  }
+  if (actual.limits?.cpu) {
+    fail(`Deployment/${deploymentName} container ${containerName} must not set a CPU limit`);
+  }
+}
+
 if (!fs.existsSync(manifestPath)) {
   fail(`manifest not found: ${manifestPath}`);
 } else {
@@ -91,6 +114,20 @@ if (!fs.existsSync(manifestPath)) {
       }
     }
   }
+
+  const resourceBudgets = [
+    ["bot-orchestrator", "bot-orchestrator", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
+    ["pgbouncer", "pgbouncer", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
+    ["pgbouncer-t", "pgbouncer-t", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
+    ["hubs", "hubs", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
+    ["spoke", "spoke", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
+    ["nearspark", "nearspark", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],
+    ["photomnemonic", "photomnemonic", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
+    ["haproxy", "haproxy", { cpu: "100m", memory: "128Mi", memoryLimit: "512Mi" }]
+  ];
+  resourceBudgets.forEach(([deployment, container, expected]) =>
+    verifyResourceBudget(resources, deployment, container, expected)
+  );
 
   for (const name of ["reticulum", "pgsql", "dialog", "coturn"]) {
     const deployment = findResource(resources, "Deployment", name);
