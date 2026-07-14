@@ -103,7 +103,7 @@ async function runMediasoupWorkers()
 		});
 
 		mediasoupWorkers.push(worker);
-		utils.workerLoadMan.set(worker._pid, { peerCnt: 0, roomReqCnt: 0, rooms: new Map() });
+		utils.workerLoadMan.set(worker.pid, { peerCnt: 0, roomReqCnt: 0, rooms: new Map() });
 	}
 
 	utils.workerLoadMan.runSurvey();

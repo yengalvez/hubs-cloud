@@ -1300,6 +1300,16 @@ spec:
       containers:
       - name: dialog
         image: $Container_Dockerhub_Username/dialog:$Container_Tag
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         resources:
           requests:
             cpu: 50m

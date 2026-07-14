@@ -42,7 +42,7 @@ const workerLoadMan = (function() {
 
 		/**
 		 *
-		 * @param {*} pid (string) worker._pid
+		 * @param {*} pid (string) worker.pid
 		 * @param {*} amt (int) amount to add, default=1
 		 */
 		addPeer: function(pid, amt=1){
@@ -56,7 +56,7 @@ const workerLoadMan = (function() {
 		},
 
 		/**
-		 * @param {*} pid (string) worker._pid
+		 * @param {*} pid (string) worker.pid
 		 * @param {*} amt (int) amount to add, default=9999999
 		 */
 		addRoomReq: function(pid, roomId, amt=9999999){
@@ -85,7 +85,7 @@ const workerLoadMan = (function() {
 			let minWorkerIdx_peer = -1;
 
 			for (let [pid, workerMeta] of _workerLoadMap.entries()){
-				const idx = mediasoupWorkers.map((worker) => worker._pid).indexOf(pid);
+				const idx = mediasoupWorkers.map((worker) => worker.pid).indexOf(pid);
 				if (idx === -1){ continue; }
 
 				// ignore the amount reserved for requesting room
@@ -131,7 +131,7 @@ const workerLoadMan = (function() {
 				}
 
 				for (let [worker, routerId] of room._inUseMediasoupWorkers){
-					this.addRoomReq(worker._pid, room._roomId, room._roomReq);
+					this.addRoomReq(worker.pid, room._roomId, room._roomReq);
 				}
 			}
 			// logger.info("runSurvey -- this._workerLoadMap: %s", JSON.stringify(this._workerLoadMap, stableSortReplacer, 2));

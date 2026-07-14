@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG NODE_VERSION=18
+ARG NODE_VERSION=22
 
 FROM node:${NODE_VERSION} AS build
 workdir /app
@@ -11,8 +11,9 @@ run npm ci
 copy . .
 FROM node:${NODE_VERSION}-slim
 workdir /app
-copy --from=build /app /app
+copy --chown=1000:1000 --from=build /app /app
 # run apt-get update > /dev/null && apt-get install -y jq curl dnsutils netcat > /dev/null
 run apt-get update > /dev/null && apt-get install -y jq curl dnsutils > /dev/null
 copy scripts/docker/run.sh /run.sh
-cmd bash /run.sh
+USER 1000:1000
+cmd ["/bin/bash", "/run.sh"]

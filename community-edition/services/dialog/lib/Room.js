@@ -99,12 +99,15 @@ class Room extends EventEmitter
 		// {array} unused mediasoupWorkers for this room
 		this._arr_unusedMediasoupWorkers = arr_unusedMediasoupWorkers;
 
-		// {map<worker._pid: routerId>}
+		// {map<worker.pid: routerId>}
 		this._inUseMediasoupWorkers = inUseMediasoupWorkers;
 
 		// Map of mediasoup Router instances.
 		// {map<routerId: router>}
 		this._mediasoupRouters = mediasoupRouters;
+
+		// Track producers piped into each router without relying on mediasoup internals.
+		this._pipedProducerIdsByRouter = new Map();
 
 		// mediasoup AudioLevelObserver.
 		// @type {mediasoup.AudioLevelObserver}
@@ -629,6 +632,7 @@ class Room extends EventEmitter
 						producerId : producer.id,
 						router     : targetRouter
 					});
+					this._getPipedProducerIds(targetRouter.id).add(producer.id);
 				}
 
 				// Store the Producer into the protoo Peer data Object.
@@ -1439,7 +1443,7 @@ class Room extends EventEmitter
 		{
 			worker = workers[leastUsedWorkerIdx];
 			routerId = this._inUseMediasoupWorkers.get(worker);
-			return [routerId, worker._pid];
+			return [routerId, worker.pid];
 		}
 		// in use workers are all maxed out
 		else if (this._arr_unusedMediasoupWorkers.length > 0)
@@ -1460,12 +1464,12 @@ class Room extends EventEmitter
 				this._inUseMediasoupWorkers.set(worker, newRouter.id);
 				this._arr_unusedMediasoupWorkers.splice(this._arr_unusedMediasoupWorkers.indexOf(worker), 1);
 
-				logger.info("new router (id: %s) created on worker (pid: %s) for room (id: %s)", newRouter.id, worker._pid, this._roomId);
+				logger.info("new router (id: %s) created on worker (pid: %s) for room (id: %s)", newRouter.id, worker.pid, this._roomId);
 				logger.info("this._mediasoupRouters.size: ", this._mediasoupRouters.size);
 
 				this._pipeProducersToRouter(newRouter.id);
 
-				return [newRouter.id, worker._pid];
+				return [newRouter.id, worker.pid];
 			}
 		}
 
@@ -1474,12 +1478,13 @@ class Room extends EventEmitter
 		logger.warn("high server load -- all workers maxed out");
 		worker = workers[leastUsedWorkerIdx];
 		routerId = this._inUseMediasoupWorkers.get(worker);
-		return [routerId, worker._pid];
+		return [routerId, worker.pid];
 	}
 
 	async _pipeProducersToRouter(routerId)
 	{
 		const router = this._mediasoupRouters.get(routerId);
+		const pipedProducerIds = this._getPipedProducerIds(routerId);
 
 		const peersToPipe =
 			Object.values(this._protooRoom.peers)
@@ -1491,7 +1496,7 @@ class Room extends EventEmitter
 
 			for (const producerId of peer.data.producers.keys())
 			{
-				if (router._producers.has(producerId))
+				if (pipedProducerIds.has(producerId))
 				{
 					logger.info("~~~skipping~parenting~router~~~")
 					continue;
@@ -1501,9 +1506,23 @@ class Room extends EventEmitter
 					producerId : producerId,
 					router     : router
 				});
+				pipedProducerIds.add(producerId);
 			}
 		}
-	}	
+	}
+
+	_getPipedProducerIds(routerId)
+	{
+		let producerIds = this._pipedProducerIdsByRouter.get(routerId);
+
+		if (!producerIds)
+		{
+			producerIds = new Set();
+			this._pipedProducerIdsByRouter.set(routerId, producerIds);
+		}
+
+		return producerIds;
+	}
 
 }
 

@@ -188,6 +188,7 @@ if (!fs.existsSync(manifestPath)) {
 
   const reticulum = findResource(resources, "Deployment", "reticulum");
   const botOrchestrator = findResource(resources, "Deployment", "bot-orchestrator");
+  const dialog = findResource(resources, "Deployment", "dialog");
   const reticulumBotKeyChecksum =
     reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
   const botOrchestratorBotKeyChecksum =
@@ -257,6 +258,29 @@ if (!fs.existsSync(manifestPath)) {
     }
     if (security.seccompProfile?.type !== "RuntimeDefault") {
       fail("bot-orchestrator container must use the RuntimeDefault seccomp profile");
+    }
+  }
+
+  const dialogContainer = dialog?.spec?.template?.spec?.containers?.find(container => container.name === "dialog");
+  if (!dialogContainer) {
+    fail("missing dialog container");
+  } else {
+    const security = dialogContainer.securityContext || {};
+    const droppedCapabilities = security.capabilities?.drop || [];
+    if (security.runAsNonRoot !== true) {
+      fail("dialog container must run as non-root");
+    }
+    if (Number(security.runAsUser) !== 1000 || Number(security.runAsGroup) !== 1000) {
+      fail("dialog container must use the audited uid/gid 1000");
+    }
+    if (security.allowPrivilegeEscalation !== false) {
+      fail("dialog container must disable privilege escalation");
+    }
+    if (!droppedCapabilities.includes("ALL")) {
+      fail("dialog container must drop all Linux capabilities");
+    }
+    if (security.seccompProfile?.type !== "RuntimeDefault") {
+      fail("dialog container must use the RuntimeDefault seccomp profile");
     }
   }
 
