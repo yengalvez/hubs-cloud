@@ -1,6 +1,7 @@
 #!/bin/sh
 
 set -eu
+umask 077
 
 : "${PSQL:?PSQL is required}"
 : "${REALM:?REALM is required}"
