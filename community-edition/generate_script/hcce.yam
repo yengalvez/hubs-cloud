@@ -428,11 +428,9 @@ spec:
     matchLabels:
       app: reticulum
   minReadySeconds: 15
+  # ret-pvc is single-writer storage. Never overlap Reticulum revisions.
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    type: Recreate
   revisionHistoryLimit: 1
   template:
     metadata:
@@ -756,6 +754,9 @@ metadata:
   namespace: $Namespace
 spec:
   replicas: 1
+  # pgsql-pvc is single-writer storage. Never run two PostgreSQL revisions.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: pgsql

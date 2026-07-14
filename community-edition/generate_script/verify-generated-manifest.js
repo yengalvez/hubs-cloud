@@ -57,6 +57,16 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
+  for (const name of ["reticulum", "pgsql"]) {
+    const deployment = findResource(resources, "Deployment", name);
+    if (deployment?.spec?.strategy?.type !== "Recreate") {
+      fail(`Deployment/${name} must use Recreate for its single-writer persistent volume`);
+    }
+    if (deployment?.spec?.strategy?.rollingUpdate) {
+      fail(`Deployment/${name} must not define rollingUpdate for single-writer storage`);
+    }
+  }
+
   for (const name of ["ret", "dialog", "nearspark"]) {
     const ingress = findResource(resources, "Ingress", name);
     if (!ingress) {
