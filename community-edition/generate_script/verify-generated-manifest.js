@@ -246,6 +246,9 @@ if (!fs.existsSync(manifestPath)) {
     if (security.runAsNonRoot !== true) {
       fail("bot-orchestrator container must run as non-root");
     }
+    if (Number(security.runAsUser) !== 1000 || Number(security.runAsGroup) !== 1000) {
+      fail("bot-orchestrator container must use the audited uid/gid 1000");
+    }
     if (security.allowPrivilegeEscalation !== false) {
       fail("bot-orchestrator container must disable privilege escalation");
     }
