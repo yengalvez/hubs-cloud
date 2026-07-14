@@ -140,6 +140,13 @@ if (!fs.existsSync(manifestPath)) {
     fail("Deployment/haproxy must keep its dedicated service account");
   }
 
+  const coturnDeployment = findResource(resources, "Deployment", "coturn");
+  const credentialLeakingCoturnImage =
+    "docker.io/mozillareality/coturn@sha256:8380269c7bb2dc369f4126251199f0d603711debe8537b22cb7be470a50c51ce";
+  if (coturnDeployment?.spec?.template?.spec?.containers?.[0]?.image === credentialLeakingCoturnImage) {
+    fail("Deployment/coturn must not use the image that logs its database connection string");
+  }
+
   const resourceBudgets = [
     ["reticulum", "reticulum", { cpu: "250m", memory: "2Gi", memoryLimit: "4Gi" }],
     ["reticulum", "postgrest", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],
