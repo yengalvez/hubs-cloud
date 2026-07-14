@@ -8,6 +8,18 @@ config :ret,
 config :phoenix, :format_encoders, "json-api": Jason
 config :phoenix, :json_library, Jason
 
+# Phoenix logs HTTP, socket, and channel parameters. Filter credentials in every
+# environment so a deployment-specific config cannot accidentally expose them.
+config :phoenix, :filter_parameters, [
+  "q",
+  "filter",
+  "cursor",
+  "bot_access_key",
+  "token",
+  "password",
+  "secret"
+]
+
 config :canary,
   repo: Ret.Repo,
   unauthorized_handler: {RetWeb.Canary.AuthorizationErrorHandler, :authorization_error}

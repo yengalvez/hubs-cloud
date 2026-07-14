@@ -187,6 +187,10 @@ function main() {
     if (!processedConfig.BOT_ACCESS_KEY) {
       processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
     }
+    processedConfig.BOT_ACCESS_KEY_CHECKSUM = crypto
+      .createHash("sha256")
+      .update(String(processedConfig.BOT_ACCESS_KEY))
+      .digest("hex");
 
     // Runner defaults (safe, reversible). These must exist because the template uses $VARS.
     if (!processedConfig.RUNNER_BACKEND) {

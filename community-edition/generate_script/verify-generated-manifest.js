@@ -68,6 +68,18 @@ if (!fs.existsSync(manifestPath)) {
   }
 
   const reticulum = findResource(resources, "Deployment", "reticulum");
+  const botOrchestrator = findResource(resources, "Deployment", "bot-orchestrator");
+  const reticulumBotKeyChecksum =
+    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
+  const botOrchestratorBotKeyChecksum =
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
+  if (!/^[a-f0-9]{64}$/i.test(reticulumBotKeyChecksum || "")) {
+    fail("Deployment/reticulum must carry the bot access key checksum annotation");
+  }
+  if (botOrchestratorBotKeyChecksum !== reticulumBotKeyChecksum) {
+    fail("Reticulum and bot-orchestrator must share the bot access key checksum annotation");
+  }
+
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(container => container.name === "reticulum");
   if (!reticulumContainer) {
     fail("missing reticulum container");

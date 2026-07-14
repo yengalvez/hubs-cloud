@@ -436,6 +436,8 @@ spec:
     metadata:
       labels:
         app: reticulum
+      annotations:
+        yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
     spec:
       volumes:
       - name: storage
@@ -658,6 +660,8 @@ spec:
     metadata:
       labels:
         app: bot-orchestrator
+      annotations:
+        yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
     spec:
       containers:
       - name: bot-orchestrator

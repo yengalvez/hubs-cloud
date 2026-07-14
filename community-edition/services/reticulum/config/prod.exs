@@ -90,9 +90,6 @@ config :ret, Ret.SessionLockRepo,
 #     config :ret, RetWeb.Endpoint, server: true
 #
 
-# Filter out media search API params
-config :phoenix, :filter_parameters, ["q", "filter", "cursor"]
-
 # Disable prepared queries bc of pgbouncer
 config :ret, Ret.Repo, adapter: Ecto.Adapters.Postgres, prepare: :unnamed
 
