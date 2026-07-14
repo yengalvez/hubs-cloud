@@ -101,6 +101,12 @@ if (!fs.existsSync(manifestPath)) {
     if (haproxyContainer.securityContext) {
       fail("haproxy container must not restore the legacy securityContext");
     }
+    for (const probe of ["startupProbe", "readinessProbe", "livenessProbe"]) {
+      const value = haproxyContainer[probe];
+      if (value?.httpGet?.path !== "/healthz" || Number(value?.httpGet?.port) !== 1042) {
+        fail(`haproxy container must define ${probe} on /healthz:1042`);
+      }
+    }
   }
 
   const haproxyRole = findResource(resources, "ClusterRole", "haproxy-cr");
