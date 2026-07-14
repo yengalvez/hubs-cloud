@@ -21,6 +21,13 @@ jobs:
     steps:
       - name: Prevent unsanctioned pull requests to the default branch
         if: github.base_ref == github.event.repository.default_branch && (github.head_ref != 'development' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          echo "ERROR: You are only allowed to merge to the '${{ github.event.repository.default_branch }}' branch from this repository's 'development' branch.  base_ref: ${{ github.base_ref }}; head_ref: ${{ github.head_ref }}; base_repo: ${{ github.event.pull_request.base.repo.full_name }}; head_repo: ${{ github.event.pull_request.head.repo.full_name }}; "
+          printf "ERROR: You are only allowed to merge to the '%s' branch from this repository's 'development' branch. base_ref: %s; head_ref: %s; base_repo: %s; head_repo: %s.\n" \
+            "$DEFAULT_BRANCH" "$BASE_REF" "$HEAD_REF" "$BASE_REPO" "$HEAD_REPO"
           exit 1
