@@ -282,6 +282,11 @@ if (!fs.existsSync(manifestPath)) {
     if (security.seccompProfile?.type !== "RuntimeDefault") {
       fail("dialog container must use the RuntimeDefault seccomp profile");
     }
+    for (const probe of ["startupProbe", "readinessProbe", "livenessProbe"]) {
+      if (Number(dialogContainer[probe]?.tcpSocket?.port) !== 4443) {
+        fail(`dialog container must define ${probe} on TCP port 4443`);
+      }
+    }
   }
 
   for (const name of ["ret", "dialog", "nearspark"]) {

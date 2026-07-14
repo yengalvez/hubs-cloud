@@ -1320,6 +1320,21 @@ spec:
         ports:
         - hostPort: 4443
           containerPort: 4443
+        startupProbe:
+          tcpSocket:
+            port: 4443
+          periodSeconds: 5
+          failureThreshold: 24
+        readinessProbe:
+          tcpSocket:
+            port: 4443
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          tcpSocket:
+            port: 4443
+          periodSeconds: 10
+          failureThreshold: 3
         env:
         - name: perms_key
           valueFrom:
