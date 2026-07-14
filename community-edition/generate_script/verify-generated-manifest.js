@@ -123,7 +123,8 @@ if (!fs.existsSync(manifestPath)) {
     "spoke",
     "nearspark",
     "photomnemonic",
-    "dialog"
+    "dialog",
+    "coturn"
   ];
   for (const name of tokenlessDeployments) {
     const deployment = findResource(resources, "Deployment", name);

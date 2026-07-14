@@ -1339,6 +1339,7 @@ spec:
       labels:
         app: coturn
     spec:
+      automountServiceAccountToken: false
       hostNetwork: true
       containers:
       - name: coturn
