@@ -220,7 +220,7 @@ if (!fs.existsSync(manifestPath)) {
     ["hubs", "hubs", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
     ["spoke", "spoke", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
     ["nearspark", "nearspark", { cpu: "25m", memory: "32Mi", memoryLimit: "256Mi" }],
-    ["photomnemonic", "photomnemonic", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
+    ["photomnemonic", "photomnemonic", { cpu: "25m", memory: "384Mi", memoryLimit: "768Mi" }],
     ["dialog", "dialog", { cpu: "50m", memory: "96Mi", memoryLimit: "512Mi" }],
     ["coturn", "coturn", { cpu: "25m", memory: "32Mi", memoryLimit: "512Mi" }],
     ["haproxy", "haproxy", { cpu: "100m", memory: "128Mi", memoryLimit: "512Mi" }]
