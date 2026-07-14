@@ -1,12 +1,4 @@
-from node:lts as build
-run mkdir certs && openssl req -x509 -newkey rsa:4096 -sha256 -days 36500 -nodes -keyout certs/key.pem -out certs/cert.pem -subj '/CN=dialog'
-from coturn/coturn:alpine
-copy --from=build /certs /certs
-user root:root
-run apk add curl netcat-openbsd
+FROM docker.io/mozillareality/coturn@sha256:8380269c7bb2dc369f4126251199f0d603711debe8537b22cb7be470a50c51ce
 
-COPY entrypoint.sh /entrypoint.sh
-run chmod +x /entrypoint.sh
-# user nobody:nogroup
-volume ["/var/lib/coturn"]
-cmd /entrypoint.sh
+# Keep the proven runtime image and replace only its credential-leaking entrypoint.
+COPY --chmod=0755 entrypoint.sh /entrypoint.sh
