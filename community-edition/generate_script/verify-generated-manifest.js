@@ -67,6 +67,31 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
+  const reticulum = findResource(resources, "Deployment", "reticulum");
+  const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(container => container.name === "reticulum");
+  if (!reticulumContainer) {
+    fail("missing reticulum container");
+  } else {
+    const security = reticulumContainer.securityContext || {};
+    const droppedCapabilities = security.capabilities?.drop || [];
+    if (security.privileged === true) {
+      fail("reticulum container must not be privileged");
+    }
+    if (security.allowPrivilegeEscalation !== false) {
+      fail("reticulum container must disable privilege escalation");
+    }
+    if (!droppedCapabilities.includes("ALL")) {
+      fail("reticulum container must drop all Linux capabilities");
+    }
+    if (security.seccompProfile?.type !== "RuntimeDefault") {
+      fail("reticulum container must use the RuntimeDefault seccomp profile");
+    }
+    const storageMount = (reticulumContainer.volumeMounts || []).find(mount => mount.name === "storage");
+    if (storageMount?.mountPropagation) {
+      fail("reticulum storage mount must not propagate host mounts");
+    }
+  }
+
   for (const name of ["ret", "dialog", "nearspark"]) {
     const ingress = findResource(resources, "Ingress", name);
     if (!ingress) {

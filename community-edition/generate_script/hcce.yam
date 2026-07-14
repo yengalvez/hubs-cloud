@@ -450,11 +450,15 @@ spec:
         volumeMounts:
         - name: storage
           mountPath: /storage
-          mountPropagation: Bidirectional
         - name: config
           mountPath: /home/ret
         securityContext:
-          privileged: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         image: $Container_Dockerhub_Username/reticulum:$Container_Tag
         ports:
         - containerPort: 9100
