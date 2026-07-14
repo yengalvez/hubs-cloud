@@ -118,6 +118,7 @@ if (!fs.existsSync(manifestPath)) {
   const tokenlessDeployments = [
     "bot-orchestrator",
     "reticulum",
+    "pgsql",
     "pgbouncer",
     "pgbouncer-t",
     "hubs",

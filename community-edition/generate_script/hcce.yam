@@ -794,6 +794,7 @@ spec:
       labels:
         app: pgsql
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: postgresql
           image: $Container_Dockerhub_Username/postgres:$Container_Tag
