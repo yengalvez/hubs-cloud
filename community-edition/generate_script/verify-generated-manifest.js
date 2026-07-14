@@ -235,6 +235,28 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
+  const botContainer = botOrchestrator?.spec?.template?.spec?.containers?.find(
+    container => container.name === "bot-orchestrator"
+  );
+  if (!botContainer) {
+    fail("missing bot-orchestrator container");
+  } else {
+    const security = botContainer.securityContext || {};
+    const droppedCapabilities = security.capabilities?.drop || [];
+    if (security.runAsNonRoot !== true) {
+      fail("bot-orchestrator container must run as non-root");
+    }
+    if (security.allowPrivilegeEscalation !== false) {
+      fail("bot-orchestrator container must disable privilege escalation");
+    }
+    if (!droppedCapabilities.includes("ALL")) {
+      fail("bot-orchestrator container must drop all Linux capabilities");
+    }
+    if (security.seccompProfile?.type !== "RuntimeDefault") {
+      fail("bot-orchestrator container must use the RuntimeDefault seccomp profile");
+    }
+  }
+
   for (const name of ["ret", "dialog", "nearspark"]) {
     const ingress = findResource(resources, "Ingress", name);
     if (!ingress) {

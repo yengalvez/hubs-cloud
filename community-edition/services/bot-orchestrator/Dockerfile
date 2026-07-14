@@ -46,4 +46,7 @@ COPY app.js /app/app.js
 COPY run-bot.js /app/run-bot.js
 COPY run-ghost-runner.js /app/run-ghost-runner.js
 
+RUN chown -R node:node /app
+USER node
+
 CMD ["npm", "start"]

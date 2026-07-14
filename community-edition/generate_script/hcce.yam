@@ -681,6 +681,14 @@ spec:
       containers:
       - name: bot-orchestrator
         image: $Container_Dockerhub_Username/bot-orchestrator:$Container_Tag
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         resources:
           requests:
             cpu: 25m
