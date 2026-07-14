@@ -91,11 +91,16 @@ function handleImageOverrides(processedConfig, replacedContent) {
     const jsDoc = doc.toJS();
     if (jsDoc.kind === "Deployment") {
       if (jsDoc.metadata.name === "reticulum") {
+        let changed = false;
         if (processedConfig.OVERRIDE_RETICULUM_IMAGE) {
           jsDoc.spec.template.spec.containers[0].image = processedConfig.OVERRIDE_RETICULUM_IMAGE;
-          if (processedConfig.OVERRIDE_POSTGREST_IMAGE) {
-            jsDoc.spec.template.spec.containers[1].image = processedConfig.OVERRIDE_POSTGREST_IMAGE;
-          }
+          changed = true;
+        }
+        if (processedConfig.OVERRIDE_POSTGREST_IMAGE) {
+          jsDoc.spec.template.spec.containers[1].image = processedConfig.OVERRIDE_POSTGREST_IMAGE;
+          changed = true;
+        }
+        if (changed) {
           yamlDocuments[index] = new YAML.Document(jsDoc);
         }
       }
@@ -227,7 +232,7 @@ function main() {
       replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
     }
 
-    replacedContent = handleImageOverrides(processedConfig, replacedContent)
+    replacedContent = handleImageOverrides(processedConfig, replacedContent);
 
     utils.writeOutputFile(replacedContent, "", "hcce.yaml");
 

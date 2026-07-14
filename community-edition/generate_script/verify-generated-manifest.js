@@ -28,6 +28,10 @@ function hasRule(clusterRole, apiGroup, resource, requiredVerbs) {
   });
 }
 
+function isDigestPinnedImage(image) {
+  return typeof image === "string" && /@sha256:[a-f0-9]{64}$/i.test(image);
+}
+
 if (!fs.existsSync(manifestPath)) {
   fail(`manifest not found: ${manifestPath}`);
 } else {
@@ -41,6 +45,17 @@ if (!fs.existsSync(manifestPath)) {
     document.errors.forEach(error => fail(`YAML document ${index + 1}: ${error.message}`));
   });
   const resources = documents.map(document => document.toJS()).filter(Boolean);
+
+  for (const deployment of resources.filter(resource => resource.kind === "Deployment")) {
+    for (const container of deployment.spec?.template?.spec?.containers || []) {
+      if (!isDigestPinnedImage(container.image)) {
+        fail(
+          `Deployment/${deployment.metadata?.name} container ${container.name || "<unnamed>"} ` +
+          `must pin image by sha256 digest (got ${container.image || "<missing>"})`
+        );
+      }
+    }
+  }
 
   for (const name of ["ret", "dialog", "nearspark"]) {
     const ingress = findResource(resources, "Ingress", name);
