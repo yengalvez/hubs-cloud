@@ -438,7 +438,9 @@ spec:
         app: reticulum
       annotations:
         yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
+      automountServiceAccountToken: false
       volumes:
       - name: storage
         hostPath:
@@ -848,6 +850,8 @@ spec:
     metadata:
       labels:
         app: pgbouncer
+      annotations:
+        yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
       automountServiceAccountToken: false
       containers:
@@ -904,6 +908,8 @@ spec:
     metadata:
       labels:
         app: pgbouncer-t
+      annotations:
+        yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
       automountServiceAccountToken: false
       containers:
@@ -1338,6 +1344,8 @@ spec:
     metadata:
       labels:
         app: coturn
+      annotations:
+        yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
       automountServiceAccountToken: false
       hostNetwork: true

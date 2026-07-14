@@ -191,6 +191,20 @@ function main() {
       .createHash("sha256")
       .update(String(processedConfig.BOT_ACCESS_KEY))
       .digest("hex");
+    processedConfig.DB_CREDENTIAL_CHECKSUM = crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify({
+          DB_USER: processedConfig.DB_USER,
+          DB_PASS: processedConfig.DB_PASS,
+          DB_NAME: processedConfig.DB_NAME,
+          DB_HOST: processedConfig.DB_HOST,
+          DB_HOST_T: processedConfig.DB_HOST_T,
+          PGRST_DB_URI: processedConfig.PGRST_DB_URI,
+          PSQL: processedConfig.PSQL
+        })
+      )
+      .digest("hex");
 
     // Runner defaults (safe, reversible). These must exist because the template uses $VARS.
     if (!processedConfig.RUNNER_BACKEND) {

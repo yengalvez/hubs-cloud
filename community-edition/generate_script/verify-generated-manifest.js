@@ -117,6 +117,7 @@ if (!fs.existsSync(manifestPath)) {
 
   const tokenlessDeployments = [
     "bot-orchestrator",
+    "reticulum",
     "pgbouncer",
     "pgbouncer-t",
     "hubs",
@@ -188,6 +189,18 @@ if (!fs.existsSync(manifestPath)) {
   }
   if (botOrchestratorBotKeyChecksum !== reticulumBotKeyChecksum) {
     fail("Reticulum and bot-orchestrator must share the bot access key checksum annotation");
+  }
+
+  const databaseConsumers = ["reticulum", "pgbouncer", "pgbouncer-t", "coturn"];
+  const databaseChecksums = databaseConsumers.map(name => {
+    const deployment = findResource(resources, "Deployment", name);
+    return deployment?.spec?.template?.metadata?.annotations?.["yenhubs.org/db-credential-checksum"];
+  });
+  if (
+    databaseChecksums.some(checksum => !/^[a-f0-9]{64}$/i.test(checksum || "")) ||
+    new Set(databaseChecksums).size !== 1
+  ) {
+    fail("Reticulum, PgBouncer pools and Coturn must share the database credential checksum annotation");
   }
 
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(container => container.name === "reticulum");
