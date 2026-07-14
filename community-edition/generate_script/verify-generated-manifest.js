@@ -32,6 +32,41 @@ function isDigestPinnedImage(image) {
   return typeof image === "string" && /@sha256:[a-f0-9]{64}$/i.test(image);
 }
 
+function verifyIngressPolicy(resources, name, targetApp, allowedApps, port) {
+  const policy = findResource(resources, "NetworkPolicy", name);
+  if (!policy) {
+    fail(`missing NetworkPolicy/${name}`);
+    return;
+  }
+  if (policy.spec?.podSelector?.matchLabels?.app !== targetApp) {
+    fail(`NetworkPolicy/${name} must select app=${targetApp}`);
+  }
+  const policyTypes = policy.spec?.policyTypes || [];
+  if (!policyTypes.includes("Ingress") || policyTypes.includes("Egress")) {
+    fail(`NetworkPolicy/${name} must isolate ingress only`);
+  }
+
+  const rules = policy.spec?.ingress || [];
+  const peers = rules.flatMap(rule => rule.from || []);
+  const actualApps = peers.map(peer => peer.podSelector?.matchLabels?.app).filter(Boolean).sort();
+  const expectedApps = [...allowedApps].sort();
+  if (
+    peers.some(peer => !peer.podSelector || peer.namespaceSelector || peer.ipBlock) ||
+    JSON.stringify(actualApps) !== JSON.stringify(expectedApps)
+  ) {
+    fail(`NetworkPolicy/${name} must allow only same-namespace apps: ${expectedApps.join(", ")}`);
+  }
+
+  const ports = rules.flatMap(rule => rule.ports || []);
+  if (
+    ports.length !== 1 ||
+    String(ports[0].protocol || "TCP") !== "TCP" ||
+    Number(ports[0].port) !== Number(port)
+  ) {
+    fail(`NetworkPolicy/${name} must allow only TCP/${port}`);
+  }
+}
+
 if (!fs.existsSync(manifestPath)) {
   fail(`manifest not found: ${manifestPath}`);
 } else {
@@ -153,6 +188,12 @@ if (!fs.existsSync(manifestPath)) {
   if (!hasRule(haproxyRole, "gateway.networking.k8s.io", "gateways", ["get", "list", "watch"])) {
     fail("ClusterRole/haproxy-cr is missing Gateway API read permissions");
   }
+
+  verifyIngressPolicy(resources, "bot-orchestrator-ingress", "bot-orchestrator", ["reticulum"], 5001);
+  verifyIngressPolicy(resources, "pgsql-ingress", "pgsql", ["pgbouncer", "pgbouncer-t"], 5432);
+  verifyIngressPolicy(resources, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
+  verifyIngressPolicy(resources, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);
+  verifyIngressPolicy(resources, "photomnemonic-ingress", "photomnemonic", ["reticulum"], 5000);
 
   if (findResource(resources, "Secret", "cert-hcce")) {
     fail("unused self-signed Secret/cert-hcce must not be generated");

@@ -1522,3 +1522,109 @@ subjects:
 - kind: ServiceAccount
   name: haproxy-sa
   namespace: $Namespace
+---
+####################################################################################
+############################ internal network isolation ############################
+####################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bot-orchestrator-ingress
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: bot-orchestrator
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reticulum
+    ports:
+    - protocol: TCP
+      port: 5001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgsql-ingress
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: pgsql
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: pgbouncer
+    - podSelector:
+        matchLabels:
+          app: pgbouncer-t
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgbouncer-ingress
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: pgbouncer
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reticulum
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgbouncer-t-ingress
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: pgbouncer-t
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reticulum
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: photomnemonic-ingress
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: photomnemonic
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: reticulum
+    ports:
+    - protocol: TCP
+      port: 5000
