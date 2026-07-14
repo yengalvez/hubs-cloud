@@ -559,40 +559,40 @@ defmodule Ret.Storage do
         transform
       )
       when is_function(transform, 2) do
-    {:ok,
-     %{
-       "content_type" => content_type,
-       "content_length" => content_length
-     }, source_stream} = fetch_blob(id, key, owned_file_path())
+    with {:ok,
+          %{
+            "content_type" => content_type,
+            "content_length" => content_length
+          }, source_stream} <- fetch_blob(id, key, owned_file_path()) do
+      {transformed_stream, transformed_length} = transform.(source_stream, content_length)
 
-    {transformed_stream, transformed_length} = transform.(source_stream, content_length)
+      new_key = SecureRandom.hex()
+      new_promotion_token = SecureRandom.hex()
 
-    new_key = SecureRandom.hex()
-    new_promotion_token = SecureRandom.hex()
+      {:ok, new_id} =
+        store_stream(
+          transformed_stream,
+          transformed_length,
+          content_type,
+          new_key,
+          new_promotion_token,
+          owned_file_path()
+        )
 
-    {:ok, new_id} =
-      store_stream(
-        transformed_stream,
-        transformed_length,
-        content_type,
-        new_key,
-        new_promotion_token,
-        owned_file_path()
-      )
+      owned_file_params = %{
+        owned_file_uuid: new_id,
+        key: new_key,
+        content_type: content_type,
+        content_length: transformed_length
+      }
 
-    owned_file_params = %{
-      owned_file_uuid: new_id,
-      key: new_key,
-      content_type: content_type,
-      content_length: transformed_length
-    }
+      owned_file =
+        %OwnedFile{}
+        |> OwnedFile.changeset(account, owned_file_params)
+        |> Repo.insert!()
 
-    owned_file =
-      %OwnedFile{}
-      |> OwnedFile.changeset(account, owned_file_params)
-      |> Repo.insert!()
-
-    {:ok, owned_file}
+      {:ok, owned_file}
+    end
   end
 
   def duplicate(%OwnedFile{} = owned_file, %Account{} = account) do

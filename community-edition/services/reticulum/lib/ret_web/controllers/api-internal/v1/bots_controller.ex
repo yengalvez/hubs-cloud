@@ -77,7 +77,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
           chat_enabled: chat_enabled,
           prompt: prompt
         },
-        last_active_at: NaiveDateTime.to_iso8601(last_active_at)
+        last_active_at: serialize_datetime(last_active_at)
       }
     else
       nil
@@ -111,6 +111,10 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
   end
 
   defp normalize_bot_prompt(_), do: ""
+
+  defp serialize_datetime(nil), do: nil
+  defp serialize_datetime(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
+  defp serialize_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
 
   defp map_get(map, key) do
     atom_key =

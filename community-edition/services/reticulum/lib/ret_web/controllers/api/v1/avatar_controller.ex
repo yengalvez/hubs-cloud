@@ -45,6 +45,10 @@ defmodule RetWeb.Api.V1.AvatarController do
     create_or_update(conn, params, avatar)
   end
 
+  def create(conn, %{"avatar" => params}) do
+    create_or_update(conn, params, %Avatar{})
+  end
+
   def update(conn, %{"id" => avatar_sid, "avatar" => params}) do
     case avatar_sid |> get_avatar() do
       %Avatar{} = avatar -> create_or_update(conn, params, avatar)

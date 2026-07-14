@@ -82,6 +82,13 @@ defmodule Ret.StorageTest do
     assert_fetch_result(r2, "text/plain", "test2")
   end
 
+  test "duplicating a missing owned file returns not_found instead of crashing" do
+    account = Ret.Repo.insert!(%Ret.Account{})
+    missing_file = %OwnedFile{owned_file_uuid: Ecto.UUID.generate(), key: "missing"}
+
+    assert {:error, :not_found} = Storage.duplicate(missing_file, account)
+  end
+
   defp assert_fetch_result(result, expected_content_type, expected_content) do
     {:ok, %{"content_type" => content_type}, stream} = result
 
