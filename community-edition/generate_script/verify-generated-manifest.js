@@ -117,6 +117,7 @@ if (!fs.existsSync(manifestPath)) {
 
   const resourceBudgets = [
     ["bot-orchestrator", "bot-orchestrator", { cpu: "25m", memory: "128Mi", memoryLimit: "512Mi" }],
+    ["pgsql", "postgresql", { cpu: "100m", memory: "256Mi", memoryLimit: "1Gi" }],
     ["pgbouncer", "pgbouncer", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
     ["pgbouncer-t", "pgbouncer-t", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],
     ["hubs", "hubs", { cpu: "10m", memory: "16Mi", memoryLimit: "128Mi" }],

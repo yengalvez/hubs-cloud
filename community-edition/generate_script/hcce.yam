@@ -782,6 +782,12 @@ spec:
       containers:
         - name: postgresql
           image: $Container_Dockerhub_Username/postgres:$Container_Tag
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
           ports:
             - name: postgresql
               containerPort: 5432
