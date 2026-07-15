@@ -235,24 +235,35 @@ defmodule Ret.Storage do
 
   def promote(id, key, promotion_token, account, require_token \\ true)
 
-  def promote(_id, nil, nil, _account, _require_token) do
-    {:error, :not_allowed}
-  end
-
-  def promote(nil, _key, _promotion_token, _account, _require_token) do
-    {:error, :not_found}
-  end
-
-  def promote(_id, nil, _promotion_token, _account, _require_token) do
-    {:error, :not_allowed}
-  end
-
   # Promotes an expiring stored file to a permanently stored file in the specified Account.
   def promote(id, key, promotion_token, %Account{} = account, require_token) do
-    # Check if this file has already been promoted
-    OwnedFile
-    |> Repo.get_by(owned_file_uuid: id)
-    |> promote_or_return_owned_file(id, key, promotion_token, account, require_token)
+    case promote_with_status(id, key, promotion_token, account, require_token) do
+      {:ok, owned_file, _status} -> {:ok, owned_file}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def promote_with_status(id, key, promotion_token, account, require_token \\ true)
+
+  def promote_with_status(_id, nil, nil, _account, _require_token),
+    do: {:error, :not_allowed}
+
+  def promote_with_status(nil, _key, _promotion_token, _account, _require_token),
+    do: {:error, :not_found}
+
+  def promote_with_status(_id, nil, _promotion_token, _account, _require_token),
+    do: {:error, :not_allowed}
+
+  def promote_with_status(id, key, promotion_token, %Account{} = account, require_token) do
+    case Ret.Locking.exec_after_lock("storage_promote_#{id}", fn ->
+           OwnedFile
+           |> Repo.get_by(owned_file_uuid: id)
+           |> promote_or_return_owned_file(id, key, promotion_token, account, require_token)
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :storage_error}
+    end
   end
 
   # Promotes multiple files into the given account.
@@ -264,6 +275,18 @@ defmodule Ret.Storage do
     |> Enum.map(fn
       {k, {id, key}} -> {k, promote(id, key, nil, account)}
       {k, {id, key, promotion_token}} -> {k, promote(id, key, promotion_token, account)}
+    end)
+    |> Enum.into(%{})
+  end
+
+  def promote_with_status(map, %Account{} = account) when is_map(map) do
+    map
+    |> Enum.map(fn
+      {k, {id, key}} ->
+        {k, promote_with_status(id, key, nil, account)}
+
+      {k, {id, key, promotion_token}} ->
+        {k, promote_with_status(id, key, promotion_token, account)}
     end)
     |> Enum.into(%{})
   end
@@ -283,12 +306,26 @@ defmodule Ret.Storage do
   defp promote_or_return_owned_file(
          %OwnedFile{} = owned_file,
          _id,
-         _key,
+         key,
          _promotion_token,
-         _account,
+         %Account{} = account,
          _require_token
        ) do
-    {:ok, owned_file}
+    if owned_file.account_id == account.account_id and owned_file.key == key and
+         owned_file.state in [:active, :inactive] do
+      case owned_file.state do
+        :active ->
+          {:ok, owned_file, :existing}
+
+        :inactive ->
+          case OwnedFile.set_active(owned_file.owned_file_uuid, account.account_id) do
+            {:ok, active_owned_file} -> {:ok, active_owned_file, :existing}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    else
+      {:error, :not_allowed}
+    end
   end
 
   # Promoting a stored file to being owned has two side effects: the file is moved
@@ -304,12 +341,12 @@ defmodule Ret.Storage do
       [dest_path, dest_meta_file_path, dest_blob_file_path] <-
         paths_for_uuid(uuid, owned_file_path()),
       [{:ok, _}, {:ok, _}] <- [File.stat(meta_file_path), File.stat(blob_file_path)],
-      %{
-        "content_type" => content_type,
-        "content_length" => content_length,
-        "promotion_token" => actual_promotion_token
-      } <-
-        File.read!(meta_file_path) |> Poison.decode!(),
+      {:ok,
+       %{
+         "content_type" => content_type,
+         "content_length" => content_length,
+         "promotion_token" => actual_promotion_token
+       }} <- read_storage_metadata(meta_file_path),
       {:ok} <-
         if(require_token,
           do: check_promotion_token(actual_promotion_token, promotion_token),
@@ -324,19 +361,111 @@ defmodule Ret.Storage do
         content_length: content_length
       }
 
-      owned_file =
+      changeset =
         %OwnedFile{}
         |> OwnedFile.changeset(account, owned_file_params)
-        |> Repo.insert!()
 
-      File.mkdir_p!(dest_path)
-      File.rename!(meta_file_path, dest_meta_file_path)
-      File.rename!(blob_file_path, dest_blob_file_path)
+      promotion_result =
+        with :ok <- File.mkdir_p(dest_path),
+             :ok <-
+               move_file_pair(
+                 meta_file_path,
+                 blob_file_path,
+                 dest_meta_file_path,
+                 dest_blob_file_path
+               ) do
+          case Repo.insert(changeset) do
+            {:ok, owned_file} ->
+              {:ok, owned_file, :created}
 
-      {:ok, owned_file}
+            {:error, changeset} ->
+              restore_promoted_file_pair(
+                dest_meta_file_path,
+                dest_blob_file_path,
+                meta_file_path,
+                blob_file_path
+              )
+
+              {:error, changeset}
+          end
+        end
+
+      case promotion_result do
+        {:error, %Ecto.Changeset{}} = error ->
+          error
+
+        {:error, reason} ->
+          Logger.error("Failed to move stored file #{id} during promotion: #{inspect(reason)}")
+          {:error, :storage_error}
+
+        result ->
+          result
+      end
     else
-      {:error, :invalid_key} -> {:error, :not_allowed}
-      _ -> {:error, :not_found}
+      {:error, :invalid_key} ->
+        {:error, :not_allowed}
+
+      {:error, :enoent} ->
+        {:error, :not_found}
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to promote stored file #{id}: #{inspect(reason)}")
+        {:error, :storage_error}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp read_storage_metadata(path) do
+    with {:ok, contents} <- File.read(path),
+         {:ok, metadata} <- Poison.decode(contents) do
+      {:ok, metadata}
+    end
+  end
+
+  defp move_file_pair(source_meta, source_blob, destination_meta, destination_blob) do
+    with :ok <- ensure_destinations_absent(destination_meta, destination_blob),
+         :ok <- File.rename(source_meta, destination_meta) do
+      case File.rename(source_blob, destination_blob) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          case File.rename(destination_meta, source_meta) do
+            :ok ->
+              :ok
+
+            {:error, restore_reason} ->
+              Logger.error(
+                "Failed to restore metadata after paired file move failed: #{inspect(restore_reason)}"
+              )
+          end
+
+          {:error, reason}
+      end
+    end
+  end
+
+  defp ensure_destinations_absent(destination_meta, destination_blob) do
+    if File.exists?(destination_meta) or File.exists?(destination_blob) do
+      {:error, :destination_exists}
+    else
+      :ok
+    end
+  end
+
+  defp restore_promoted_file_pair(source_meta, source_blob, destination_meta, destination_blob) do
+    case move_file_pair(source_meta, source_blob, destination_meta, destination_blob) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to roll back promoted file pair: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -474,30 +603,138 @@ defmodule Ret.Storage do
     end
   end
 
-  def demote_inactive_owned_files do
-    Ret.Locking.exec_if_lockable(:storage_demote, fn ->
-      inactive_owned_files = OwnedFile.inactive()
+  def demote_inactive_owned_files(grace_seconds \\ nil) do
+    grace_seconds = grace_seconds || module_config(:owned_file_demotion_grace_seconds) || 86_400
+    cutoff = NaiveDateTime.utc_now() |> NaiveDateTime.add(-grace_seconds, :second)
 
-      inactive_owned_files
-      |> Enum.map(& &1.owned_file_uuid)
-      |> Enum.each(&move_file_to_expiring_storage/1)
-
-      inactive_owned_files
-      |> Enum.each(&Repo.delete/1)
-    end)
+    OwnedFile.inactive_before(cutoff)
+    |> Enum.each(&demote_inactive_owned_file/1)
   end
 
-  defp move_file_to_expiring_storage(uuid) do
-    with(
-      [_, meta_file_path, blob_file_path] <- paths_for_uuid(uuid, owned_file_path()),
-      [dest_path, dest_meta_file_path, dest_blob_file_path] <-
-        paths_for_uuid(uuid, expiring_file_path())
-    ) do
-      File.mkdir_p!(dest_path)
-      File.rename!(meta_file_path, dest_meta_file_path)
-      File.rename!(blob_file_path, dest_blob_file_path)
+  def mark_inactive_if_unreferenced(nil), do: :ok
+
+  def mark_inactive_if_unreferenced(%OwnedFile{} = owned_file) do
+    case Ret.Locking.exec_after_lock("storage_promote_#{owned_file.owned_file_uuid}", fn ->
+           case Repo.get(OwnedFile, owned_file.owned_file_id) do
+             nil ->
+               :ok
+
+             current_owned_file ->
+               if OwnedFile.referenced?(current_owned_file) do
+                 case reactivate_if_needed(current_owned_file) do
+                   :ok -> :referenced
+                   {:error, reason} -> Repo.rollback({:reactivation_failed, reason})
+                 end
+               else
+                 case OwnedFile.set_inactive(current_owned_file) do
+                   {:ok, _inactive_owned_file} -> :marked_inactive
+                   {:error, reason} -> {:error, reason}
+                 end
+               end
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :storage_error}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp demote_inactive_owned_file(%OwnedFile{} = owned_file) do
+    result =
+      Ret.Locking.exec_after_lock("storage_promote_#{owned_file.owned_file_uuid}", fn ->
+        case Repo.get(OwnedFile, owned_file.owned_file_id) do
+          nil ->
+            :ok
+
+          %OwnedFile{state: state} when state != :inactive ->
+            :active
+
+          current_owned_file ->
+            if OwnedFile.referenced?(current_owned_file) do
+              case reactivate_if_needed(current_owned_file) do
+                :ok -> :reactivated
+                {:error, reason} -> Repo.rollback({:reactivation_failed, reason})
+              end
+            else
+              demote_owned_file(current_owned_file)
+            end
+        end
+      end)
+
+    case result do
+      {:ok, status} when status in [:ok, :active, :reactivated, :demoted, :missing_files] ->
+        status
+
+      {:error, reason} ->
+        Logger.error(
+          "Failed to demote inactive owned file #{owned_file.owned_file_uuid}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+
+      other ->
+        Logger.error(
+          "Unexpected demotion result for owned file #{owned_file.owned_file_uuid}: #{inspect(other)}"
+        )
+
+        {:error, :storage_error}
     end
   end
+
+  defp demote_owned_file(%OwnedFile{} = owned_file) do
+    [_, source_meta, source_blob] = paths_for_uuid(owned_file.owned_file_uuid, owned_file_path())
+
+    [destination_path, destination_meta, destination_blob] =
+      paths_for_uuid(owned_file.owned_file_uuid, expiring_file_path())
+
+    case file_pair_status(source_meta, source_blob) do
+      :missing ->
+        :missing_files
+
+      :partial ->
+        Repo.rollback({:file_move_failed, :incomplete_source_pair})
+
+      :complete ->
+        with :ok <- File.mkdir_p(destination_path),
+             :ok <- move_file_pair(source_meta, source_blob, destination_meta, destination_blob) do
+          case Repo.delete(owned_file) do
+            {:ok, _deleted_owned_file} ->
+              :demoted
+
+            {:error, reason} ->
+              restore_promoted_file_pair(
+                destination_meta,
+                destination_blob,
+                source_meta,
+                source_blob
+              )
+
+              Repo.rollback({:owned_file_delete_failed, reason})
+          end
+        else
+          {:error, reason} -> Repo.rollback({:file_move_failed, reason})
+        end
+    end
+  end
+
+  defp file_pair_status(meta_path, blob_path) do
+    case {File.exists?(meta_path), File.exists?(blob_path)} do
+      {true, true} -> :complete
+      {false, false} -> :missing
+      _ -> :partial
+    end
+  end
+
+  defp reactivate_if_needed(%OwnedFile{state: :inactive} = owned_file) do
+    case OwnedFile.set_active(owned_file.owned_file_uuid, owned_file.account_id) do
+      {:ok, _active_owned_file} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp reactivate_if_needed(%OwnedFile{}), do: :ok
 
   @spec rm_files_for_owned_file(OwnedFile.t()) :: :ok
   def rm_files_for_owned_file(%OwnedFile{} = owned_file) do

@@ -71,6 +71,30 @@ defmodule Ret.Project do
     )
   end
 
+  def lock_by_id_for_account(project_id, account) do
+    Repo.one(
+      from p in Project,
+        where: p.project_id == ^project_id,
+        where: p.created_by_account_id == ^account.account_id,
+        lock: "FOR UPDATE"
+    )
+    |> Repo.preload([
+      :created_by_account,
+      :project_owned_file,
+      :thumbnail_owned_file,
+      scene: Scene.scene_preloads(),
+      parent_scene: Scene.scene_preloads(),
+      parent_scene_listing: [
+        :model_owned_file,
+        :screenshot_owned_file,
+        :scene_owned_file,
+        :project,
+        :account,
+        scene: Scene.scene_preloads()
+      ]
+    ])
+  end
+
   def projects_for_account(account) do
     Repo.all(
       from p in Project,

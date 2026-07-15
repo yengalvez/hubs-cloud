@@ -2,12 +2,47 @@ defmodule Ret.OwnedFile do
   use Ecto.Schema
   import Ecto.Query
   import Ecto.Changeset
+  require Logger
   alias Ret.{Repo, OwnedFile, Account}
 
   @type t :: %__MODULE__{}
 
   @schema_prefix "ret0"
   @primary_key {:owned_file_id, :id, autogenerate: true}
+
+  @reference_columns [
+    {"app_configs", "owned_file_id"},
+    {"assets", "asset_owned_file_id"},
+    {"assets", "thumbnail_owned_file_id"},
+    {"avatar_listings", "base_map_owned_file_id"},
+    {"avatar_listings", "bin_owned_file_id"},
+    {"avatar_listings", "emissive_map_owned_file_id"},
+    {"avatar_listings", "gltf_owned_file_id"},
+    {"avatar_listings", "normal_map_owned_file_id"},
+    {"avatar_listings", "orm_map_owned_file_id"},
+    {"avatar_listings", "thumbnail_owned_file_id"},
+    {"avatars", "base_map_owned_file_id"},
+    {"avatars", "bin_owned_file_id"},
+    {"avatars", "emissive_map_owned_file_id"},
+    {"avatars", "gltf_owned_file_id"},
+    {"avatars", "normal_map_owned_file_id"},
+    {"avatars", "orm_map_owned_file_id"},
+    {"avatars", "thumbnail_owned_file_id"},
+    {"projects", "project_owned_file_id"},
+    {"projects", "thumbnail_owned_file_id"},
+    {"scene_listings", "model_owned_file_id"},
+    {"scene_listings", "scene_owned_file_id"},
+    {"scene_listings", "screenshot_owned_file_id"},
+    {"scenes", "model_owned_file_id"},
+    {"scenes", "scene_owned_file_id"},
+    {"scenes", "screenshot_owned_file_id"}
+  ]
+
+  @reference_query "SELECT EXISTS (" <>
+                     Enum.map_join(@reference_columns, " UNION ALL ", fn {table, column} ->
+                       "SELECT 1 FROM ret0.#{table} WHERE #{column} = $1"
+                     end) <> ")"
+
   schema "owned_files" do
     field :owned_file_uuid, :string
     field :key, :string
@@ -39,9 +74,15 @@ defmodule Ret.OwnedFile do
     Repo.all(from OwnedFile, where: [state: ^:inactive])
   end
 
-  def set_active(owned_file_uuid, account_id) do
-    get_by_uuid_and_account(owned_file_uuid, account_id) |> set_state(:active)
+  def inactive_before(%NaiveDateTime{} = cutoff) do
+    Repo.all(
+      from owned_file in OwnedFile,
+        where: owned_file.state == ^:inactive,
+        where: owned_file.updated_at <= ^cutoff
+    )
+  end
 
+  def set_active(owned_file_uuid, account_id) do
     case get_by_uuid_and_account(owned_file_uuid, account_id) do
       nil ->
         {:error, :file_not_found}
@@ -82,6 +123,21 @@ defmodule Ret.OwnedFile do
 
   def get_by_uuid(owned_file_uuid) do
     Repo.one(from OwnedFile, where: [owned_file_uuid: ^owned_file_uuid])
+  end
+
+  def reference_columns, do: @reference_columns
+
+  def referenced?(%OwnedFile{owned_file_id: owned_file_id}), do: referenced?(owned_file_id)
+
+  def referenced?(owned_file_id) when is_integer(owned_file_id) do
+    case Ecto.Adapters.SQL.query(Repo, @reference_query, [owned_file_id]) do
+      {:ok, %{rows: [[referenced]]}} ->
+        referenced
+
+      {:error, error} ->
+        Logger.error("Failed to check owned-file references: #{inspect(error)}")
+        true
+    end
   end
 
   defp set_state(nil, _state), do: nil
