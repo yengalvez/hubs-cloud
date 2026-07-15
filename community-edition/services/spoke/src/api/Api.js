@@ -149,25 +149,30 @@ export default class Project extends EventEmitter {
 
   isAuthenticated() {
     const value = localStorage.getItem(LOCAL_STORE_KEY);
+    if (!value) return false;
 
-    const store = JSON.parse(value);
+    try {
+      const store = JSON.parse(value);
+      const token = store && store.credentials && store.credentials.token;
+      if (!token) return false;
 
-    return !!(store && store.credentials && store.credentials.token);
+      const claims = jwtDecode(token);
+      if (typeof claims.exp !== "number" || claims.exp * 1000 <= Date.now()) {
+        this.logout();
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      this.logout();
+      return false;
+    }
   }
 
   getToken() {
-    const value = localStorage.getItem(LOCAL_STORE_KEY);
+    if (!this.isAuthenticated()) throw new Error("Not authenticated");
 
-    if (!value) {
-      throw new Error("Not authenticated");
-    }
-
-    const store = JSON.parse(value);
-
-    if (!store || !store.credentials || !store.credentials.token) {
-      throw new Error("Not authenticated");
-    }
-
+    const store = JSON.parse(localStorage.getItem(LOCAL_STORE_KEY));
     return store.credentials.token;
   }
 
