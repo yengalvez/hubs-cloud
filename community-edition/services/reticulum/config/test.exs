@@ -11,7 +11,7 @@ config :ret, RetWeb.Endpoint,
   server: false
 
 # Print only warnings and errors during test
-config :logger, level: :warn
+config :logger, level: :warning
 
 config :ret, Ret.AppConfig, caching?: false
 
@@ -44,7 +44,6 @@ config :ret, Ret.Storage,
 config :sentry,
   environment_name: :test,
   json_library: Poison,
-  included_environments: [],
   tags: %{
     env: "test"
   }

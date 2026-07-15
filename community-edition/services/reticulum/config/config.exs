@@ -49,6 +49,8 @@ config :logger, :console,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+config :sentry, client: Sentry.HackneyClient
+
 config :ret, Ret.Repo,
   migration_source: "schema_migrations",
   migration_default_prefix: "ret0",
@@ -71,7 +73,7 @@ config :ret, RetWeb.Router, secure?: false
 
 config :peerage, log_results: false
 
-config :statix, prefix: "ret"
+config :ret, Ret.Statix, prefix: "ret"
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

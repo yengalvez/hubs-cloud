@@ -8,7 +8,9 @@ defmodule RetWeb.EntityTest do
 
   @payload_save_entity_state read_json("save_entity_state_payload.json")
   @payload_save_entity_state_2 read_json("save_entity_state_payload_2.json")
-  @payload_save_entity_state_promotable_no_token read_json("save_entity_state_payload_promotable_no_token.json")
+  @payload_save_entity_state_promotable_no_token read_json(
+                                                   "save_entity_state_payload_promotable_no_token.json"
+                                                 )
   @payload_save_entity_state_promotable read_json("save_entity_state_payload_promotable.json")
   @payload_save_entity_state_unpromotable read_json("save_entity_state_payload_unpromotable.json")
   @payload_update_entity_state read_json("update_entity_state_payload.json")
@@ -162,6 +164,40 @@ defmodule RetWeb.EntityTest do
     # The page was updated to 1
     assert Enum.at(entity_state.update_messages, 1)["data"]["networked-pdf"]["data"]["pageNumber"] ===
              1
+  end
+
+  test "entity updates are isolated by hub", %{hub: hub} do
+    {:ok, hub: other_hub} = create_hub(%{scene: nil})
+
+    entity = fn page_number ->
+      %{
+        nid: "shared-root",
+        create_message: Jason.encode!(%{"networkId" => "shared-root"}),
+        updates: [
+          %{
+            root_nid: "shared-root",
+            nid: "shared-root.0",
+            update_message: Jason.encode!(%{"pageNumber" => page_number})
+          }
+        ]
+      }
+    end
+
+    assert {:ok, _} = Ret.create_entity(hub, entity.(1))
+    assert {:ok, _} = Ret.create_entity(other_hub, entity.(2))
+
+    assert {:ok, _} =
+             Ret.insert_or_update_sub_entity(other_hub, %{
+               root_nid: "shared-root",
+               nid: "shared-root.0",
+               update_message: Jason.encode!(%{"pageNumber" => 3})
+             })
+
+    [first_hub_entity] = Ret.list_entities(hub.hub_id)
+    [other_hub_entity] = Ret.list_entities(other_hub.hub_id)
+
+    assert Jason.decode!(hd(first_hub_entity.sub_entities).update_message)["pageNumber"] == 1
+    assert Jason.decode!(hd(other_hub_entity.sub_entities).update_message)["pageNumber"] == 3
   end
 
   test "delete_entity_state replies with error if entity does not exist", %{

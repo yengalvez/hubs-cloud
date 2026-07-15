@@ -6,7 +6,7 @@ defmodule Ret.Repo.Migrations.AddAvatarListingsAccount do
 
   def up do
     alter table(:avatar_listings) do
-      add :account_id, references(:accounts, column: :account_id, null: false)
+      add :account_id, references(:accounts, column: :account_id), null: false
     end
 
     execute "ALTER TABLE ret0.avatar_listings ALTER COLUMN avatar_id DROP NOT NULL"

@@ -5,7 +5,7 @@ defmodule RetWeb.ApiInternal.V1.LoginEmailControllerTest do
   alias Ret.Account
 
   @dashboard_access_header "x-ret-dashboard-access-key"
-  @dashboard_access_key "test-key"
+  @dashboard_access_key "test-dashboard-access-key-32bytes"
 
   setup_all do
     merge_module_config(:ret, RetWeb.Plugs.DashboardHeaderAuthorization, %{

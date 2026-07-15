@@ -9,7 +9,6 @@ config :ret, RetWeb.Router, secure?: false
 config :sentry,
   environment_name: :turkey,
   json_library: Poison,
-  included_environments: [:turkey],
   tags: %{
     env: "turkey"
   }

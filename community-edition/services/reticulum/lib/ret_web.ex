@@ -22,7 +22,7 @@ defmodule RetWeb do
       use Phoenix.Controller, namespace: RetWeb
       import Plug.Conn
       alias RetWeb.Router.Helpers, as: Routes
-      import RetWeb.Gettext
+      use Gettext, backend: RetWeb.Gettext
       import RetWeb.ControllerHelpers
     end
   end
@@ -41,7 +41,7 @@ defmodule RetWeb do
 
       alias RetWeb.Router.Helpers, as: Routes
       import RetWeb.ErrorHelpers
-      import RetWeb.Gettext
+      use Gettext, backend: RetWeb.Gettext
     end
   end
 
@@ -56,7 +56,7 @@ defmodule RetWeb do
   def channel do
     quote do
       use Phoenix.Channel
-      import RetWeb.Gettext
+      use Gettext, backend: RetWeb.Gettext
     end
   end
 

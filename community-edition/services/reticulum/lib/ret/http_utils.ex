@@ -2,12 +2,20 @@ defmodule Ret.HttpUtils do
   use Retry
 
   @internal_ipv4_cidr_list [
-    InetCidr.parse("0.0.0.0/8"),
-    InetCidr.parse("10.0.0.0/8"),
-    InetCidr.parse("127.0.0.0/8"),
-    InetCidr.parse("169.254.0.0/16"),
-    InetCidr.parse("172.16.0.0/12"),
-    InetCidr.parse("192.168.0.0/16")
+    InetCidr.parse_cidr!("0.0.0.0/8"),
+    InetCidr.parse_cidr!("10.0.0.0/8"),
+    InetCidr.parse_cidr!("100.64.0.0/10"),
+    InetCidr.parse_cidr!("127.0.0.0/8"),
+    InetCidr.parse_cidr!("169.254.0.0/16"),
+    InetCidr.parse_cidr!("172.16.0.0/12"),
+    InetCidr.parse_cidr!("192.0.0.0/24"),
+    InetCidr.parse_cidr!("192.0.2.0/24"),
+    InetCidr.parse_cidr!("192.168.0.0/16"),
+    InetCidr.parse_cidr!("198.18.0.0/15"),
+    InetCidr.parse_cidr!("198.51.100.0/24"),
+    InetCidr.parse_cidr!("203.0.113.0/24"),
+    InetCidr.parse_cidr!("224.0.0.0/4"),
+    InetCidr.parse_cidr!("240.0.0.0/4")
   ]
 
   def retry_head_until_success(url, options \\ []),
@@ -138,17 +146,20 @@ defmodule Ret.HttpUtils do
   end
 
   def resolve_ip(host) do
+    case resolve_ips(host) do
+      [] -> nil
+      results -> Enum.random(results)
+    end
+  end
+
+  def resolve_ips(host) do
     try do
-      InetCidr.parse_address!(host)
+      [InetCidr.parse_address!(host)]
     rescue
       _ ->
         case DNS.resolve(host) do
-          {:ok, results} ->
-            # TODO We should probably be able to handle ipv6 here too.
-            results |> Enum.filter(&InetCidr.v4?/1) |> Enum.random()
-
-          _ ->
-            nil
+          {:ok, results} -> results |> Enum.filter(&InetCidr.v4?/1) |> Enum.uniq()
+          _ -> []
         end
     end
   end
@@ -169,7 +180,7 @@ defmodule Ret.HttpUtils do
   end
 
   def replace_host(uri, ip_address) do
-    Map.put(uri, :host, to_string(:inet.ntoa(ip_address)))
+    %{uri | authority: nil, host: to_string(:inet.ntoa(ip_address)), userinfo: nil}
   end
 
   defp module_config(key) do

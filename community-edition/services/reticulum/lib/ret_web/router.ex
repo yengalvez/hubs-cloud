@@ -1,7 +1,6 @@
 defmodule RetWeb.Router do
   use RetWeb, :router
   use Plug.ErrorHandler
-  use Sentry.Plug
 
   secure? =
     :ret

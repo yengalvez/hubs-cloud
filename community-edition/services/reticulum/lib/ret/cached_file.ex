@@ -89,7 +89,7 @@ defmodule Ret.CachedFile do
   def vacuum(%{expiration: expiration}) do
     Ret.Locking.exec_if_lockable(:cached_file_vacuum, fn ->
       cached_files_to_delete =
-        Repo.all(from f in CachedFile, where: f.accessed_at() < ^expiration)
+        Repo.all(from f in CachedFile, where: f.accessed_at < ^expiration)
 
       keys = Enum.map(cached_files_to_delete, fn v -> v.cache_key end)
 

@@ -5,7 +5,7 @@ defmodule RetWeb.Gettext do
   By using [Gettext](https://hexdocs.pm/gettext),
   your module gains a set of macros for translations, for example:
 
-      import RetWeb.Gettext
+      use Gettext, backend: RetWeb.Gettext
 
       # Simple translation
       gettext "Here is the string to translate"
@@ -20,5 +20,5 @@ defmodule RetWeb.Gettext do
 
   See the [Gettext Docs](https://hexdocs.pm/gettext) for detailed usage.
   """
-  use Gettext, otp_app: :ret
+  use Gettext.Backend, otp_app: :ret
 end

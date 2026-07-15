@@ -1,6 +1,6 @@
 defmodule RetWeb.Endpoint do
+  use Sentry.PlugCapture
   use Phoenix.Endpoint, otp_app: :ret
-  use Sentry.Phoenix.Endpoint
   use Absinthe.Phoenix.Endpoint
 
   socket "/socket", RetWeb.SessionSocket,
@@ -41,6 +41,7 @@ defmodule RetWeb.Endpoint do
 
   plug CORSPlug, origin: &RetWeb.Endpoint.get_cors_origins/0
   plug RetWeb.Plugs.AddVary
+  plug Sentry.PlugContext
   plug RetWeb.Router
 
   @doc """

@@ -12,7 +12,11 @@ defmodule Ret.Entity do
     field :nid, :string
     field :create_message, :binary
     belongs_to :hub, Hub, references: :hub_id
-    has_many :sub_entities, SubEntity, foreign_key: :entity_id
+
+    has_many :sub_entities, SubEntity,
+      foreign_key: :entity_id,
+      preload_order: [asc: :sub_entity_id]
+
     timestamps()
   end
 

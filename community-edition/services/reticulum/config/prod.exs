@@ -134,7 +134,6 @@ config :tzdata, :autoupdate, :disabled
 config :sentry,
   environment_name: :prod,
   json_library: Poison,
-  included_environments: [:prod],
   tags: %{
     env: "prod"
   }

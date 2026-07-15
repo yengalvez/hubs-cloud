@@ -72,8 +72,6 @@ defmodule Ret.AccountFavorite do
     |> put_change(:last_activated_at, Timex.now() |> DateTime.truncate(:second))
   end
 
-  defp get_favorite(%Hub{}, nil), do: nil
-
   defp get_favorite(%Hub{} = hub, %Account{} = account) do
     AccountFavorite |> Repo.get_by(account_id: account.account_id, hub_id: hub.hub_id)
   end

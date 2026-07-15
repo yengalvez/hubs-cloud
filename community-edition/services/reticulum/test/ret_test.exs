@@ -185,13 +185,16 @@ defmodule RetTest do
     } do
       account_to_delete_id = account_to_delete.account_id
       avatar = create_avatar(account_to_delete)
-      create_avatar_listing(avatar)
+      listing = create_avatar_listing(avatar)
 
       %Avatar{account_id: ^account_to_delete_id} = Repo.reload(avatar)
+      %AvatarListing{account_id: ^account_to_delete_id} = Repo.reload(listing)
 
       assert :ok === Ret.delete_account(account_to_delete.account_id, current_user)
       assert avatar = Repo.reload(avatar)
+      assert listing = Repo.reload(listing)
       assert current_user.account_id === avatar.account_id
+      assert current_user.account_id === listing.account_id
     end
 
     test "reassigns owned files of listed avatar to current user", %{
@@ -605,6 +608,7 @@ defmodule RetTest do
   defp create_avatar_listing(%Avatar{} = avatar),
     do:
       Repo.insert!(%AvatarListing{
+        account_id: avatar.account_id,
         avatar_id: avatar.avatar_id,
         avatar_listing_sid: "fake-avatar-listing-sid",
         base_map_owned_file: avatar.base_map_owned_file,

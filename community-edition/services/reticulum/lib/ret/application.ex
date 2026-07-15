@@ -56,11 +56,11 @@ defmodule Ret.Application do
       EctoBootMigration.stop_repos(repos_pids)
     end
 
-    :ok = Ret.Statix.connect()
-    {:ok, _} = Logger.add_backend(Sentry.LoggerBackend)
+    :ok = install_sentry_logger_handler()
 
     children = [
       {Phoenix.PubSub, [name: Ret.PubSub, adapter: Phoenix.PubSub.PG2, pool_size: 4]},
+      Ret.Statix,
       Ret.Repo,
       RetWeb.Endpoint,
       RetWeb.Presence,
@@ -233,6 +233,16 @@ defmodule Ret.Application do
     ]
 
     Supervisor.start_link(children, name: Ret.Supervisor, strategy: :one_for_one)
+  end
+
+  defp install_sentry_logger_handler do
+    case :logger.add_handler(:ret_sentry_handler, Sentry.LoggerHandler, %{
+           config: %{metadata: [:request_id]}
+         }) do
+      :ok -> :ok
+      {:error, {:already_exist, :ret_sentry_handler}} -> :ok
+      {:error, reason} -> raise "failed to install Sentry logger handler: #{inspect(reason)}"
+    end
   end
 
   def config_change(changed, _new, removed) do

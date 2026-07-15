@@ -18,4 +18,11 @@ defmodule RetWeb.PageControllerTest do
 
     assert csp |> String.contains?("google-analytics")
   end
+
+  test "cors proxy rejects internal targets without making a request", %{conn: conn} do
+    conn = %{conn | scheme: :https, host: "hubs-proxy.local", port: 4000}
+    resp = get(conn, "/http://127.0.0.1/secret")
+
+    assert response(resp, 401) == "Bad request."
+  end
 end

@@ -129,6 +129,11 @@ defmodule Ret do
     from Avatar, where: [account_id: ^account_id]
   end
 
+  @spec avatar_listing_query(Account.id()) :: Ecto.Query.t()
+  defp avatar_listing_query(account_id) when is_serial_id(account_id) do
+    from AvatarListing, where: [account_id: ^account_id]
+  end
+
   @spec delete_avatars_multi(Ecto.Multi.t(), Account.id(), Keyword.t()) :: Ecto.Multi.t()
   defp delete_avatars_multi(%Ecto.Multi{} = multi, account_id, reassignment)
        when is_serial_id(account_id) and is_list(reassignment),
@@ -137,6 +142,11 @@ defmodule Ret do
          |> Ecto.Multi.update_all(
            :reassign_avatar_owned_files,
            avatar_owned_file_query(account_id),
+           reassignment
+         )
+         |> Ecto.Multi.update_all(
+           :reassign_avatar_listings,
+           avatar_listing_query(account_id),
            reassignment
          )
          |> Ecto.Multi.update_all(

@@ -5,11 +5,42 @@ Reference [this discussion thread](https://github.com/mozilla/hubs/discussions/3
 
 A hybrid game networking and web API server, focused on Social Mixed Reality.
 
+## YenHubs audited runtime
+
+This fork pins its supported runtime in `.tool-versions` and in the container
+build:
+
+- Elixir 1.18.4
+- Erlang/OTP 27.3.4.14
+- PostgreSQL 12.19 (current Hubs CE compatibility) and 14.23 (upgrade target)
+
+The `reticulum-ci` GitHub Actions workflow runs the complete test suite against
+both PostgreSQL versions and builds the `turkey` release. To reproduce the
+checks locally against a disposable PostgreSQL instance:
+
+```bash
+export DB_HOST=127.0.0.1
+export DB_CREDENTIALS=postgres
+mix deps.get
+mix hex.audit
+mix format --check-formatted
+MIX_ENV=test mix ecto.create
+MIX_ENV=test mix ecto.migrate
+MIX_ENV=test mix compile --warnings-as-errors
+MIX_ENV=test mix test
+MIX_ENV=turkey mix compile --warnings-as-errors
+MIX_ENV=turkey mix release --overwrite
+```
+
+`mix.exs` acknowledges only two advisories in the latest available cowlib
+2.18.0. Remove those acknowledgements as soon as a fixed cowlib release is
+available; any additional advisory remains a CI failure.
+
 ## Development
 
 ### 1. Install Prerequisite Packages:
 
-#### PostgreSQL (recommended version 11.x):
+#### PostgreSQL (supported versions 12.x and 14.x):
 
 Linux:
 
@@ -25,7 +56,7 @@ Windows: https://www.postgresql.org/download/windows/
 
 Windows WSL: https://github.com/michaeltreat/Windows-Subsystem-For-Linux-Setup-Guide/blob/master/readmes/installs/PostgreSQL.md
 
-#### Erlang (v23.3) + Elixir (v1.14) + Phoenix
+#### Erlang/OTP 27.3.4.14 + Elixir 1.18.4 + Phoenix
 
 https://elixir-lang.org/install.html
 

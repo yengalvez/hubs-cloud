@@ -1,6 +1,6 @@
 defmodule Ret.EntityManager do
   alias Ecto.Multi
-  alias Ret.{Entity, SubEntity, Repo}
+  alias Ret.{Entity, SubEntity}
   import Ecto.Query
 
   def create_entity(hub, %{updates: updates} = entity_params) do
@@ -17,14 +17,23 @@ defmodule Ret.EntityManager do
 
   def insert_or_update_sub_entity(hub, %{root_nid: root_nid, nid: nid} = params) do
     Multi.new()
-    |> Multi.run(:entity, fn _repo, _changes ->
-      case Repo.one(from Entity, where: [nid: ^root_nid], preload: [:sub_entities]) do
+    |> Multi.run(:entity, fn repo, _changes ->
+      case repo.one(
+             from Entity,
+               where: [nid: ^root_nid, hub_id: ^hub.hub_id],
+               preload: [:sub_entities]
+           ) do
         nil -> {:error, :entity_state_does_not_exist}
         entity -> {:ok, entity}
       end
     end)
-    |> Multi.run(:existing_sub_entity, fn _repo, _changes ->
-      {:ok, Repo.one(from SubEntity, where: [nid: ^nid], preload: [:hub, :entity])}
+    |> Multi.run(:existing_sub_entity, fn repo, %{entity: entity} ->
+      {:ok,
+       repo.one(
+         from SubEntity,
+           where: [nid: ^nid, hub_id: ^hub.hub_id, entity_id: ^entity.entity_id],
+           preload: [:hub, :entity]
+       )}
     end)
     |> Multi.insert_or_update(:sub_entity, fn %{
                                                 entity: entity,

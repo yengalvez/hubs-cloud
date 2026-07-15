@@ -11,8 +11,7 @@ defmodule RetWeb.PageController do
     OwnedFile,
     AvatarListing,
     PageOriginWarmer,
-    Storage,
-    HttpUtils
+    Storage
   }
 
   alias Plug.Conn
@@ -649,10 +648,10 @@ defmodule RetWeb.PageController do
           client_options: [ssl: [{:versions, [:"tlsv1.2"]}]]
         )
 
-      body = ReverseProxyPlug.read_body(conn)
+      {body, request_conn} = ReverseProxyPlug.read_body(conn)
 
       %Conn{}
-      |> Map.merge(conn)
+      |> Map.merge(request_conn)
       # Need to strip path_info since proxy plug reads it
       |> Map.put(:path_info, [])
       |> ReverseProxyPlug.request(body, opts)
@@ -670,69 +669,49 @@ defmodule RetWeb.PageController do
     do: cors_proxy(conn, "#{url}?#{qs}")
 
   defp cors_proxy(conn, url) do
-    %URI{authority: authority, host: host} = uri = URI.parse(url)
-
-    resolved_ip = HttpUtils.resolve_ip(host)
-
-    if HttpUtils.internal_ip?(resolved_ip) do
-      conn |> send_resp(401, "Bad request.")
-    else
-      # We want to ensure that the URL we request hits the same IP that we verified above,
-      # so we replace the host with the IP address here and use this url to make the proxy request.
-      ip_url = URI.to_string(HttpUtils.replace_host(uri, resolved_ip))
-
-      # Disallow CORS proxying unless request was made to the cors proxy url
-      cors_proxy_url = Application.get_env(:ret, RetWeb.Endpoint)[:cors_proxy_url]
-
-      [cors_scheme, cors_port, cors_host] =
-        [:scheme, :port, :host] |> Enum.map(&Keyword.get(cors_proxy_url, &1))
-
-      is_cors_proxy_url =
-        if System.get_env("TURKEY_MODE") do
-          cors_host == conn.host &&
-            cors_scheme == get_req_header(conn, "x-forwarded-proto") |> Enum.at(0)
-        else
-          cors_scheme == Atom.to_string(conn.scheme) && cors_host == conn.host &&
-            cors_port == conn.port
-        end
-
-      if is_cors_proxy_url do
-        allowed_origins =
-          Application.get_env(:ret, RetWeb.Endpoint)[:allowed_origins] |> String.split(",")
-        opts =
-          ReverseProxyPlug.init(
-            upstream: url,
-            allowed_origins: allowed_origins,
-            proxy_url: "#{cors_scheme}://#{cors_host}:#{cors_port}",
-            # Since we replaced the host with the IP address in ip_url above, we need to force the host
-            # used for ssl verification here so that the connection isn't rejected.
-            # Note that we have to convert the authority to a charlist, since this uses Erlang's `ssl` module
-            # internally, which expects a charlist.
-            client_options: [
-              ssl: [{:server_name_indication, to_charlist(authority)}, {:versions, [:"tlsv1.2",:"tlsv1.3"]}]
-            ],
-            # preserve_host_header: true
-          )
-
-        body = ReverseProxyPlug.read_body(conn)
-        is_head = conn |> Conn.get_req_header("x-original-method") == ["HEAD"]
-
-        %Conn{}|> Map.merge(conn)
-        |> Map.put(
-          :method,
-          if is_head do
-            "HEAD"
-          else
-            conn.method
-          end
+    with true <- cors_proxy_request?(conn),
+         {:ok, method} <- cors_proxy_method(conn),
+         {:ok, target} <- RetWeb.CorsProxy.resolve_target(url) do
+      opts =
+        ReverseProxyPlug.init(
+          upstream: target.pinned_url,
+          client: RetWeb.CorsProxyHTTPClient,
+          client_options: RetWeb.CorsProxy.client_options(target)
         )
-        # Need to strip path_info since proxy plug reads it
-        |> Map.put(:path_info, [])
-        |> ReverseProxyPlug.request(body, opts)
-        |> ReverseProxyPlug.response(conn, opts)
-      else
-        conn |> send_resp(401, "Bad request.")
-      end
+
+      {body, request_conn} = ReverseProxyPlug.read_body(conn)
+
+      %Conn{}
+      |> Map.merge(request_conn)
+      |> Map.put(:method, method)
+      |> Map.put(:path_info, [])
+      |> ReverseProxyPlug.request(body, opts)
+      |> ReverseProxyPlug.response(conn, opts)
+    else
+      _ -> conn |> send_resp(401, "Bad request.")
+    end
+  end
+
+  defp cors_proxy_request?(conn) do
+    cors_proxy_url = Application.get_env(:ret, RetWeb.Endpoint)[:cors_proxy_url]
+
+    [cors_scheme, cors_port, cors_host] =
+      [:scheme, :port, :host] |> Enum.map(&Keyword.get(cors_proxy_url, &1))
+
+    if System.get_env("TURKEY_MODE") do
+      cors_host == conn.host &&
+        cors_scheme == get_req_header(conn, "x-forwarded-proto") |> Enum.at(0)
+    else
+      cors_scheme == Atom.to_string(conn.scheme) && cors_host == conn.host &&
+        cors_port == conn.port
+    end
+  end
+
+  defp cors_proxy_method(conn) do
+    case {conn.method, Conn.get_req_header(conn, "x-original-method")} do
+      {method, []} when method in ["GET", "HEAD"] -> {:ok, method}
+      {"GET", ["HEAD"]} -> {:ok, "HEAD"}
+      _ -> {:error, :invalid_method}
     end
   end
 

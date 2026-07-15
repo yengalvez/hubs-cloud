@@ -76,17 +76,21 @@ defmodule RetWeb.AccountControllerTest do
   end
 
   test "admins can create multiple acounts, and have validation errors", %{conn: conn} do
-    req =
+    res =
       conn
-      |> api_v1_account_path(:create, %{
-        data: [
-          %{email: "testapi1@mozilla.com"},
-          %{email: "testapi2@mozilla.com"},
-          %{email: "invalidemail"}
-        ]
-      })
-
-    res = conn |> post(req) |> response(207) |> Poison.decode!()
+      |> put_req_header("content-type", "application/json")
+      |> post(
+        "/api/v1/accounts",
+        Poison.encode!(%{
+          data: [
+            %{email: "testapi1@mozilla.com"},
+            %{email: "testapi2@mozilla.com"},
+            %{email: "invalidemail"}
+          ]
+        })
+      )
+      |> response(207)
+      |> Poison.decode!()
 
     account1 = Account.account_for_email("testapi1@mozilla.com")
     account2 = Account.account_for_email("testapi2@mozilla.com")
