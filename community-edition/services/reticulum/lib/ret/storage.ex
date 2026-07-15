@@ -311,8 +311,10 @@ defmodule Ret.Storage do
          %Account{} = account,
          _require_token
        ) do
-    if owned_file.account_id == account.account_id and owned_file.key == key and
-         owned_file.state in [:active, :inactive] do
+    with true <-
+           owned_file.account_id == account.account_id and owned_file.key == key and
+             owned_file.state in [:active, :inactive],
+         :ok <- validate_owned_file_pair(owned_file) do
       case owned_file.state do
         :active ->
           {:ok, owned_file, :existing}
@@ -324,7 +326,8 @@ defmodule Ret.Storage do
           end
       end
     else
-      {:error, :not_allowed}
+      false -> {:error, :not_allowed}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -603,6 +606,48 @@ defmodule Ret.Storage do
     end
   end
 
+  def reconcile_owned_files(grace_seconds \\ nil) do
+    Ret.Locking.exec_if_session_lockable(:storage_owned_file_reconcile, fn ->
+      mark_unreferenced_active_owned_files(grace_seconds)
+      reconcile_untracked_owned_file_pairs(grace_seconds)
+      demote_inactive_owned_files(grace_seconds)
+    end)
+  end
+
+  def mark_unreferenced_active_owned_files(grace_seconds \\ nil) do
+    grace_seconds = grace_seconds || module_config(:owned_file_orphan_grace_seconds) || 86_400
+    cutoff = NaiveDateTime.utc_now() |> NaiveDateTime.add(-grace_seconds, :second)
+
+    OwnedFile.active_before(cutoff)
+    |> Enum.each(&mark_inactive_if_unreferenced/1)
+  end
+
+  def reconcile_untracked_owned_file_pairs(grace_seconds \\ nil) do
+    grace_seconds = grace_seconds || module_config(:owned_file_orphan_grace_seconds) || 86_400
+
+    cutoff_unix =
+      DateTime.utc_now() |> DateTime.add(-grace_seconds, :second) |> DateTime.to_unix()
+
+    with storage_path when is_binary(storage_path) <- module_config(:storage_path) do
+      blob_uuids =
+        [storage_path, owned_file_path(), "**", "*.blob"]
+        |> Path.join()
+        |> Path.wildcard()
+        |> Enum.map(&Path.basename(&1, ".blob"))
+
+      metadata_uuids =
+        [storage_path, owned_file_path(), "**", "*.meta.json"]
+        |> Path.join()
+        |> Path.wildcard()
+        |> Enum.map(&Path.basename(&1, ".meta.json"))
+
+      blob_uuids
+      |> Enum.concat(metadata_uuids)
+      |> Enum.uniq()
+      |> Enum.each(&reconcile_untracked_owned_uuid(&1, cutoff_unix))
+    end
+  end
+
   def demote_inactive_owned_files(grace_seconds \\ nil) do
     grace_seconds = grace_seconds || module_config(:owned_file_demotion_grace_seconds) || 86_400
     cutoff = NaiveDateTime.utc_now() |> NaiveDateTime.add(-grace_seconds, :second)
@@ -727,10 +772,91 @@ defmodule Ret.Storage do
     end
   end
 
+  defp validate_owned_file_pair(%OwnedFile{} = owned_file) do
+    [_, meta_path, blob_path] = paths_for_owned_file(owned_file)
+
+    with :complete <- file_pair_status(meta_path, blob_path),
+         {:ok, metadata} <- read_storage_metadata(meta_path),
+         true <- metadata["content_type"] == owned_file.content_type,
+         true <- metadata["content_length"] == owned_file.content_length,
+         {:ok} <- check_blob_file_key(blob_path, owned_file.key) do
+      :ok
+    else
+      :missing -> {:error, :not_found}
+      :partial -> {:error, :storage_error}
+      false -> {:error, :storage_error}
+      {:error, :enoent} -> {:error, :not_found}
+      {:error, _reason} -> {:error, :storage_error}
+      _ -> {:error, :storage_error}
+    end
+  end
+
+  defp reconcile_untracked_owned_uuid(uuid, cutoff_unix) do
+    [_, meta_path, blob_path] = paths_for_uuid(uuid, owned_file_path())
+
+    with {:ok, _uuid} <- Ecto.UUID.cast(uuid),
+         :complete <- file_pair_status(meta_path, blob_path),
+         true <- file_pair_older_than?(meta_path, blob_path, cutoff_unix) do
+      case Ret.Locking.exec_after_lock("storage_promote_#{uuid}", fn ->
+             reconcile_untracked_owned_pair(uuid, meta_path, blob_path)
+           end) do
+        {:ok, result} when result in [:tracked, :moved_to_expiring] ->
+          result
+
+        {:error, reason} ->
+          Logger.error("Failed to reconcile untracked owned file #{uuid}: #{inspect(reason)}")
+          {:error, reason}
+
+        other ->
+          Logger.error("Unexpected untracked owned-file result for #{uuid}: #{inspect(other)}")
+          {:error, :storage_error}
+      end
+    else
+      :partial ->
+        Logger.error("Incomplete owned-file pair found for #{uuid}; leaving it untouched")
+        :partial
+
+      _ ->
+        :skipped
+    end
+  end
+
+  defp reconcile_untracked_owned_pair(uuid, meta_path, blob_path) do
+    case Repo.get_by(OwnedFile, owned_file_uuid: uuid) do
+      %OwnedFile{} ->
+        :tracked
+
+      nil ->
+        [destination_path, destination_meta, destination_blob] =
+          paths_for_uuid(uuid, expiring_file_path())
+
+        with :complete <- file_pair_status(meta_path, blob_path),
+             :ok <- File.mkdir_p(destination_path),
+             :ok <- move_file_pair(meta_path, blob_path, destination_meta, destination_blob) do
+          :moved_to_expiring
+        else
+          :missing -> :tracked
+          :partial -> Repo.rollback({:file_move_failed, :incomplete_source_pair})
+          {:error, reason} -> Repo.rollback({:file_move_failed, reason})
+        end
+    end
+  end
+
+  defp file_pair_older_than?(meta_path, blob_path, cutoff_unix) do
+    with {:ok, meta_stat} <- File.stat(meta_path, time: :posix),
+         {:ok, blob_stat} <- File.stat(blob_path, time: :posix) do
+      max(meta_stat.mtime, blob_stat.mtime) <= cutoff_unix
+    else
+      _ -> false
+    end
+  end
+
   defp reactivate_if_needed(%OwnedFile{state: :inactive} = owned_file) do
-    case OwnedFile.set_active(owned_file.owned_file_uuid, owned_file.account_id) do
-      {:ok, _active_owned_file} -> :ok
-      {:error, reason} -> {:error, reason}
+    with :ok <- validate_owned_file_pair(owned_file) do
+      case OwnedFile.set_active(owned_file.owned_file_uuid, owned_file.account_id) do
+        {:ok, _active_owned_file} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 

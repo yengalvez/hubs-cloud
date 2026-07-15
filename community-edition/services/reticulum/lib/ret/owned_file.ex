@@ -82,6 +82,14 @@ defmodule Ret.OwnedFile do
     )
   end
 
+  def active_before(%NaiveDateTime{} = cutoff) do
+    Repo.all(
+      from owned_file in OwnedFile,
+        where: owned_file.state == ^:active,
+        where: owned_file.updated_at <= ^cutoff
+    )
+  end
+
   def set_active(owned_file_uuid, account_id) do
     case get_by_uuid_and_account(owned_file_uuid, account_id) do
       nil ->

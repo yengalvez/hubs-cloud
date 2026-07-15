@@ -1,6 +1,7 @@
 defmodule Ret.StorageTest do
   use Ret.DataCase
   import Ret.TestHelpers
+  import ExUnit.CaptureLog
 
   alias Ret.{OwnedFile, Storage}
 
@@ -137,6 +138,35 @@ defmodule Ret.StorageTest do
     assert {:ok, _, _} = Storage.fetch(reactivated_file)
   end
 
+  test "re-promoting an inactive file with missing bytes fails and leaves it inactive", %{
+    temp_file: temp_file
+  } do
+    account = Ret.Repo.insert!(%Ret.Account{})
+
+    {:ok, uuid} = Storage.store(%Plug.Upload{path: temp_file}, "text/plain", "secret")
+    {:ok, owned_file} = Storage.promote(uuid, "secret", nil, account)
+    {:ok, _inactive_file} = OwnedFile.set_inactive(owned_file)
+    :ok = Storage.rm_files_for_owned_file(owned_file)
+
+    assert {:error, :not_found} = Storage.promote_with_status(uuid, "secret", nil, account)
+    assert Ret.Repo.get(OwnedFile, owned_file.owned_file_id).state == :inactive
+  end
+
+  test "re-promoting an inactive file with corrupt metadata fails without reactivating it", %{
+    temp_file: temp_file
+  } do
+    account = Ret.Repo.insert!(%Ret.Account{})
+
+    {:ok, uuid} = Storage.store(%Plug.Upload{path: temp_file}, "text/plain", "secret")
+    {:ok, owned_file} = Storage.promote(uuid, "secret", nil, account)
+    {:ok, _inactive_file} = OwnedFile.set_inactive(owned_file)
+    [_, meta_path, _blob_path] = Storage.paths_for_owned_file(owned_file)
+    File.write!(meta_path, "not-json")
+
+    assert {:error, :storage_error} = Storage.promote_with_status(uuid, "secret", nil, account)
+    assert Ret.Repo.get(OwnedFile, owned_file.owned_file_id).state == :inactive
+  end
+
   test "re-promoting requires the original owner and key", %{temp_file: temp_file} do
     account = Ret.Repo.insert!(%Ret.Account{})
     other_account = Ret.Repo.insert!(%Ret.Account{})
@@ -167,7 +197,7 @@ defmodule Ret.StorageTest do
     assert schema_columns == MapSet.new(OwnedFile.reference_columns())
   end
 
-  test "demotion keeps an inactive database row when its physical files are missing", %{
+  test "demotion keeps an inactive row when its physical files are missing", %{
     temp_file: temp_file
   } do
     account = Ret.Repo.insert!(%Ret.Account{})
@@ -197,6 +227,97 @@ defmodule Ret.StorageTest do
 
     assert Ret.Repo.get(OwnedFile, owned_file.owned_file_id).state == :inactive
     assert File.exists?(blob_path)
+  end
+
+  test "reconciliation marks an old unreferenced active file inactive", %{temp_file: temp_file} do
+    account = Ret.Repo.insert!(%Ret.Account{})
+
+    {:ok, uuid} = Storage.store(%Plug.Upload{path: temp_file}, "text/plain", "secret")
+    {:ok, owned_file} = Storage.promote(uuid, "secret", nil, account)
+
+    Storage.mark_unreferenced_active_owned_files(0)
+
+    assert Ret.Repo.get(OwnedFile, owned_file.owned_file_id).state == :inactive
+    assert {:ok, _, _} = Storage.fetch(owned_file)
+  end
+
+  test "reconciliation keeps referenced active files active", %{temp_file: temp_file} do
+    account = Ret.Repo.insert!(%Ret.Account{})
+
+    {:ok, uuid} = Storage.store(%Plug.Upload{path: temp_file}, "text/plain", "secret")
+    {:ok, owned_file} = Storage.promote(uuid, "secret", nil, account)
+
+    Ret.Repo.insert!(%Ret.AppConfig{
+      key: "storage-test-reference",
+      owned_file_id: owned_file.owned_file_id
+    })
+
+    Storage.mark_unreferenced_active_owned_files(0)
+
+    assert Ret.Repo.get(OwnedFile, owned_file.owned_file_id).state == :active
+  end
+
+  test "reconciliation returns an untracked complete owned pair to expiring storage", %{
+    temp_file: temp_file
+  } do
+    {:ok, uuid} =
+      Storage.store(temp_file, "text/plain", "secret", nil, Storage.owned_file_path())
+
+    assert Ret.Repo.get_by(OwnedFile, owned_file_uuid: uuid) == nil
+    assert {:error, :not_found} = Storage.fetch(uuid, "secret")
+
+    Storage.reconcile_untracked_owned_file_pairs(0)
+
+    assert_fetch_result(Storage.fetch(uuid, "secret"), "text/plain", "test")
+    assert Ret.Repo.get_by(OwnedFile, owned_file_uuid: uuid) == nil
+  end
+
+  test "reconciliation detects but preserves an untracked metadata-only pair", %{
+    temp_file: temp_file
+  } do
+    {:ok, uuid} =
+      Storage.store(temp_file, "text/plain", "secret", nil, Storage.owned_file_path())
+
+    [_, meta_path, blob_path] =
+      Storage.paths_for_owned_file(%OwnedFile{owned_file_uuid: uuid})
+
+    File.rm!(blob_path)
+
+    log = capture_log(fn -> Storage.reconcile_untracked_owned_file_pairs(0) end)
+
+    assert log =~ "Incomplete owned-file pair found for #{uuid}"
+    assert File.exists?(meta_path)
+    refute File.exists?(blob_path)
+    assert Ret.Repo.get_by(OwnedFile, owned_file_uuid: uuid) == nil
+  end
+
+  test "full reconciliation isolates a partial pair from other files", %{
+    temp_file: temp_file,
+    temp_file_2: temp_file_2
+  } do
+    account = Ret.Repo.insert!(%Ret.Account{})
+
+    {:ok, complete_uuid} =
+      Storage.store(%Plug.Upload{path: temp_file}, "text/plain", "complete-secret")
+
+    {:ok, complete_file} = Storage.promote(complete_uuid, "complete-secret", nil, account)
+    {:ok, _inactive_complete_file} = OwnedFile.set_inactive(complete_file)
+
+    {:ok, partial_uuid} =
+      Storage.store(%Plug.Upload{path: temp_file_2}, "text/plain", "partial-secret")
+
+    {:ok, partial_file} = Storage.promote(partial_uuid, "partial-secret", nil, account)
+    [_, partial_meta_path, partial_blob_path] = Storage.paths_for_owned_file(partial_file)
+    File.rm!(partial_meta_path)
+    {:ok, _inactive_partial_file} = OwnedFile.set_inactive(partial_file)
+
+    Storage.reconcile_owned_files(0)
+
+    assert Ret.Repo.get(OwnedFile, complete_file.owned_file_id) == nil
+    assert_fetch_result(Storage.fetch(complete_uuid, "complete-secret"), "text/plain", "test")
+    assert Ret.Repo.get(OwnedFile, partial_file.owned_file_id).state == :inactive
+    refute File.exists?(partial_meta_path)
+    assert File.exists?(partial_blob_path)
   end
 
   test "should be able to promote multiple files", %{

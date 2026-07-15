@@ -113,7 +113,7 @@ config :ret, Ret.Scheduler,
 
     # Various maintenence routines
     {{:cron, "0 10 * * *"}, {Ret.Storage, :vacuum, []}},
-    {{:cron, "3 10 * * *"}, {Ret.Storage, :demote_inactive_owned_files, []}},
+    {{:cron, "3 10 * * *"}, {Ret.Storage, :reconcile_owned_files, []}},
     {{:cron, "4 10 * * *"}, {Ret.LoginToken, :expire_stale, []}},
     {{:cron, "6 10 * * *"}, {Ret.Hub, :vacuum_hosts, []}},
     {{:cron, "7 10 * * *"}, {Ret.CachedFile, :vacuum, []}}
