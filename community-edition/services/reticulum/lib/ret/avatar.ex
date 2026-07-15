@@ -23,6 +23,9 @@ defmodule Ret.Avatar do
     :orm_map_owned_file
   ]
   @file_columns [:gltf_owned_file, :bin_owned_file, :thumbnail_owned_file] ++ @image_columns
+  @max_model_bytes 64 * 1024 * 1024
+  @max_image_bytes 16 * 1024 * 1024
+  @max_thumbnail_bytes 5 * 1024 * 1024
 
   @schema_prefix "ret0"
   @primary_key {:avatar_id, :id, autogenerate: true}
@@ -337,7 +340,48 @@ defmodule Ret.Avatar do
     |> put_assoc(:parent_avatar, parent_avatar)
     |> put_assoc(:parent_avatar_listing, parent_avatar_listing)
     |> put_owned_files(owned_files_map)
+    |> validate_owned_file_sizes()
     |> AvatarSlug.maybe_generate_slug()
+  end
+
+  defp validate_owned_file_sizes(changeset) do
+    model_bytes =
+      [:gltf_owned_file, :bin_owned_file]
+      |> Enum.map(&owned_file_size(changeset, &1))
+      |> Enum.sum()
+
+    changeset =
+      if model_bytes > @max_model_bytes do
+        add_error(changeset, :gltf_owned_file, "avatar model exceeds 64 MiB")
+      else
+        changeset
+      end
+
+    changeset =
+      Enum.reduce(@image_columns, changeset, fn column, acc ->
+        if owned_file_size(acc, column) > @max_image_bytes do
+          add_error(acc, column, "avatar texture exceeds 16 MiB")
+        else
+          acc
+        end
+      end)
+
+    if owned_file_size(changeset, :thumbnail_owned_file) > @max_thumbnail_bytes do
+      add_error(changeset, :thumbnail_owned_file, "avatar thumbnail exceeds 5 MiB")
+    else
+      changeset
+    end
+  end
+
+  defp owned_file_size(changeset, column) do
+    case get_field(changeset, column) do
+      %OwnedFile{content_length: content_length}
+      when is_integer(content_length) and content_length > 0 ->
+        content_length
+
+      _ ->
+        0
+    end
   end
 
   defp put_owned_files(in_changeset, owned_files_map) do

@@ -3,6 +3,16 @@ defmodule RetWeb.Api.V1.AvatarController do
 
   alias Ret.{Account, Repo, Avatar, AvatarListing, Storage, GLTFUtils}
 
+  @file_param_associations %{
+    "gltf" => :gltf_owned_file,
+    "bin" => :bin_owned_file,
+    "thumbnail" => :thumbnail_owned_file,
+    "base_map" => :base_map_owned_file,
+    "emissive_map" => :emissive_map_owned_file,
+    "normal_map" => :normal_map_owned_file,
+    "orm_map" => :orm_map_owned_file
+  }
+
   plug RetWeb.Plugs.RateLimit when action in [:create, :update]
 
   defp get_avatar(avatar_sid, preloads \\ []) do
@@ -72,14 +82,43 @@ defmodule RetWeb.Api.V1.AvatarController do
   end
 
   defp create_or_update(conn, params, avatar, account) do
-    files_to_promote =
-      (params["files"] || %{})
-      |> Enum.map(fn
-        {k, nil} -> {String.to_atom(k), :remove}
-        {k, v} -> {String.to_atom(k), List.to_tuple(v)}
-      end)
-      |> Enum.into(%{})
+    case normalize_files_to_promote(params["files"] || %{}) do
+      {:ok, files_to_promote} ->
+        promote_files_and_save_avatar(conn, params, avatar, account, files_to_promote)
 
+      {:error, :invalid_files} ->
+        conn |> send_resp(422, "invalid avatar files")
+    end
+  end
+
+  defp normalize_files_to_promote(files) when is_map(files) do
+    Enum.reduce_while(files, {:ok, %{}}, fn
+      {key, nil}, {:ok, acc} ->
+        case Map.fetch(@file_param_associations, key) do
+          {:ok, association} -> {:cont, {:ok, Map.put(acc, association, :remove)}}
+          :error -> {:halt, {:error, :invalid_files}}
+        end
+
+      {key, [id, access_key, promotion_token]}, {:ok, acc}
+      when is_binary(id) and byte_size(id) > 0 and is_binary(access_key) and
+             byte_size(access_key) > 0 and
+             is_binary(promotion_token) and byte_size(promotion_token) > 0 ->
+        case Map.fetch(@file_param_associations, key) do
+          {:ok, association} ->
+            {:cont, {:ok, Map.put(acc, association, {id, access_key, promotion_token})}}
+
+          :error ->
+            {:halt, {:error, :invalid_files}}
+        end
+
+      _entry, _acc ->
+        {:halt, {:error, :invalid_files}}
+    end)
+  end
+
+  defp normalize_files_to_promote(_files), do: {:error, :invalid_files}
+
+  defp promote_files_and_save_avatar(conn, params, avatar, account, files_to_promote) do
     owned_file_results =
       files_to_promote
       |> Enum.map(fn
@@ -95,7 +134,7 @@ defmodule RetWeb.Api.V1.AvatarController do
       nil ->
         owned_files =
           owned_file_results
-          |> Enum.map(fn {k, {:ok, file}} -> {:"#{k}_owned_file", file} end)
+          |> Enum.map(fn {association, {:ok, file}} -> {association, file} end)
           |> Enum.into(%{})
 
         parent_avatar =
