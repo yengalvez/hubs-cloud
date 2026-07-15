@@ -9,7 +9,8 @@ defmodule RetWeb.PhoenixParameterFilterTest do
       "access_token" => "session-token",
       "password" => "account-password",
       "client_secret" => "oauth-secret",
-      "message" => "safe"
+      "message" => "private conversation",
+      "prompt" => "private room prompt"
     }
 
     assert Phoenix.Logger.filter_values(values, filter_parameters) == %{
@@ -17,7 +18,8 @@ defmodule RetWeb.PhoenixParameterFilterTest do
              "access_token" => "[FILTERED]",
              "password" => "[FILTERED]",
              "client_secret" => "[FILTERED]",
-             "message" => "safe"
+             "message" => "[FILTERED]",
+             "prompt" => "[FILTERED]"
            }
   end
 

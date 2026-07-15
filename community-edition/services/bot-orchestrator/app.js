@@ -478,8 +478,10 @@ async function callOpenAI({ hubSid, botId, message, botsConfig, context, request
   }
 }
 
-function chatRateLimited(hubSid, botId, requesterId) {
-  const key = `${hubSid}:${botId}:${requesterId}`;
+function chatRateLimited(hubSid, requesterId) {
+  // Limit the account across every bot in a room. A per-bot key lets one user
+  // multiply provider traffic simply by rotating through the available bots.
+  const key = `${hubSid}:${requesterId}`;
   const now = Date.now();
 
   if (now - lastRateLimitPruneAt >= CHAT_RATE_LIMIT_WINDOW_MS) {
@@ -863,7 +865,7 @@ app.post("/internal/bots/chat", authMiddleware, async (req, res) => {
     return;
   }
 
-  if (chatRateLimited(hubSid, botId, requesterId)) {
+  if (chatRateLimited(hubSid, requesterId)) {
     res.json({
       reply: "Espera un momento antes de enviar otro mensaje.",
       action: null,

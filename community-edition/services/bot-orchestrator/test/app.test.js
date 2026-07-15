@@ -89,6 +89,38 @@ test("returns a privacy-safe fallback without echoing the user message", async (
   assert.equal(body.action, null);
 });
 
+test("rate limits an account across different bots in the same room", async () => {
+  const config = await post("/internal/bots/room-config", {
+    hub_sid: "room-rate-limit",
+    bots: { enabled: true, count: 4, mobility: "medium", chat_enabled: true }
+  });
+  assert.equal(config.status, 200);
+
+  for (let botNumber = 1; botNumber <= 3; botNumber += 1) {
+    const response = await post("/internal/bots/chat", {
+      hub_sid: "room-rate-limit",
+      bot_id: `bot-${botNumber}`,
+      requester_id: "account-rate-limit",
+      message: "hola"
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.rate_limited, undefined);
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+
+  const limited = await post("/internal/bots/chat", {
+    hub_sid: "room-rate-limit",
+    bot_id: "bot-4",
+    requester_id: "account-rate-limit",
+    message: "hola"
+  });
+  const limitedBody = await limited.json();
+
+  assert.equal(limited.status, 200);
+  assert.equal(limitedBody.rate_limited, true);
+});
+
 test("builds non-stored OpenAI requests with pseudonymous safety identifiers", () => {
   const request = internals.buildOpenAIRequest({
     hubSid: "room-a",

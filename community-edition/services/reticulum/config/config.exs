@@ -14,6 +14,8 @@ config :phoenix, :filter_parameters, [
   "q",
   "filter",
   "cursor",
+  "message",
+  "prompt",
   "bot_access_key",
   "token",
   "password",
