@@ -167,6 +167,28 @@ if (!fs.existsSync(manifestPath)) {
   });
   const resources = documents.map(document => document.toJS()).filter(Boolean);
 
+  const retConfig = findResource(resources, "ConfigMap", "ret-config");
+  const reticulum = findResource(resources, "Deployment", "reticulum");
+  const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
+    container => container.name === "reticulum"
+  );
+  const runtimeConfig = retConfig?.data?.["config.toml.template"] || "";
+  const runtimePlaceholders = [...runtimeConfig.matchAll(/<([A-Z][A-Z0-9_]*)>/g)].map(match => match[1]);
+  const runtimeVariables = new Set(
+    (reticulumContainer?.env || [])
+      .map(variable => variable.name)
+      .filter(name => name.startsWith("turkeyCfg_"))
+      .map(name => name.slice("turkeyCfg_".length))
+  );
+  const missingRuntimeVariables = [...new Set(runtimePlaceholders)].filter(
+    name => !runtimeVariables.has(name)
+  );
+  if (missingRuntimeVariables.length > 0) {
+    fail(
+      `ret-config placeholders have no matching turkeyCfg_ environment variable: ${missingRuntimeVariables.join(", ")}`
+    );
+  }
+
   for (const deployment of resources.filter(resource => resource.kind === "Deployment")) {
     for (const container of deployment.spec?.template?.spec?.containers || []) {
       if (!isDigestPinnedImage(container.image)) {
@@ -249,7 +271,6 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  const reticulum = findResource(resources, "Deployment", "reticulum");
   const botOrchestrator = findResource(resources, "Deployment", "bot-orchestrator");
   const dialog = findResource(resources, "Deployment", "dialog");
   const reticulumBotKeyChecksum =
@@ -275,7 +296,6 @@ if (!fs.existsSync(manifestPath)) {
     fail("Reticulum, PgBouncer pools and Coturn must share the database credential checksum annotation");
   }
 
-  const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(container => container.name === "reticulum");
   if (!reticulumContainer) {
     fail("missing reticulum container");
   } else {

@@ -101,9 +101,9 @@ defmodule Ret.JanusLoadStatus do
 
   defp retry_api_post_until_success(url, payload) do
     retry with: exponential_backoff() |> randomize |> cap(3_000) |> expiry(5_000) do
-      hackney_options =
+      request_options =
         if module_config(:insecure_ssl) == true do
-          [:insecure]
+          [ssl: [verify: :verify_none]]
         else
           []
         end
@@ -113,7 +113,7 @@ defmodule Ret.JanusLoadStatus do
              url,
              payload |> Poison.encode!(),
              [{"Content-Type", "application/json"}],
-             hackney: hackney_options
+             request_options
            ) do
         {:ok, %HTTPoison.Response{status_code: 200} = resp} -> resp
         _ -> :error

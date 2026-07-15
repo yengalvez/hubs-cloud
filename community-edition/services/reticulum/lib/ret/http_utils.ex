@@ -61,11 +61,17 @@ defmodule Ret.HttpUtils do
         options[:headers]
       end
 
-    hackney_options =
+    request_options = [
+      follow_redirect: true,
+      timeout: options[:cap_ms],
+      recv_timeout: options[:cap_ms]
+    ]
+
+    request_options =
       if module_config(:insecure_ssl) == true do
-        [:insecure]
+        Keyword.put(request_options, :ssl, verify: :verify_none)
       else
-        []
+        request_options
       end
 
     retry with:
@@ -75,12 +81,7 @@ defmodule Ret.HttpUtils do
             |> expiry(options[:expiry_ms]) do
       http_client = module_config(:http_client) || HTTPoison
 
-      case http_client.request(verb, url, body, headers,
-             follow_redirect: true,
-             timeout: options[:cap_ms],
-             recv_timeout: options[:cap_ms],
-             hackney: hackney_options
-           ) do
+      case http_client.request(verb, url, body, headers, request_options) do
         {:ok, %HTTPoison.Response{status_code: status_code} = resp}
         when status_code >= 200 and status_code < 300 ->
           resp

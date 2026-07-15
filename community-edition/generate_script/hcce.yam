@@ -217,7 +217,8 @@ data:
     pool = "hubs"
 
     [ret."Elixir.RetWeb.Plugs.DashboardHeaderAuthorization"]
-    dashboard_access_key = "<DASHBOARD_ACCESS_KEY>"
+    # Empty means the internal bot access key is reused by the authorization plug.
+    dashboard_access_key = ""
 
     [ret."Elixir.Ret.DiscordClient"]
     client_id = ""
@@ -349,7 +350,7 @@ data:
     password = "<SMTP_PASS>"
 
     [ret."Elixir.Ret.Support"]
-    slack_webhook_url = "<SLACK_WEBHOOK>"
+    slack_webhook_url = ""
 
     # The values in the following section are added to the Content Security Policy.
     # This is used to allow connections to external URLs.
@@ -402,9 +403,6 @@ data:
     subject = ""
     public_key = ""
     private_key = ""
-
-    [sentry]
-    dsn = "<SENTRY_DSN>"
 
     [run]
     hostname_dns_suffix = "turkey"

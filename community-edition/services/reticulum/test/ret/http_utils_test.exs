@@ -10,6 +10,11 @@ defmodule Ret.HttpUtilsTest do
     end)
   end
 
+  setup do
+    original_config = Application.get_env(:ret, Ret.HttpUtils)
+    on_exit(fn -> Application.put_env(:ret, Ret.HttpUtils, original_config) end)
+  end
+
   test "fetch_content_type should attempt a request and return the response content type" do
     Ret.HttpMock
     |> Mox.expect(:request, 1, fn _verb, _url, _body, _headers, _options ->
@@ -17,6 +22,20 @@ defmodule Ret.HttpUtilsTest do
     end)
 
     {:ok, "foo/bar"} = Ret.HttpUtils.fetch_content_type("http://foo.local/")
+  end
+
+  test "uses the HTTPoison 3 SSL option for explicitly insecure internal requests" do
+    Ret.TestHelpers.merge_module_config(:ret, Ret.HttpUtils, %{insecure_ssl: true})
+
+    Ret.HttpMock
+    |> Mox.expect(:request, 1, fn _verb, _url, _body, _headers, options ->
+      assert options[:ssl] == [verify: :verify_none]
+      refute Keyword.has_key?(options, :hackney)
+      {:ok, %HTTPoison.Response{status_code: 200}}
+    end)
+
+    assert %HTTPoison.Response{status_code: 200} =
+             Ret.HttpUtils.retry_get_until_success("https://internal.example/")
   end
 
   test "classifies non-global IPv4 ranges as internal" do
