@@ -686,6 +686,7 @@ spec:
           runAsUser: 1000
           runAsGroup: 1000
           allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - ALL
@@ -742,6 +743,9 @@ spec:
           value: "$MAX_ACTIVE_ROOMS"
         - name: MAX_BOTS_PER_ROOM
           value: "$MAX_BOTS_PER_ROOM"
+        volumeMounts:
+        - name: bot-orchestrator-tmp
+          mountPath: /tmp
         livenessProbe:
           httpGet:
             path: /health
@@ -754,6 +758,10 @@ spec:
             port: 5001
           initialDelaySeconds: 5
           periodSeconds: 10
+      volumes:
+      - name: bot-orchestrator-tmp
+        emptyDir:
+          sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: Service

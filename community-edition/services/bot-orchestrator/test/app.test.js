@@ -140,7 +140,13 @@ test("builds non-stored OpenAI requests with pseudonymous safety identifiers", (
   assert.equal(request.store, false);
   assert.equal(request.safety_identifier.length, 64);
   assert.equal(request.safety_identifier.includes("account-123"), false);
-  assert.match(request.input[0].content[0].text, /datos no confiables/);
+  assert.match(request.input[0].content[0].text, /texto no confiable/);
+  assert.equal(request.input[0].content[0].text.includes("Eres el recepcionista."), false);
+  const userPayload = JSON.parse(request.input[1].content[0].text);
+  assert.equal(userPayload.room_persona, "Eres el recepcionista.");
+  assert.equal(userPayload.hub_sid, undefined);
+  assert.equal(userPayload.bot_id, undefined);
+  assert.equal(request.input[1].content[0].text.includes("account-123"), false);
   assert.equal(request.text.format.type, "json_schema");
   assert.equal(request.text.format.strict, true);
   assert.deepEqual(request.text.format.schema.required, ["reply", "action"]);
