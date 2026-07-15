@@ -192,6 +192,23 @@ export default class Project extends EventEmitter {
     });
   }
 
+  async withLoginRetry(request, showDialog) {
+    let response = await request();
+
+    if (response.status !== 401) {
+      return response;
+    }
+
+    await new Promise(resolve => {
+      showDialog(LoginDialog, {
+        onSuccess: resolve
+      });
+    });
+
+    response = await request();
+    return response;
+  }
+
   async getProjects() {
     const token = this.getToken();
 
@@ -868,19 +885,23 @@ export default class Project extends EventEmitter {
       const {
         file_id: glbId,
         meta: { access_token: glbToken }
-      } = await this.upload(glbBlob, uploadProgress => {
-        showDialog(
-          ProgressDialog,
-          {
-            title: "Publishing Scene",
-            message: `Uploading scene: ${Math.floor(uploadProgress * 100)}%`,
-            onCancel: () => {
-              abortController.abort();
-            }
-          },
-          abortController.signal
-        );
-      });
+      } = await this.upload(
+        glbBlob,
+        uploadProgress => {
+          showDialog(
+            ProgressDialog,
+            {
+              title: "Publishing Scene",
+              message: `Uploading scene: ${Math.floor(uploadProgress * 100)}%`,
+              onCancel: () => {
+                abortController.abort();
+              }
+            },
+            abortController.signal
+          );
+        },
+        abortController.signal
+      );
 
       if (signal.aborted) {
         const error = new Error("Publish project aborted");
@@ -915,39 +936,25 @@ export default class Project extends EventEmitter {
         }
       };
 
-      const token = this.getToken();
-
-      const headers = {
-        "content-type": "application/json",
-        authorization: `Bearer ${token}`
-      };
       const body = JSON.stringify({ scene: sceneParams });
+      const publishRequest = () => {
+        const headers = {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.getToken()}`
+        };
 
-      const resp = await this.fetch(`https://${RETICULUM_SERVER}/api/v1/projects/${project.project_id}/publish`, {
-        method: "POST",
-        headers,
-        body
-      });
+        return this.fetch(`https://${RETICULUM_SERVER}/api/v1/projects/${project.project_id}/publish`, {
+          method: "POST",
+          headers,
+          body
+        });
+      };
+      const resp = await this.withLoginRetry(publishRequest, showDialog);
 
       if (signal.aborted) {
         const error = new Error("Publish project aborted");
         error.aborted = true;
         throw error;
-      }
-
-      if (resp.status === 401) {
-        return await new Promise((resolve, reject) => {
-          showDialog(LoginDialog, {
-            onSuccess: async () => {
-              try {
-                const result = await this.publish(editor, showDialog, hideDialog);
-                resolve(result);
-              } catch (e) {
-                reject(e);
-              }
-            }
-          });
-        });
       }
 
       if (resp.status !== 200) {
