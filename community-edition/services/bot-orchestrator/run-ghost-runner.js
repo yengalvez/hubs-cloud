@@ -890,6 +890,25 @@ async function main() {
     0,
     Number(process.env.GHOST_FULL_SYNC_BURST_INITIAL_DELAY_MS || 250)
   );
+  let botsConfig = null;
+  let botsConfigDirty = false;
+
+  const handleManagedConfig = message => {
+    if (!message || message.type !== "bots-config") return;
+    botsConfig = normalizeBotsConfig(message.bots);
+    botsConfigDirty = true;
+    if (process.connected && typeof process.send === "function") {
+      try {
+        process.send({
+          type: "bots-config-applied",
+          fingerprint: typeof message.fingerprint === "string" ? message.fingerprint : ""
+        });
+      } catch (error) {
+        log("Failed to acknowledge managed bot config:", error.message);
+      }
+    }
+  };
+  process.on("message", handleManagedConfig);
 
   const wsPkg = require("ws");
   global.WebSocket = wsPkg; // required for phoenix in Node
@@ -959,7 +978,9 @@ async function main() {
 
   log("Joined hub:", hubSid, "session:", sessionId);
 
-  let botsConfig = normalizeBotsConfig((hub.user_data && hub.user_data.bots) || {});
+  if (!botsConfig) {
+    botsConfig = normalizeBotsConfig((hub.user_data && hub.user_data.bots) || {});
+  }
 
   // Keep these cached and refresh periodically.
   let waypointData = { spawnPoints: [], patrolPoints: [], allWaypoints: [], colliders: [] };
@@ -1291,6 +1312,7 @@ async function main() {
     if (!userData || typeof userData !== "object" || !Object.prototype.hasOwnProperty.call(userData, "bots")) return;
     const nextConfig = normalizeBotsConfig(userData.bots || {});
     botsConfig = nextConfig;
+    botsConfigDirty = true;
   });
 
   // Presence / late joiners.
@@ -1381,7 +1403,8 @@ async function main() {
     const now = timekeeper.nowMs();
 
     // Reconcile bots periodically so config changes take effect.
-    if (now - lastConfigRefreshAt >= CONFIG_REFRESH_INTERVAL_MS) {
+    if (botsConfigDirty || now - lastConfigRefreshAt >= CONFIG_REFRESH_INTERVAL_MS) {
+      botsConfigDirty = false;
       lastConfigRefreshAt = now;
       const changed = reconcileBots(now);
       if (changed) {

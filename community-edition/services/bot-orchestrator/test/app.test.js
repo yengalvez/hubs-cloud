@@ -57,6 +57,40 @@ test("protects internal endpoints and does not expose Express", async () => {
   assert.equal((await health.json()).runner_backend_default, "ghost");
 });
 
+test("sends only movement-relevant config changes to an active ghost runner", () => {
+  const messages = [];
+  const info = {
+    backend: "ghost",
+    configFingerprint: null,
+    pendingConfigFingerprint: null,
+    process: {
+      connected: true,
+      send(message) {
+        messages.push(message);
+        return true;
+      }
+    }
+  };
+
+  const initial = { enabled: true, count: 2, mobility: "medium", chat_enabled: true, prompt: "Recepción" };
+  assert.equal(internals.sendRunnerConfigToProcess(info, initial), true);
+  assert.equal(messages.length, 1);
+  assert.deepEqual(messages[0].bots, { enabled: true, count: 2, mobility: "medium" });
+
+  assert.equal(internals.sendRunnerConfigToProcess(info, { ...initial, prompt: "Otra persona" }), false);
+  assert.equal(internals.sendRunnerConfigToProcess(info, { ...initial, chat_enabled: false }), false);
+  assert.equal(messages.length, 1);
+
+  assert.equal(internals.sendRunnerConfigToProcess(info, { ...initial, count: 5 }), true);
+  assert.equal(internals.sendRunnerConfigToProcess(info, { ...initial, count: 5 }), false);
+  assert.equal(internals.sendRunnerConfigToProcess(info, { ...initial, count: 5, mobility: "high" }), true);
+  // A rapid rollback must supersede an in-flight newer config, not be mistaken
+  // for the previously acknowledged state.
+  info.configFingerprint = internals.runnerConfigFingerprint(initial);
+  assert.equal(internals.sendRunnerConfigToProcess(info, initial), true);
+  assert.equal(messages.length, 4);
+});
+
 test("keeps chat disabled until Reticulum supplies an enabled room config", async () => {
   const response = await post("/internal/bots/chat", {
     hub_sid: "room-a",

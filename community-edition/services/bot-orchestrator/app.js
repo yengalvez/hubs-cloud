@@ -280,6 +280,58 @@ function normalizeConfig(input) {
   };
 }
 
+function runnerConfigPayload(input) {
+  const config = normalizeConfig(input);
+  return {
+    enabled: config.enabled,
+    count: config.count,
+    mobility: config.mobility
+  };
+}
+
+function runnerConfigFingerprint(input) {
+  return JSON.stringify(runnerConfigPayload(input));
+}
+
+function sendRunnerConfigToProcess(info, input) {
+  if (
+    !info ||
+    info.backend !== "ghost" ||
+    !info.process ||
+    !info.process.connected ||
+    typeof info.process.send !== "function"
+  ) {
+    return false;
+  }
+
+  const bots = runnerConfigPayload(input);
+  const fingerprint = runnerConfigFingerprint(bots);
+  if (info.pendingConfigFingerprint === fingerprint) return false;
+  if (!info.pendingConfigFingerprint && info.configFingerprint === fingerprint) return false;
+
+  info.pendingConfigFingerprint = fingerprint;
+  try {
+    info.process.send({ type: "bots-config", bots, fingerprint }, error => {
+      if (error && info.pendingConfigFingerprint === fingerprint) {
+        info.pendingConfigFingerprint = null;
+        console.warn("Failed to send bot config to ghost runner.", error.message);
+      }
+    });
+    return true;
+  } catch (error) {
+    info.pendingConfigFingerprint = null;
+    console.warn("Failed to send bot config to ghost runner.", error.message);
+    return false;
+  }
+}
+
+function acknowledgeRunnerConfig(info, fingerprint) {
+  if (!info || typeof fingerprint !== "string" || info.pendingConfigFingerprint !== fingerprint) return false;
+  info.configFingerprint = fingerprint;
+  info.pendingConfigFingerprint = null;
+  return true;
+}
+
 function detectWaypointAction(message, context) {
   if (!message || typeof message !== "string") return null;
 
@@ -592,15 +644,27 @@ function startRunner(hubSid) {
 
   const script = runnerScriptForBackend(backend);
   const args = [script, "--url", HUBS_BASE_URL, "--room", hubSid, "--runner"];
-  const child = spawn("node", args, { stdio: "inherit" });
+  const stdio = backend === "ghost" ? ["ignore", "inherit", "inherit", "ipc"] : "inherit";
+  const child = spawn("node", args, { stdio });
 
   const info = {
     process: child,
     backend,
+    configFingerprint: null,
+    pendingConfigFingerprint: null,
     restartDelayMs: 3000,
     restartTimer: null
   };
   roomRunners.set(hubSid, info);
+
+  if (backend === "ghost") {
+    child.on("message", message => {
+      if (!message || message.type !== "bots-config-applied") return;
+      acknowledgeRunnerConfig(info, message.fingerprint);
+    });
+    const room = roomConfigs.get(hubSid);
+    if (room && room.bots) sendRunnerConfigToProcess(info, room.bots);
+  }
 
   child.on("exit", () => {
     roomRunners.delete(hubSid);
@@ -637,6 +701,7 @@ function ensureRunnerState(hubSid) {
 
   if (roomRunners.has(hubSid)) {
     dequeueHub(hubSid);
+    sendRunnerConfigToProcess(roomRunners.get(hubSid), room.bots);
     return "running";
   }
 
@@ -961,6 +1026,8 @@ module.exports = {
     normalizeConfig,
     parseOpenAIResponsePayload,
     parseStructuredReply,
+    runnerConfigFingerprint,
+    sendRunnerConfigToProcess,
     sanitizeKnownWaypoints,
     safetyIdentifierFor,
     syncActiveRoomsFromReticulum,
