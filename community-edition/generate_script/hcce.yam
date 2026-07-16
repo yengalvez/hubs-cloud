@@ -727,6 +727,14 @@ spec:
           value: "$GHOST_RUNNER_SCRIPT"
         - name: GHOST_RAYCAST_MODE
           value: "$GHOST_RAYCAST_MODE"
+        - name: GHOST_NAVIGATION_MODE
+          value: "$GHOST_NAVIGATION_MODE"
+        - name: GHOST_NAVMESH_MAX_TRIANGLES
+          value: "$GHOST_NAVMESH_MAX_TRIANGLES"
+        - name: GHOST_NAVMESH_MAX_ROUTE_POINTS
+          value: "$GHOST_NAVMESH_MAX_ROUTE_POINTS"
+        - name: GHOST_NAVMESH_MAX_SNAP_DISTANCE_M
+          value: "$GHOST_NAVMESH_MAX_SNAP_DISTANCE_M"
         - name: GHOST_SCENE_FETCH_TIMEOUT_MS
           value: "10000"
         - name: GHOST_SCENE_MAX_BYTES

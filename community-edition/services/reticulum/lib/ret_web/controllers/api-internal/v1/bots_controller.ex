@@ -104,6 +104,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
 
   defp normalize_mobility("low"), do: "low"
   defp normalize_mobility("high"), do: "high"
+  defp normalize_mobility("static"), do: "static"
   defp normalize_mobility(_), do: "medium"
 
   defp normalize_bot_prompt(value) when is_binary(value) do

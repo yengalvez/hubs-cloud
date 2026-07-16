@@ -102,6 +102,28 @@ test("keeps chat disabled until Reticulum supplies an enabled room config", asyn
   assert.equal(response.status, 403);
 });
 
+test("preserves static mobility and never emits navigation actions for static bots", async () => {
+  assert.equal(internals.normalizeConfig({ mobility: "static" }).mobility, "static");
+
+  const config = await post("/internal/bots/room-config", {
+    hub_sid: "room-static",
+    bots: { enabled: true, count: 1, mobility: "static", chat_enabled: true }
+  });
+  assert.equal(config.status, 200);
+
+  const response = await post("/internal/bots/chat", {
+    hub_sid: "room-static",
+    bot_id: "bot-1",
+    requester_id: "account-static",
+    message: "Ve a spawbot-recepcion",
+    context: { waypoints: ["spawbot-recepcion"] }
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.action, null);
+});
+
 test("returns a privacy-safe fallback without echoing the user message", async () => {
   const config = await post("/internal/bots/room-config", {
     hub_sid: "room-a",

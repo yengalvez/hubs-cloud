@@ -174,6 +174,7 @@ defmodule RetWeb.Api.V1.BotController do
 
   defp normalize_mobility("low"), do: "low"
   defp normalize_mobility("high"), do: "high"
+  defp normalize_mobility("static"), do: "static"
   defp normalize_mobility(_), do: "medium"
 
   defp map_get(map, key) do

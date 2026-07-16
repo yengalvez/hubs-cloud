@@ -11,6 +11,8 @@ Options:
 
 const docopt = require("docopt").docopt;
 const { mat4, vec3, quat } = require("gl-matrix");
+const THREE = require("three");
+const { Pathfinding } = require("three-pathfinding");
 
 // Node 20+ has fetch globally, but keep this as a sanity check.
 if (typeof fetch !== "function") {
@@ -244,6 +246,23 @@ function createSceneFetchPolicy(baseUrl, overrides = {}) {
       1,
       1_000_000
     ),
+    maxNavmeshTriangles: parsePositiveInteger(
+      overrides.maxNavmeshTriangles || process.env.GHOST_NAVMESH_MAX_TRIANGLES,
+      50_000,
+      1,
+      200_000
+    ),
+    maxRoutePoints: parsePositiveInteger(
+      overrides.maxRoutePoints || process.env.GHOST_NAVMESH_MAX_ROUTE_POINTS,
+      64,
+      2,
+      256
+    ),
+    navmeshSnapDistanceM: clamp(
+      finiteNumber(overrides.navmeshSnapDistanceM || process.env.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M, 3),
+      0.1,
+      20
+    ),
     fetchImpl: overrides.fetchImpl || fetch
   };
 }
@@ -406,7 +425,47 @@ async function fetchMaybeRange(url, policy, maxInitialBytes = 256 * 1024) {
   };
 }
 
-async function fetchGltfJson(sceneUrl, policy) {
+function parseGlbSceneDescriptor(buffer, sceneUrl, policy) {
+  const gltf = parseGlbJson(buffer, policy);
+  const view = new DataView(buffer);
+  const declaredLength = view.getUint32(8, true);
+  const jsonChunkLength = view.getUint32(12, true);
+  const binHeaderStart = 20 + jsonChunkLength;
+
+  if (declaredLength === binHeaderStart) {
+    return {
+      gltf,
+      sceneUrl,
+      isGlb: true,
+      declaredLength,
+      glbBinStart: null,
+      glbBinLength: 0,
+      fullBuffer: buffer.byteLength >= declaredLength ? buffer : null
+    };
+  }
+
+  if (binHeaderStart + 8 > declaredLength) throw new Error("glb_invalid_bin_chunk");
+  if (binHeaderStart + 8 > view.byteLength) throw new Error("glb_incomplete_bin_header");
+
+  const binLength = view.getUint32(binHeaderStart, true);
+  const binType = view.getUint32(binHeaderStart + 4, true);
+  if (binType !== 0x004e4942) throw new Error("glb_missing_bin_chunk");
+
+  const glbBinStart = binHeaderStart + 8;
+  if (glbBinStart + binLength > declaredLength) throw new Error("glb_invalid_bin_chunk");
+
+  return {
+    gltf,
+    sceneUrl,
+    isGlb: true,
+    declaredLength,
+    glbBinStart,
+    glbBinLength: binLength,
+    fullBuffer: buffer.byteLength >= declaredLength ? buffer : null
+  };
+}
+
+async function fetchGltfScene(sceneUrl, policy) {
   // Try to minimize startup time by fetching only the GLB JSON chunk via range requests.
   const first = await fetchMaybeRange(sceneUrl, policy);
 
@@ -420,7 +479,15 @@ async function fetchGltfJson(sceneUrl, policy) {
     const text = new TextDecoder("utf-8").decode(new Uint8Array(jsonBuffer));
     const parsed = safeJsonParse(text);
     if (!parsed) throw new Error("gltf_invalid_json");
-    return validateGltfShape(parsed, policy);
+    return {
+      gltf: validateGltfShape(parsed, policy),
+      sceneUrl,
+      isGlb: false,
+      declaredLength: jsonBuffer.byteLength,
+      glbBinStart: null,
+      glbBinLength: 0,
+      fullBuffer: jsonBuffer
+    };
   }
 
   // GLB: parse header + JSON chunk length from the partial buffer.
@@ -433,11 +500,13 @@ async function fetchGltfJson(sceneUrl, policy) {
 
   const chunkLength = view.getUint32(12, true);
   if (chunkLength > policy.maxJsonBytes) throw new Error("gltf_json_too_large");
-  const needed = 20 + chunkLength;
+  const jsonEnd = 20 + chunkLength;
+  if (jsonEnd > declaredLength) throw new Error("glb_invalid_length");
+  const needed = declaredLength > jsonEnd ? jsonEnd + 8 : jsonEnd;
   if (needed > declaredLength) throw new Error("glb_invalid_length");
 
   if (needed <= view.byteLength) {
-    return parseGlbJson(first.buffer, policy);
+    return parseGlbSceneDescriptor(first.buffer, sceneUrl, policy);
   }
 
   if (!first.ranged) throw new Error("glb_incomplete_json_chunk");
@@ -453,7 +522,159 @@ async function fetchGltfJson(sceneUrl, policy) {
     secondRes,
     secondRes.status === 206 ? needed : policy.maxSceneBytes
   );
-  return parseGlbJson(secondBuf, policy);
+  return parseGlbSceneDescriptor(secondBuf, sceneUrl, policy);
+}
+
+async function fetchGltfJson(sceneUrl, policy) {
+  return (await fetchGltfScene(sceneUrl, policy)).gltf;
+}
+
+async function fetchSceneByteRange(scene, start, length, policy) {
+  if (!scene || !scene.isGlb || scene.glbBinStart === null) throw new Error("navmesh_requires_glb_bin");
+  if (!Number.isInteger(start) || !Number.isInteger(length) || start < 0 || length <= 0) {
+    throw new Error("gltf_invalid_buffer_range");
+  }
+
+  const end = start + length;
+  if (end > scene.declaredLength) throw new Error("gltf_buffer_range_out_of_bounds");
+  if (
+    start < scene.glbBinStart ||
+    end > scene.glbBinStart + scene.glbBinLength
+  ) {
+    throw new Error("gltf_buffer_range_out_of_bounds");
+  }
+
+  if (scene.fullBuffer) {
+    return scene.fullBuffer.slice(start, end);
+  }
+
+  const response = await fetchWithScenePolicy(
+    scene.sceneUrl,
+    { headers: { Range: `bytes=${start}-${end - 1}` } },
+    policy
+  );
+  if (response.status !== 200 && response.status !== 206) throw new Error(`scene_http_${response.status}`);
+
+  const buffer = await readResponseBodyLimited(
+    response,
+    response.status === 206 ? length : policy.maxSceneBytes
+  );
+
+  if (response.status === 206) {
+    if (buffer.byteLength !== length) throw new Error("gltf_incomplete_buffer_range");
+    return buffer;
+  }
+
+  if (end > buffer.byteLength) throw new Error("gltf_incomplete_buffer_range");
+  return buffer.slice(start, end);
+}
+
+const ACCESSOR_COMPONENTS = {
+  SCALAR: 1,
+  VEC2: 2,
+  VEC3: 3,
+  VEC4: 4,
+  MAT2: 4,
+  MAT3: 9,
+  MAT4: 16
+};
+
+const COMPONENT_BYTES = {
+  5120: 1,
+  5121: 1,
+  5122: 2,
+  5123: 2,
+  5125: 4,
+  5126: 4
+};
+
+function readComponent(view, byteOffset, componentType) {
+  switch (componentType) {
+    case 5120:
+      return view.getInt8(byteOffset);
+    case 5121:
+      return view.getUint8(byteOffset);
+    case 5122:
+      return view.getInt16(byteOffset, true);
+    case 5123:
+      return view.getUint16(byteOffset, true);
+    case 5125:
+      return view.getUint32(byteOffset, true);
+    case 5126:
+      return view.getFloat32(byteOffset, true);
+    default:
+      throw new Error("gltf_unsupported_component_type");
+  }
+}
+
+async function readAccessor(scene, accessorIndex, policy, cache = new Map()) {
+  const gltf = scene.gltf;
+  const accessors = Array.isArray(gltf.accessors) ? gltf.accessors : [];
+  const bufferViews = Array.isArray(gltf.bufferViews) ? gltf.bufferViews : [];
+  const accessor = accessors[accessorIndex];
+  if (!accessor || typeof accessor !== "object") throw new Error("gltf_invalid_accessor");
+  if (accessor.sparse) throw new Error("gltf_sparse_accessor_not_supported");
+  if (!Number.isInteger(accessor.bufferView)) throw new Error("gltf_accessor_without_buffer_view");
+
+  const bufferView = bufferViews[accessor.bufferView];
+  if (!bufferView || typeof bufferView !== "object") throw new Error("gltf_invalid_buffer_view");
+  if ((bufferView.buffer || 0) !== 0) throw new Error("gltf_external_buffer_not_supported");
+
+  const itemSize = ACCESSOR_COMPONENTS[accessor.type];
+  const componentBytes = COMPONENT_BYTES[accessor.componentType];
+  const count = Number(accessor.count);
+  if (!itemSize || !componentBytes || !Number.isInteger(count) || count < 0) {
+    throw new Error("gltf_invalid_accessor");
+  }
+
+  const viewByteOffset = Number(bufferView.byteOffset || 0);
+  const viewByteLength = Number(bufferView.byteLength);
+  const accessorByteOffset = Number(accessor.byteOffset || 0);
+  const elementBytes = itemSize * componentBytes;
+  const byteStride = Number(bufferView.byteStride || elementBytes);
+  if (
+    !Number.isInteger(viewByteOffset) ||
+    !Number.isInteger(viewByteLength) ||
+    !Number.isInteger(accessorByteOffset) ||
+    !Number.isInteger(byteStride) ||
+    viewByteOffset < 0 ||
+    viewByteLength <= 0 ||
+    accessorByteOffset < 0 ||
+    byteStride < elementBytes
+  ) {
+    throw new Error("gltf_invalid_buffer_view");
+  }
+
+  const requiredBytes = count === 0 ? 0 : accessorByteOffset + (count - 1) * byteStride + elementBytes;
+  if (requiredBytes > viewByteLength) throw new Error("gltf_accessor_out_of_bounds");
+
+  const cacheKey = `${viewByteOffset}:${viewByteLength}`;
+  let buffer = cache.get(cacheKey);
+  if (!buffer) {
+    const absoluteStart = scene.glbBinStart + viewByteOffset;
+    buffer = await fetchSceneByteRange(scene, absoluteStart, viewByteLength, policy);
+    cache.set(cacheKey, buffer);
+  }
+
+  const dataView = new DataView(buffer);
+  const values = new Float64Array(count * itemSize);
+  for (let itemIndex = 0; itemIndex < count; itemIndex++) {
+    const elementOffset = accessorByteOffset + itemIndex * byteStride;
+    for (let componentIndex = 0; componentIndex < itemSize; componentIndex++) {
+      values[itemIndex * itemSize + componentIndex] = readComponent(
+        dataView,
+        elementOffset + componentIndex * componentBytes,
+        accessor.componentType
+      );
+    }
+  }
+
+  return {
+    values,
+    count,
+    itemSize,
+    componentType: accessor.componentType
+  };
 }
 
 function nodeLocalMatrix(node) {
@@ -626,6 +847,225 @@ function extractWaypointsAndColliders(gltf) {
   };
 }
 
+async function extractNavMeshGeometry(scene, policy) {
+  if (!scene || !scene.isGlb || scene.glbBinStart === null) return null;
+
+  const gltf = scene.gltf;
+  const nodes = Array.isArray(gltf.nodes) ? gltf.nodes : [];
+  const meshes = Array.isArray(gltf.meshes) ? gltf.meshes : [];
+  const worldMatrices = computeWorldNodeMatrices(gltf);
+  const bufferCache = new Map();
+  const positions = [];
+  const indices = [];
+  let triangleCount = 0;
+
+  for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
+    const node = nodes[nodeIndex];
+    const components = getHubsComponents(node);
+    const hasNavMesh =
+      !!components &&
+      (Object.prototype.hasOwnProperty.call(components, "nav-mesh") ||
+        Object.prototype.hasOwnProperty.call(components, "nav_mesh"));
+    if (!hasNavMesh || !Number.isInteger(node.mesh)) continue;
+
+    const mesh = meshes[node.mesh];
+    const primitives = mesh && Array.isArray(mesh.primitives) ? mesh.primitives : [];
+    const world = worldMatrices[nodeIndex];
+    if (!world) continue;
+
+    for (let primitiveIndex = 0; primitiveIndex < primitives.length; primitiveIndex++) {
+      const primitive = primitives[primitiveIndex];
+      if (!primitive || (primitive.mode !== undefined && primitive.mode !== 4)) continue;
+
+      const positionAccessorIndex = primitive.attributes && primitive.attributes.POSITION;
+      if (!Number.isInteger(positionAccessorIndex)) continue;
+
+      // eslint-disable-next-line no-await-in-loop
+      const positionAccessor = await readAccessor(scene, positionAccessorIndex, policy, bufferCache);
+      if (positionAccessor.itemSize !== 3 || positionAccessor.componentType !== 5126) {
+        throw new Error("navmesh_position_accessor_invalid");
+      }
+
+      const baseVertex = positions.length / 3;
+      const tmpPosition = vec3.create();
+      for (let vertexIndex = 0; vertexIndex < positionAccessor.count; vertexIndex++) {
+        const offset = vertexIndex * 3;
+        vec3.set(
+          tmpPosition,
+          positionAccessor.values[offset],
+          positionAccessor.values[offset + 1],
+          positionAccessor.values[offset + 2]
+        );
+        vec3.transformMat4(tmpPosition, tmpPosition, world);
+        positions.push(tmpPosition[0], tmpPosition[1], tmpPosition[2]);
+      }
+
+      let primitiveIndices;
+      if (Number.isInteger(primitive.indices)) {
+        // eslint-disable-next-line no-await-in-loop
+        const indexAccessor = await readAccessor(scene, primitive.indices, policy, bufferCache);
+        if (
+          indexAccessor.itemSize !== 1 ||
+          ![5121, 5123, 5125].includes(indexAccessor.componentType) ||
+          indexAccessor.count % 3 !== 0
+        ) {
+          throw new Error("navmesh_index_accessor_invalid");
+        }
+        primitiveIndices = indexAccessor.values;
+      } else {
+        if (positionAccessor.count % 3 !== 0) throw new Error("navmesh_nonindexed_triangle_count_invalid");
+        primitiveIndices = Array.from({ length: positionAccessor.count }, (_value, index) => index);
+      }
+
+      triangleCount += primitiveIndices.length / 3;
+      if (triangleCount > policy.maxNavmeshTriangles) throw new Error("navmesh_too_many_triangles");
+
+      for (let index = 0; index < primitiveIndices.length; index++) {
+        const localIndex = Number(primitiveIndices[index]);
+        if (!Number.isInteger(localIndex) || localIndex < 0 || localIndex >= positionAccessor.count) {
+          throw new Error("navmesh_index_out_of_bounds");
+        }
+        indices.push(baseVertex + localIndex);
+      }
+    }
+  }
+
+  if (!triangleCount || !positions.length || !indices.length) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  return { geometry, triangleCount };
+}
+
+function createNavMeshPlanner(navMesh, policy) {
+  if (!navMesh || !navMesh.geometry || !navMesh.triangleCount) return null;
+
+  const zoneId = "ghost-navmesh";
+  const pathfinder = new Pathfinding();
+  const zoneData = Pathfinding.createZone(navMesh.geometry);
+  if (!zoneData || !Array.isArray(zoneData.groups) || !zoneData.groups.length) return null;
+  pathfinder.setZoneData(zoneId, zoneData);
+
+  const triangles = [];
+  for (let group = 0; group < zoneData.groups.length; group++) {
+    const polygons = zoneData.groups[group] || [];
+    for (let polygonIndex = 0; polygonIndex < polygons.length; polygonIndex++) {
+      const polygon = polygons[polygonIndex];
+      const a = zoneData.vertices[polygon.vertexIds[0]];
+      const b = zoneData.vertices[polygon.vertexIds[1]];
+      const c = zoneData.vertices[polygon.vertexIds[2]];
+      if (!a || !b || !c) continue;
+      triangles.push({ group, triangle: new THREE.Triangle(a, b, c) });
+    }
+  }
+
+  const projectPoint = position => {
+    if (!Array.isArray(position) || position.length < 3 || !triangles.length) return null;
+    const source = new THREE.Vector3(
+      finiteNumber(position[0]),
+      finiteNumber(position[1]),
+      finiteNumber(position[2])
+    );
+    const candidate = new THREE.Vector3();
+    const closest = new THREE.Vector3();
+    let closestGroup = null;
+    let closestDistanceSq = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < triangles.length; index++) {
+      const entry = triangles[index];
+      entry.triangle.closestPointToPoint(source, candidate);
+      const distanceSq = candidate.distanceToSquared(source);
+      if (distanceSq >= closestDistanceSq) continue;
+      closestDistanceSq = distanceSq;
+      closestGroup = entry.group;
+      closest.copy(candidate);
+    }
+
+    if (closestGroup === null || Math.sqrt(closestDistanceSq) > policy.navmeshSnapDistanceM) return null;
+    return {
+      group: closestGroup,
+      position: [closest.x, closest.y, closest.z],
+      vector: closest.clone(),
+      distance: Math.sqrt(closestDistanceSq)
+    };
+  };
+
+  const findRoute = (from, to) => {
+    const start = projectPoint(from);
+    const target = projectPoint(to);
+    if (!start || !target || start.group !== target.group) return null;
+
+    let path;
+    try {
+      path = pathfinder.findPath(start.vector, target.vector, zoneId, start.group);
+    } catch (_error) {
+      return null;
+    }
+    if (!Array.isArray(path)) return null;
+
+    const route = [start.position];
+    for (let index = 0; index < path.length; index++) {
+      const point = path[index];
+      if (!point) continue;
+      const next = [point.x, point.y, point.z];
+      const previous = route[route.length - 1];
+      if (Math.hypot(next[0] - previous[0], next[1] - previous[1], next[2] - previous[2]) <= 0.01) {
+        continue;
+      }
+      route.push(next);
+      if (route.length > policy.maxRoutePoints) return null;
+    }
+
+    const last = route[route.length - 1];
+    if (
+      Math.hypot(
+        target.position[0] - last[0],
+        target.position[1] - last[1],
+        target.position[2] - last[2]
+      ) > 0.01
+    ) {
+      route.push(target.position);
+    }
+
+    return route.length >= 2 ? route : null;
+  };
+
+  return {
+    triangleCount: navMesh.triangleCount,
+    groupCount: zoneData.groups.length,
+    projectPoint,
+    findRoute
+  };
+}
+
+function projectWaypointsToNavmesh(points, planner) {
+  if (!planner) return points;
+
+  const projectedByPoint = new Map();
+  const project = point => {
+    if (projectedByPoint.has(point)) return projectedByPoint.get(point);
+    const projected = planner.projectPoint(point.position);
+    const next = projected
+      ? {
+          ...point,
+          position: projected.position,
+          navGroup: projected.group
+        }
+      : null;
+    projectedByPoint.set(point, next);
+    return next;
+  };
+  const projectList = list => list.map(project).filter(Boolean);
+
+  return {
+    ...points,
+    allWaypoints: projectList(points.allWaypoints),
+    spawnFlagPoints: projectList(points.spawnFlagPoints),
+    namedSpawbots: projectList(points.namedSpawbots)
+  };
+}
+
 function pickSpawnAndPatrolPoints(points) {
   const all = points.allWaypoints;
   const spawnFlag = points.spawnFlagPoints;
@@ -706,7 +1146,7 @@ function isPathClearWithColliders(colliders, from, to, endpointEpsilonM = 0.1) {
 function normalizeBotsConfig(bots) {
   const source = bots && typeof bots === "object" ? bots : {};
   const rawCount = Number(source.count || 0);
-  const mobility = source.mobility === "low" || source.mobility === "high" ? source.mobility : "medium";
+  const mobility = ["static", "low", "medium", "high"].includes(source.mobility) ? source.mobility : "medium";
   return {
     enabled: !!source.enabled,
     count: Number.isFinite(rawCount) ? clamp(Math.floor(rawCount), 0, 10) : 0,
@@ -716,6 +1156,7 @@ function normalizeBotsConfig(bots) {
 }
 
 const MOBILITY_BEHAVIOR = {
+  static: { speedMps: 0, idleMinMs: Number.POSITIVE_INFINITY, idleMaxMs: Number.POSITIVE_INFINITY },
   low: { speedMps: 0.45, idleMinMs: 8000, idleMaxMs: 22000 },
   medium: { speedMps: 0.75, idleMinMs: 4500, idleMaxMs: 14000 },
   high: { speedMps: 1.05, idleMinMs: 2500, idleMaxMs: 8000 }
@@ -728,6 +1169,7 @@ function randomIdleDurationMs(mobility) {
 }
 
 function initialIdleDurationMs(mobility) {
+  if (mobility === "static") return Number.POSITIVE_INFINITY;
   if (mobility === "low") return 2000 + Math.floor(Math.random() * 3000);
   if (mobility === "high") return 800 + Math.floor(Math.random() * 1000);
   return 1200 + Math.floor(Math.random() * 1300);
@@ -882,8 +1324,13 @@ async function main() {
 
   const botAccessKey = process.env.BOT_ACCESS_KEY || "";
   const raycastMode = (process.env.GHOST_RAYCAST_MODE || "spoke_colliders").trim().toLowerCase();
+  const navigationMode =
+    (process.env.GHOST_NAVIGATION_MODE || "navmesh_preferred").trim().toLowerCase() === "colliders"
+      ? "colliders"
+      : "navmesh_preferred";
   const pathStartDelayMs = Number(process.env.PATH_START_DELAY_MS || 450);
   const minWalkDurationMs = Number(process.env.MIN_WALK_DURATION_MS || 600);
+  const minRouteSegmentDurationMs = Number(process.env.MIN_ROUTE_SEGMENT_DURATION_MS || 150);
   const fullSyncBurstRepeats = clamp(Number(process.env.GHOST_FULL_SYNC_BURST_REPEATS || 6), 1, 20);
   const fullSyncBurstIntervalMs = Math.max(250, Number(process.env.GHOST_FULL_SYNC_BURST_INTERVAL_MS || 750));
   const fullSyncBurstInitialDelayMs = Math.max(
@@ -983,7 +1430,13 @@ async function main() {
   }
 
   // Keep these cached and refresh periodically.
-  let waypointData = { spawnPoints: [], patrolPoints: [], allWaypoints: [], colliders: [] };
+  let waypointData = {
+    spawnPoints: [],
+    patrolPoints: [],
+    allWaypoints: [],
+    colliders: [],
+    navPlanner: null
+  };
   let avatarRefs = [];
   let fullbodyRefs = [];
   let avatarRotationOffset = Math.floor(Math.random() * 1000);
@@ -1040,7 +1493,11 @@ async function main() {
       const spawnPoints = waypointData.spawnPoints.length ? waypointData.spawnPoints : waypointData.patrolPoints;
       const spawn = spawnPoints.length ? spawnPoints[index % spawnPoints.length] : null;
       const basePos = spawn ? spawn.position : [0, 0, 0];
-      const pos = separateNearbyPosition(basePos, index, usedPositions);
+      let pos = separateNearbyPosition(basePos, index, usedPositions);
+      if (waypointData.navPlanner) {
+        const projected = waypointData.navPlanner.projectPoint(pos);
+        pos = projected ? projected.position : [basePos[0], basePos[1], basePos[2]];
+      }
       usedPositions.push(pos);
 
       const avatarId = pickAvatarId(botId, avatarRefs, fullbodyRefs, avatarRotationOffset);
@@ -1075,7 +1532,8 @@ async function main() {
         mobility: botsConfig.mobility,
         destination: null,
         reservedTargetName: null,
-        path: null
+        path: null,
+        routePoints: []
       });
 
       changed = true;
@@ -1083,7 +1541,18 @@ async function main() {
 
     // Update mobility on existing bots.
     bots.forEach(record => {
+      if (record.mobility === botsConfig.mobility) return;
+
+      const previousMobility = record.mobility;
+      updateRecordPositionFromPath(record, nowMs);
       record.mobility = botsConfig.mobility;
+      changed = true;
+
+      if (record.mobility === "static") {
+        setIdle(record, nowMs);
+      } else if (previousMobility === "static") {
+        record.stateEndsAt = nowMs + initialIdleDurationMs(record.mobility);
+      }
     });
 
     return changed;
@@ -1118,7 +1587,27 @@ async function main() {
     reservedTargets.set(targetName, record.id);
   };
 
-  const pickPatrolPoint = (record, excludeName) => {
+  const planRouteToPoint = (record, point) => {
+    if (!record || !point) return null;
+
+    if (waypointData.navPlanner) {
+      return waypointData.navPlanner.findRoute(record.position, point.position);
+    }
+
+    if (
+      raycastMode === "spoke_colliders" &&
+      !isPathClearWithColliders(waypointData.colliders, record.position, point.position)
+    ) {
+      return null;
+    }
+
+    return [
+      [record.position[0], record.position[1], record.position[2]],
+      [point.position[0], point.position[1], point.position[2]]
+    ];
+  };
+
+  const pickPatrolPlan = (record, excludeName) => {
     const points = waypointData.patrolPoints;
     if (!points.length) return null;
     const botId = record.id;
@@ -1136,7 +1625,6 @@ async function main() {
     const source = candidates.length ? candidates : points.filter(p => p && p.name !== excludeName);
     if (!source.length) return null;
 
-    // Prefer reachable points if raycast is enabled.
     const shuffled = source.slice();
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -1149,90 +1637,11 @@ async function main() {
     for (let i = 0; i < maxAttempts; i++) {
       const point = shuffled[i];
       if (!point) continue;
-      if (raycastMode === "spoke_colliders") {
-        if (!isPathClearWithColliders(waypointData.colliders, record.position, point.position)) continue;
-      }
-      return point;
+      const route = planRouteToPoint(record, point);
+      if (route) return { target: point, route };
     }
 
-    return source[Math.floor(Math.random() * source.length)];
-  };
-
-  const startWalking = (record, desiredWaypointName, nowMs) => {
-    updateRecordPositionFromPath(record, nowMs);
-
-    let target = null;
-    if (desiredWaypointName) {
-      const desired = String(desiredWaypointName).trim().toLowerCase();
-      target = waypointData.allWaypoints.find(p => (p.name || "").trim().toLowerCase() === desired) || null;
-      if (target && raycastMode === "spoke_colliders") {
-        if (!isPathClearWithColliders(waypointData.colliders, record.position, target.position)) {
-          log(`[ghost] Commanded waypoint blocked, skipping: ${desired}`);
-          target = null;
-        }
-      }
-    }
-
-    if (!target) {
-      target = pickPatrolPoint(record, record.destination && record.destination.name);
-    }
-
-    if (!target) {
-      // Wander near home if we have no patrol points.
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 0.8 + Math.random() * 1.2;
-      target = {
-        name: "__wander__",
-        position: [record.homePosition[0] + Math.cos(angle) * radius, record.position[1], record.homePosition[2] + Math.sin(angle) * radius]
-      };
-    }
-
-    if (target.name && target.name !== "__wander__") {
-      reserveTarget(record, target.name);
-    } else {
-      releaseReservation(record);
-    }
-
-    const behavior = MOBILITY_BEHAVIOR[record.mobility] || MOBILITY_BEHAVIOR.medium;
-    const startPos = [record.position[0], record.position[1], record.position[2]];
-    const destination = separateNearbyPosition(target.position, botIndexFromId(record.id), []);
-    const endPos = [destination[0], destination[1], destination[2]];
-
-    const dx = endPos[0] - startPos[0];
-    const dz = endPos[2] - startPos[2];
-    const distance = Math.hypot(dx, dz);
-    if (distance <= 0.08) {
-      record.state = "idle";
-      record.destination = null;
-      record.path = null;
-      record.stateEndsAt = nowMs + 800;
-      return;
-    }
-
-    const speedMps = Math.max(0.05, Number(behavior.speedMps) || 0.75);
-    const durMs = Math.max(minWalkDurationMs, (distance / speedMps) * 1000);
-    const t0 = nowMs + pathStartDelayMs;
-
-    const desiredYaw = normalizeAngleDeg((Math.atan2(dx, dz) * 180) / Math.PI);
-    const yaw0 = normalizeAngleDeg(record.yawDeg);
-    const yaw1 = desiredYaw;
-
-    record.state = "walk";
-    record.destination = { name: target.name, position: endPos };
-    record.path = { startPos, endPos, t0, dur: durMs, yaw0, yaw1 };
-    record.stateEndsAt = t0 + durMs;
-    record.yawDeg = yaw1;
-
-    sendNafr(
-      channel,
-      updateEntityPayload({
-        networkId: record.networkId,
-        owner: sessionId,
-        creator: sessionId,
-        lastOwnerTime: record.lastOwnerTime,
-        components: { 0: buildBotPathSegment(record.path) }
-      })
-    );
+    return null;
   };
 
   const setIdle = (record, nowMs) => {
@@ -1242,7 +1651,10 @@ async function main() {
     record.destination = null;
     releaseReservation(record);
     record.path = null;
-    record.stateEndsAt = nowMs + randomIdleDurationMs(record.mobility);
+    record.routePoints = [];
+    record.routeUsesNavmesh = false;
+    record.stateEndsAt =
+      record.mobility === "static" ? Number.POSITIVE_INFINITY : nowMs + randomIdleDurationMs(record.mobility);
 
     sendNafr(
       channel,
@@ -1254,6 +1666,117 @@ async function main() {
         components: { 0: buildBotPathFreeze(record.position, record.yawDeg, nowMs) }
       })
     );
+  };
+
+  const startNextRouteSegment = (record, nowMs, segmentStartAt) => {
+    const behavior = MOBILITY_BEHAVIOR[record.mobility] || MOBILITY_BEHAVIOR.medium;
+    const speedMps = Math.max(0.05, Number(behavior.speedMps) || 0.75);
+
+    while (record.routePoints.length) {
+      const endPos = record.routePoints.shift();
+      const startPos = [record.position[0], record.position[1], record.position[2]];
+      const dx = endPos[0] - startPos[0];
+      const dy = endPos[1] - startPos[1];
+      const dz = endPos[2] - startPos[2];
+      const distance = Math.hypot(dx, dy, dz);
+
+      if (distance <= 0.02) {
+        record.position = [endPos[0], endPos[1], endPos[2]];
+        continue;
+      }
+
+      const minimumDuration = record.routeUsesNavmesh ? minRouteSegmentDurationMs : minWalkDurationMs;
+      const durMs = Math.max(minimumDuration, (distance / speedMps) * 1000);
+      const t0 = Number.isFinite(segmentStartAt) ? segmentStartAt : nowMs + pathStartDelayMs;
+      const desiredYaw =
+        Math.hypot(dx, dz) > 0.001
+          ? normalizeAngleDeg((Math.atan2(dx, dz) * 180) / Math.PI)
+          : normalizeAngleDeg(record.yawDeg);
+      const yaw0 = normalizeAngleDeg(record.yawDeg);
+
+      record.state = "walk";
+      record.path = { startPos, endPos, t0, dur: durMs, yaw0, yaw1: desiredYaw };
+      record.stateEndsAt = t0 + durMs;
+      record.yawDeg = desiredYaw;
+
+      sendNafr(
+        channel,
+        updateEntityPayload({
+          networkId: record.networkId,
+          owner: sessionId,
+          creator: sessionId,
+          lastOwnerTime: record.lastOwnerTime,
+          components: { 0: buildBotPathSegment(record.path) }
+        })
+      );
+      return true;
+    }
+
+    return false;
+  };
+
+  const startWalking = (record, desiredWaypointName, nowMs) => {
+    updateRecordPositionFromPath(record, nowMs);
+
+    if (record.mobility === "static") {
+      setIdle(record, nowMs);
+      return;
+    }
+
+    let plan = null;
+    if (desiredWaypointName) {
+      const desired = String(desiredWaypointName).trim().toLowerCase();
+      const target =
+        waypointData.allWaypoints.find(p => (p.name || "").trim().toLowerCase() === desired) || null;
+      const route = target ? planRouteToPoint(record, target) : null;
+      if (target && route) {
+        plan = { target, route };
+      } else {
+        log(`[ghost] Commanded waypoint is not reachable, skipping: ${desired}`);
+      }
+    }
+
+    if (!plan) {
+      plan = pickPatrolPlan(record, record.destination && record.destination.name);
+    }
+
+    if (!plan && !waypointData.navPlanner) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 0.8 + Math.random() * 1.2;
+      const target = {
+        name: "__wander__",
+        position: [
+          record.homePosition[0] + Math.cos(angle) * radius,
+          record.position[1],
+          record.homePosition[2] + Math.sin(angle) * radius
+        ]
+      };
+      const route = planRouteToPoint(record, target);
+      if (route) plan = { target, route };
+    }
+
+    if (!plan || !Array.isArray(plan.route) || plan.route.length < 2) {
+      setIdle(record, nowMs);
+      return;
+    }
+
+    if (plan.target.name && plan.target.name !== "__wander__") {
+      reserveTarget(record, plan.target.name);
+    } else {
+      releaseReservation(record);
+    }
+
+    record.destination = {
+      name: plan.target.name,
+      position: [...plan.route[plan.route.length - 1]]
+    };
+    record.path = null;
+    record.routePoints = plan.route.slice(1).map(point => [point[0], point[1], point[2]]);
+    record.routeUsesNavmesh = !!waypointData.navPlanner;
+
+    if (!startNextRouteSegment(record, nowMs, nowMs + pathStartDelayMs)) {
+      setIdle(record, nowMs);
+    }
   };
 
   const broadcastFullSync = nowMs => {
@@ -1300,6 +1823,7 @@ async function main() {
     if (!botId) return;
     const record = bots.get(botId);
     if (!record) return;
+    if (record.mobility === "static") return;
     if (body.type === "go_to_waypoint" && body.waypoint) {
       startWalking(record, String(body.waypoint), timekeeper.nowMs());
     }
@@ -1359,17 +1883,47 @@ async function main() {
   }
 
   const initScenePromise = sceneUrl
-    ? fetchGltfJson(sceneUrl, sceneFetchPolicy)
-        .then(gltf => {
-          const extracted = extractWaypointsAndColliders(gltf);
-          const points = pickSpawnAndPatrolPoints(extracted);
+    ? fetchGltfScene(sceneUrl, sceneFetchPolicy)
+        .then(async scene => {
+          const extracted = extractWaypointsAndColliders(scene.gltf);
+          let navPlanner = null;
+
+          if (navigationMode === "navmesh_preferred") {
+            try {
+              const navMesh = await extractNavMeshGeometry(scene, sceneFetchPolicy);
+              navPlanner = createNavMeshPlanner(navMesh, sceneFetchPolicy);
+              if (navMesh && navMesh.geometry) navMesh.geometry.dispose();
+            } catch (error) {
+              log("Navmesh rejected. Falling back to collider/direct waypoint movement.", error.message);
+            }
+          }
+
+          let navigable = projectWaypointsToNavmesh(extracted, navPlanner);
+          if (navPlanner && extracted.allWaypoints.length && !navigable.allWaypoints.length) {
+            log("No waypoints could be projected to the navmesh. Disabling navmesh for this scene.");
+            navPlanner = null;
+            navigable = extracted;
+          }
+          const points = pickSpawnAndPatrolPoints(navigable);
           waypointData = {
             ...points,
-            allWaypoints: extracted.allWaypoints,
-            colliders: extracted.colliders
+            allWaypoints: navigable.allWaypoints,
+            colliders: extracted.colliders,
+            navPlanner
           };
-          if (raycastMode === "spoke_colliders" && (!waypointData.colliders || waypointData.colliders.length === 0)) {
+          if (
+            !navPlanner &&
+            raycastMode === "spoke_colliders" &&
+            (!waypointData.colliders || waypointData.colliders.length === 0)
+          ) {
             log("No box-colliders found in scene. Raycast fallback -> allow.");
+          }
+          if (navPlanner) {
+            log(
+              `Navmesh ready: triangles=${navPlanner.triangleCount} groups=${navPlanner.groupCount} mode=${navigationMode}`
+            );
+          } else if (navigationMode === "navmesh_preferred") {
+            log("No valid navmesh found. Falling back to collider/direct waypoint movement.");
           }
           log(
             `Waypoints: all=${waypointData.allWaypoints.length} spawn=${waypointData.spawnPoints.length} patrol=${waypointData.patrolPoints.length} colliders=${waypointData.colliders.length}`
@@ -1425,9 +1979,14 @@ async function main() {
     bots.forEach(record => {
       updateRecordPositionFromPath(record, now);
       if (record.state === "idle") {
-        if (now >= record.stateEndsAt) startWalking(record, null, now);
+        if (record.mobility !== "static" && now >= record.stateEndsAt) startWalking(record, null, now);
       } else if (record.state === "walk") {
-        if (now >= record.stateEndsAt) setIdle(record, now);
+        if (now >= record.stateEndsAt) {
+          const nextSegmentStartAt = record.stateEndsAt;
+          if (!record.routePoints.length || !startNextRouteSegment(record, now, nextSegmentStartAt)) {
+            setIdle(record, now);
+          }
+        }
       }
     });
   };
@@ -1474,10 +2033,16 @@ module.exports = {
   main,
   internals: {
     computeWorldNodeMatrices,
+    createNavMeshPlanner,
     createSceneFetchPolicy,
+    extractNavMeshGeometry,
     extractWaypointsAndColliders,
     fetchGltfJson,
+    fetchGltfScene,
+    normalizeBotsConfig,
     parseGlbJson,
+    projectWaypointsToNavmesh,
+    readAccessor,
     validateGltfShape,
     validateSceneUrl
   }

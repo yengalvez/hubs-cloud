@@ -342,6 +342,19 @@ if (!fs.existsSync(manifestPath)) {
     if (security.seccompProfile?.type !== "RuntimeDefault") {
       fail("bot-orchestrator container must use the RuntimeDefault seccomp profile");
     }
+    const botEnv = Object.fromEntries(
+      (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
+    );
+    if (botEnv.GHOST_NAVIGATION_MODE !== "navmesh_preferred") {
+      fail("bot-orchestrator must prefer navmesh navigation");
+    }
+    if (
+      Number(botEnv.GHOST_NAVMESH_MAX_TRIANGLES) !== 50000 ||
+      Number(botEnv.GHOST_NAVMESH_MAX_ROUTE_POINTS) !== 64 ||
+      Number(botEnv.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) !== 3
+    ) {
+      fail("bot-orchestrator navmesh safety limits do not match the audited baseline");
+    }
   }
 
   const dialogContainer = dialog?.spec?.template?.spec?.containers?.find(container => container.name === "dialog");

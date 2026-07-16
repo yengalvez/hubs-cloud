@@ -17,6 +17,10 @@ const RUNNER_BACKEND_CANARY_HUBS = (process.env.RUNNER_BACKEND_CANARY_HUBS || ""
   .filter(Boolean);
 const CANARY_HUB_SET = new Set(RUNNER_BACKEND_CANARY_HUBS);
 const GHOST_RUNNER_SCRIPT = process.env.GHOST_RUNNER_SCRIPT || "";
+const GHOST_NAVIGATION_MODE =
+  (process.env.GHOST_NAVIGATION_MODE || "navmesh_preferred").trim().toLowerCase() === "colliders"
+    ? "colliders"
+    : "navmesh_preferred";
 const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
 const RET_INTERNAL_ENDPOINT = (process.env.RET_INTERNAL_ENDPOINT || "http://ret:4001").replace(/\/+$/, "");
 const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/configured_with_bots";
@@ -263,7 +267,7 @@ function parseStructuredReply(responseText, knownWaypoints) {
 }
 
 function normalizeMobility(value) {
-  if (value === "low" || value === "medium" || value === "high") return value;
+  if (value === "static" || value === "low" || value === "medium" || value === "high") return value;
   return "medium";
 }
 
@@ -368,6 +372,8 @@ function detectWaypointAction(message, context) {
 
 function mobilityReply(config) {
   switch (config.mobility) {
+    case "static":
+      return "Estoy configurado como inmóvil y permaneceré en este punto.";
     case "low":
       return "Estoy en movilidad baja y permaneceré quieto la mayor parte del tiempo.";
     case "high":
@@ -385,7 +391,7 @@ function deterministicResponse({ message, botId, botsConfig, context }) {
 
   return {
     reply,
-    action: detectWaypointAction(message, context)
+    action: botsConfig.mobility === "static" ? null : detectWaypointAction(message, context)
   };
 }
 
@@ -835,6 +841,7 @@ app.get("/health", (_req, res) => {
     model: OPENAI_MODEL,
     runner_backend_default: normalizedBackend(RUNNER_BACKEND),
     runner_backend_canary_hubs: RUNNER_BACKEND_CANARY_HUBS,
+    ghost_navigation_mode: GHOST_NAVIGATION_MODE,
     runner_backends,
     active_hubs: Array.from(roomRunners.keys()),
     queued_hubs: [...queuedRunnerHubs]
@@ -968,7 +975,9 @@ app.post("/internal/bots/chat", authMiddleware, async (req, res) => {
       return;
     }
 
-    if (!response.action) {
+    if (botsConfig.mobility === "static") {
+      response.action = null;
+    } else if (!response.action) {
       response.action = detectWaypointAction(message, context);
     }
 

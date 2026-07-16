@@ -222,6 +222,18 @@ function main() {
     if (!processedConfig.GHOST_RAYCAST_MODE) {
       processedConfig.GHOST_RAYCAST_MODE = "spoke_colliders";
     }
+    if (String(processedConfig.GHOST_NAVIGATION_MODE || "").toLowerCase().trim() !== "colliders") {
+      processedConfig.GHOST_NAVIGATION_MODE = "navmesh_preferred";
+    }
+    if (!processedConfig.GHOST_NAVMESH_MAX_TRIANGLES) {
+      processedConfig.GHOST_NAVMESH_MAX_TRIANGLES = "50000";
+    }
+    if (!processedConfig.GHOST_NAVMESH_MAX_ROUTE_POINTS) {
+      processedConfig.GHOST_NAVMESH_MAX_ROUTE_POINTS = "64";
+    }
+    if (!processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) {
+      processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M = "3";
+    }
     if (!processedConfig.MAX_ACTIVE_ROOMS) {
       processedConfig.MAX_ACTIVE_ROOMS = "5";
     }

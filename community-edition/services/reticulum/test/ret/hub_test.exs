@@ -246,4 +246,22 @@ defmodule Ret.HubTest do
     assert bots["chat_enabled"]
     assert String.length(bots["prompt"]) == 1_500
   end
+
+  test "preserves static room bot mobility", %{scene: scene} do
+    changeset =
+      Hub.changeset(%Hub{}, scene, %{
+        name: "Static Bot Hub",
+        user_data: %{
+          "bots" => %{
+            "enabled" => true,
+            "count" => 2,
+            "mobility" => "static"
+          }
+        }
+      })
+
+    bots = Ecto.Changeset.get_change(changeset, :user_data)["bots"]
+
+    assert bots["mobility"] == "static"
+  end
 end
