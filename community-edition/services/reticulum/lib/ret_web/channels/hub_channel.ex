@@ -20,6 +20,7 @@ defmodule RetWeb.HubChannel do
     Storage,
     SessionStat,
     Statix,
+    WaypointReservation,
     WebPushSubscription
   }
 
@@ -61,7 +62,8 @@ defmodule RetWeb.HubChannel do
         "auth_token",
         "perms_token",
         "bot_access_key",
-        "hub_invite_id"
+        "hub_invite_id",
+        "waypoint_reservation"
       ])
     )
   end
@@ -421,6 +423,34 @@ defmodule RetWeb.HubChannel do
     Statix.increment("ret.channels.hub.event_entered", 1)
 
     {:noreply, socket}
+  end
+
+  def handle_in("waypoint_reservation:request", payload, socket) do
+    reservation = socket.assigns.waypoint_reservation
+
+    if reservation.supported do
+      context = socket.assigns.context || %{}
+
+      result =
+        WaypointReservation.request(
+          reservation.hub_id,
+          socket.assigns.session_id,
+          reservation.client_instance_id,
+          reservation.channel_id,
+          payload,
+          %{
+            allowed: socket.assigns.presence == :room || context["entering"] == true,
+            bot_runner: reservation.bot_runner
+          }
+        )
+
+      broadcast_waypoint_states(socket, result.states)
+      reply_status = if result.response["status"] == "ok", do: :ok, else: :error
+      {:reply, {reply_status, result.response}, socket}
+    else
+      response = WaypointReservation.unsupported_response(payload)
+      {:reply, {:error, response}, socket}
+    end
   end
 
   def handle_in("events:object_spawned", %{"object_type" => object_type}, socket) do
@@ -1281,6 +1311,11 @@ defmodule RetWeb.HubChannel do
     {:noreply, socket}
   end
 
+  def handle_info({:waypoint_reservation_states, states}, socket) do
+    broadcast_waypoint_states(socket, states)
+    {:noreply, socket}
+  end
+
   def handle_info(:close_channel, socket) do
     GenServer.cast(self(), :close)
     {:noreply, socket}
@@ -1304,6 +1339,8 @@ defmodule RetWeb.HubChannel do
       socket
       |> SessionStat.stat_query_for_socket()
       |> Repo.update_all(set: [ended_at: NaiveDateTime.utc_now()])
+
+      terminate_waypoint_reservation(socket)
     end
 
     :ok
@@ -1326,6 +1363,29 @@ defmodule RetWeb.HubChannel do
       pinned_by: socket.assigns.session_id
     })
   end
+
+  defp broadcast_waypoint_states(socket, states) do
+    Enum.each(states, fn state ->
+      broadcast!(socket, "waypoint_reservation:state", state)
+    end)
+  end
+
+  defp terminate_waypoint_reservation(%{assigns: %{waypoint_reservation: reservation}} = socket)
+       when reservation.supported do
+    result =
+      WaypointReservation.terminate_channel(
+        reservation.hub_id,
+        socket.assigns.session_id,
+        reservation.client_instance_id,
+        reservation.channel_id
+      )
+
+    Enum.each(result.states, fn state ->
+      RetWeb.Endpoint.broadcast(socket.topic, "waypoint_reservation:state", state)
+    end)
+  end
+
+  defp terminate_waypoint_reservation(_socket), do: :ok
 
   # Broadcasts the full hub info as well as an (optional) list of specific fields which
   # clients should consider stale and need to be updated in client state from the new
@@ -1588,6 +1648,8 @@ defmodule RetWeb.HubChannel do
            |> assign(:oauth_account_id, params[:oauth_account_id])
            |> assign(:oauth_source, params[:oauth_source])
            |> assign(:has_valid_bot_access_key, params[:has_valid_bot_access_key]),
+         {socket, waypoint_capability, waypoint_states} <-
+           configure_waypoint_reservation(socket, hub, context, params),
          response <-
            HubView.render("show.json", %{hub: hub, embeddable: account |> can?(embed_hub(hub))}) do
       perms_token = params["perms_token"] || get_perms_token(hub, account)
@@ -1603,6 +1665,7 @@ defmodule RetWeb.HubChannel do
         |> Map.put(:perms_token, perms_token)
         |> Map.put(:hub_requires_oauth, params[:hub_requires_oauth])
         |> Map.put(:bot_runner, params[:has_valid_bot_access_key] === true)
+        |> Map.put(:waypoint_reservation, waypoint_capability)
 
       existing_stat_count =
         socket
@@ -1620,6 +1683,7 @@ defmodule RetWeb.HubChannel do
       end
 
       send(self(), {:begin_tracking, socket.assigns.session_id, hub.hub_sid})
+      send(self(), {:waypoint_reservation_states, waypoint_states})
 
       # Send join push notification if this is the first joiner
       if Presence.list(socket.topic) |> Enum.count() == 0 do
@@ -1631,6 +1695,61 @@ defmodule RetWeb.HubChannel do
       Statix.increment("ret.channels.hub.joins.ok")
 
       {:ok, response, socket}
+    end
+  end
+
+  defp configure_waypoint_reservation(socket, hub, context, params) do
+    channel_id = SecureRandom.uuid()
+    bot_runner = context["bot_runner"] == true
+
+    registration =
+      if bot_runner do
+        :unsupported
+      else
+        WaypointReservation.join_client_instance(params["waypoint_reservation"])
+      end
+
+    case registration do
+      {:ok, client_instance_id} ->
+        result =
+          WaypointReservation.register_channel(
+            hub.hub_id,
+            socket.assigns.session_id,
+            client_instance_id,
+            channel_id
+          )
+
+        reservation = %{
+          supported: true,
+          hub_id: hub.hub_id,
+          client_instance_id: client_instance_id,
+          channel_id: channel_id,
+          bot_runner: false
+        }
+
+        capability = %{
+          protocol: WaypointReservation.protocol(),
+          supported: true,
+          lease_ms: WaypointReservation.lease_ms(),
+          request_timeout_ms: WaypointReservation.request_timeout_ms(),
+          active: result.active,
+          current: result.current,
+          request_seq: result.request_seq
+        }
+
+        {assign(socket, :waypoint_reservation, reservation), capability, result.states}
+
+      :unsupported ->
+        reservation = %{
+          supported: false,
+          hub_id: hub.hub_id,
+          client_instance_id: nil,
+          channel_id: channel_id,
+          bot_runner: bot_runner
+        }
+
+        {assign(socket, :waypoint_reservation, reservation),
+         WaypointReservation.unsupported_capability(), []}
     end
   end
 
