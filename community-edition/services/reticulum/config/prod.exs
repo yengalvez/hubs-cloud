@@ -124,6 +124,9 @@ config :ret, RetWeb.Plugs.HeaderAuthorization, header_name: "x-ret-admin-access-
 config :ret, Ret.Mailer,
   adapter: Bamboo.SMTPAdapter,
   tls: :always,
+  # gen_smtp 1.2 inherits verify_peer on OTP 27 without a CA bundle and fails
+  # before AUTH. Keep STARTTLS mandatory while using the legacy adapter.
+  tls_verify: :verify_none,
   ssl: false,
   retries: 3
 

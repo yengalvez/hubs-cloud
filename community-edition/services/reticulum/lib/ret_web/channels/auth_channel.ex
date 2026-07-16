@@ -4,6 +4,8 @@ defmodule RetWeb.AuthChannel do
   use RetWeb, :channel
   import Canada, only: [can?: 2]
 
+  require Logger
+
   alias Ret.{Statix, LoginToken, Account, Crypto}
 
   intercept ["auth_credentials"]
@@ -46,11 +48,14 @@ defmodule RetWeb.AuthChannel do
 
         Statix.increment("ret.emails.auth.attempted", 1)
 
-        if RetWeb.Email.enabled?() do
-          RetWeb.Email.auth_email(email, signin_args) |> Ret.Mailer.deliver_now()
-        end
+        case deliver_auth_email(email, signin_args) do
+          :ok ->
+            Statix.increment("ret.emails.auth.sent", 1)
 
-        Statix.increment("ret.emails.auth.sent", 1)
+          {:error, reason} ->
+            Statix.increment("ret.emails.auth.failed", 1)
+            Logger.error("Auth email delivery failed: #{inspect(reason)}")
+        end
       end
 
       {:noreply, socket}
@@ -99,6 +104,17 @@ defmodule RetWeb.AuthChannel do
     Process.send_after(self(), :close_channel, 1000 * 5)
     push(socket, event, payload)
     {:noreply, socket}
+  end
+
+  defp deliver_auth_email(email, signin_args) do
+    if RetWeb.Email.enabled?() do
+      case RetWeb.Email.auth_email(email, signin_args) |> Ret.Mailer.deliver_now() do
+        {:ok, _email} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :mailer_disabled}
+    end
   end
 
   defp broadcast_credentials_and_payload(nil, _payload, _socket), do: nil
