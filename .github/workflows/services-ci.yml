@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/services-ci.yml"
       - "community-edition/generate_script/**"
+      - "community-edition/input-values.ci.yaml"
       - "community-edition/package*.json"
       - "community-edition/services/bot-orchestrator/**"
       - "community-edition/services/coturn/**"
@@ -15,6 +16,7 @@ on:
     paths:
       - ".github/workflows/services-ci.yml"
       - "community-edition/generate_script/**"
+      - "community-edition/input-values.ci.yaml"
       - "community-edition/package*.json"
       - "community-edition/services/bot-orchestrator/**"
       - "community-edition/services/coturn/**"
@@ -47,6 +49,7 @@ jobs:
         run: |
           npm ci
           npm audit --omit=dev --audit-level=high
+          cp input-values.ci.yaml input-values.yaml
           npm run gen-hcce
 
       - name: Verify bot orchestrator

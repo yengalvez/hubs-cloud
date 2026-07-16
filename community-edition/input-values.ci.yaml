@@ -1,0 +1,59 @@
+# Non-secret fixture used only to verify manifest generation in CI.
+HUB_DOMAIN: hubs-ci.invalid
+Namespace: hcce
+ADM_EMAIL: admin@hubs-ci.invalid
+SMTP_SERVER: smtp.hubs-ci.invalid
+SMTP_PORT: "587"
+SMTP_USER: ci-user
+SMTP_PASS: ci-not-a-real-password
+
+DB_USER: postgres
+DB_PASS: ci-not-a-real-database-password
+DB_NAME: ret_dev
+DB_HOST: pgbouncer
+DB_HOST_T: pgbouncer-t
+PGRST_DB_URI: "postgres://postgres:ci-not-a-real-database-password@pgbouncer:5432/ret_dev"
+PSQL: "postgres://postgres:ci-not-a-real-database-password@pgsql:5432/ret_dev"
+
+NODE_COOKIE: ci-not-a-real-node-cookie
+GUARDIAN_KEY: ci-not-a-real-guardian-key
+PHX_KEY: ci-not-a-real-phx-key
+SKETCHFAB_API_KEY: ""
+TENOR_API_KEY: ""
+
+BOT_ACCESS_KEY: ci-not-a-real-bot-access-key
+OPENAI_API_KEY: ci-not-a-real-openai-key
+OPENAI_MODEL: gpt-5-nano
+
+Container_Dockerhub_Username: registry.invalid/yenhubs
+Container_Tag: ci
+
+GENERATE_PERSISTENT_VOLUMES: true
+PERSISTENT_VOLUME_SIZE: 10Gi
+PERSISTENT_VOLUME_STORAGE_CLASS: do-block-storage
+
+# The verifier requires every runtime image to be immutable. These references
+# are deliberately non-routable and are never applied to a cluster.
+OVERRIDE_RETICULUM_IMAGE: registry.invalid/yenhubs/reticulum@sha256:0000000000000000000000000000000000000000000000000000000000000001
+OVERRIDE_POSTGREST_IMAGE: registry.invalid/yenhubs/postgrest@sha256:0000000000000000000000000000000000000000000000000000000000000002
+OVERRIDE_POSTGRES_IMAGE: registry.invalid/yenhubs/postgres@sha256:0000000000000000000000000000000000000000000000000000000000000003
+OVERRIDE_PGBOUNCER_IMAGE: registry.invalid/yenhubs/pgbouncer@sha256:0000000000000000000000000000000000000000000000000000000000000004
+OVERRIDE_HUBS_IMAGE: registry.invalid/yenhubs/hubs@sha256:0000000000000000000000000000000000000000000000000000000000000005
+OVERRIDE_SPOKE_IMAGE: registry.invalid/yenhubs/spoke@sha256:0000000000000000000000000000000000000000000000000000000000000006
+OVERRIDE_NEARSPARK_IMAGE: registry.invalid/yenhubs/nearspark@sha256:0000000000000000000000000000000000000000000000000000000000000007
+OVERRIDE_PHOTOMNEMONIC_IMAGE: registry.invalid/yenhubs/photomnemonic@sha256:0000000000000000000000000000000000000000000000000000000000000008
+OVERRIDE_DIALOG_IMAGE: registry.invalid/yenhubs/dialog@sha256:0000000000000000000000000000000000000000000000000000000000000009
+OVERRIDE_COTURN_IMAGE: registry.invalid/yenhubs/coturn@sha256:000000000000000000000000000000000000000000000000000000000000000a
+OVERRIDE_HAPROXY_IMAGE: registry.invalid/yenhubs/haproxy@sha256:000000000000000000000000000000000000000000000000000000000000000b
+OVERRIDE_BOT_ORCHESTRATOR_IMAGE: registry.invalid/yenhubs/bot-orchestrator@sha256:000000000000000000000000000000000000000000000000000000000000000c
+
+RUNNER_BACKEND: ghost
+RUNNER_BACKEND_CANARY_HUBS: ""
+GHOST_RUNNER_SCRIPT: /app/run-ghost-runner.js
+GHOST_RAYCAST_MODE: spoke_colliders
+GHOST_NAVIGATION_MODE: navmesh_preferred
+GHOST_NAVMESH_MAX_TRIANGLES: "50000"
+GHOST_NAVMESH_MAX_ROUTE_POINTS: "64"
+GHOST_NAVMESH_MAX_SNAP_DISTANCE_M: "3"
+MAX_ACTIVE_ROOMS: "5"
+MAX_BOTS_PER_ROOM: "10"

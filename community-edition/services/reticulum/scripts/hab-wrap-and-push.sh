@@ -7,19 +7,19 @@ set -e
 ### preps
 apk add curl
 org="biome-sh";repo="biome"
-ver=$(curl -s https://api.github.com/repos/$org/$repo/releases/latest | grep "tag_name" | awk '{print substr($2, 2, length($2)-3)}')
+ver=$(curl -s "https://api.github.com/repos/$org/$repo/releases/latest" | grep "tag_name" | awk '{print substr($2, 2, length($2)-3)}')
 dl="https://github.com/$org/$repo/releases/download/$ver/bio-${ver#"v"}-x86_64-linux.tar.gz"
-echo "[info] getting bio from: $dl" && curl -L -o bio.gz $dl && tar -xf bio.gz
+echo "[info] getting bio from: $dl" && curl -L -o bio.gz "$dl" && tar -xf bio.gz
 cp ./bio /usr/bin/bio && bio --version
 
 export HAB_ORIGIN=mozillareality
 
 mkdir -p /hab/cache/keys/
 mkdir -p ./hab/cache/keys/
-echo $BLDR_RET_PUB_B64 | base64 -d > /hab/cache/keys/mozillareality-20190117233449.pub
-echo $BLDR_RET_PUB_B64 | base64 -d > ./hab/cache/keys/mozillareality-20190117233449.pub
-echo $BLDR_HAB_PVT_B64 | base64 -d > /hab/cache/keys/mozillareality-20190117233449.sig.key
-echo $BLDR_HAB_PVT_B64 | base64 -d > /hab/cache/keys/mozillareality-20190117233449.sig.key
+printf '%s' "$BLDR_RET_PUB_B64" | base64 -d > /hab/cache/keys/mozillareality-20190117233449.pub
+printf '%s' "$BLDR_RET_PUB_B64" | base64 -d > ./hab/cache/keys/mozillareality-20190117233449.pub
+printf '%s' "$BLDR_HAB_PVT_B64" | base64 -d > /hab/cache/keys/mozillareality-20190117233449.sig.key
+printf '%s' "$BLDR_HAB_PVT_B64" | base64 -d > /hab/cache/keys/mozillareality-20190117233449.sig.key
 
 echo "### build hab pkg"
 export HAB_AUTH_TOKEN=$BLDR_HAB_TOKEN
@@ -103,8 +103,13 @@ echo "### upload hab pkg"
 export HAB_BLDR_URL="https://bldr.reticulum.io"
 export HAB_AUTH_TOKEN=$BLDR_RET_TOKEN
 export HAB_ORIGIN_KEYS=mozillareality_ret
-echo $BLDR_RET_PUB_B64 | base64 -d > /hab/cache/keys/mozillareality-20190117233449.pub
+printf '%s' "$BLDR_RET_PUB_B64" | base64 -d > /hab/cache/keys/mozillareality-20190117233449.pub
 # cat /hab/cache/keys/mozillareality-20190117233449.pub
-hart="/hab/cache/artifacts/$HAB_ORIGIN-reticulum*.hart"
-ls -lha $hart
-bio pkg upload $hart
+hart_files=(/hab/cache/artifacts/"$HAB_ORIGIN"-reticulum*.hart)
+if [[ ${#hart_files[@]} -ne 1 || ! -f "${hart_files[0]}" ]]; then
+    echo "[error] expected exactly one Reticulum Habitat artifact" >&2
+    exit 1
+fi
+hart="${hart_files[0]}"
+ls -lha "$hart"
+bio pkg upload "$hart"
