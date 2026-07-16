@@ -33,8 +33,7 @@ config :ret, RetWeb.Endpoint,
   debug_errors: true,
   code_reloader: true,
   check_origin: false,
-  # This config value is for local development only.
-  secret_key_base: "txlMOtlaY5x3crvOCko4uV5PM29ul3zGo1oBGNO3cDXx+7GHLKqt0gR9qzgThxb5",
+  secret_key_base: String.duplicate("development-only-", 4),
   allowed_origins: "*",
   allow_crawlers: true
 
@@ -114,8 +113,7 @@ config :ret, RetWeb.Plugs.DashboardHeaderAuthorization, dashboard_access_key: ""
 config :cors_plug, origin: ["*"]
 
 config :ret,
-  # This config value is for local development only.
-  upload_encryption_key: "a8dedeb57adafa7821027d546f016efef5a501bd",
+  upload_encryption_key: String.duplicate("00", 20),
   bot_access_key: ""
 
 config :ret, Ret.BotOrchestrator,
@@ -173,16 +171,15 @@ config :ret, Ret.OAuthToken, oauth_token_key: ""
 
 config :ret, Ret.Guardian,
   issuer: "ret",
-  # This config value is for local development only.
-  secret_key: "47iqPEdWcfE7xRnyaxKDLt9OGEtkQG3SycHBEMOuT2qARmoESnhc76IgCUjaQIwX",
+  secret_key: String.duplicate("development-only-", 4),
   ttl: {12, :weeks}
 
 config :web_push_encryption, :vapid_details,
   subject: "mailto:admin@mozilla.com",
   public_key:
     "BAb03820kHYuqIvtP6QuCKZRshvv_zp5eDtqkuwCUAxASBZMQbFZXzv8kjYOuLGF16A3k8qYnIN10_4asB-Aw7w",
-  # This config value is for local development only.
-  private_key: "w76tXh1d3RBdVQ5eINevXRwW6Ow6uRcBa8tBDOXfmxM"
+  # Push notifications are disabled locally unless a disposable test key is supplied.
+  private_key: System.get_env("VAPID_PRIVATE_KEY")
 
 config :sentry,
   environment_name: :dev,

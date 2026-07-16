@@ -60,7 +60,9 @@ jobs:
           otp-version: "27.3.4.14"
 
       - name: Install package managers
-        run: mix do local.hex --force, local.rebar --force
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
 
       - name: Fetch dependencies
         run: mix deps.get --only test
@@ -96,7 +98,9 @@ jobs:
           otp-version: "27.3.4.14"
 
       - name: Install package managers
-        run: mix do local.hex --force, local.rebar --force
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
 
       - name: Fetch dependencies
         run: mix deps.get --only turkey

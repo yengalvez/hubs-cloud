@@ -1,0 +1,12 @@
+title = "YenHubs Hubs CE secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public development-only cryptographic fixtures inherited from Hubs CE."
+paths = [
+  '''community-edition/services/reticulum/container/dev-perms\.pem$''',
+  '''community-edition/services/reticulum/priv/dev-ssl\.key$''',
+  '''community-edition/services/reticulum/test/api/v2/graphiql-workspace-2020-12-07-15-26-56\.json$'''
+]

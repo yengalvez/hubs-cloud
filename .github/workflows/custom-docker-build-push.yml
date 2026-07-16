@@ -7,8 +7,6 @@ on:
         type: string
       Override_Registry_Username:
         type: string
-      Override_Registry_Password:
-        type: string
       Override_Registry_Namespace:
         type: string
       Override_Image_Tag:
@@ -57,19 +55,11 @@ jobs:
           echo "Registry_Username=$USERNAME" >> "$GITHUB_ENV"
 
       - name: Assign password from secret
-        if: ${{ inputs.Override_Registry_Password == '' }}
         run: |
           PASSWORD="${{ secrets.REGISTRY_PASSWORD }}"
           if [ -z "$PASSWORD" ]; then
             PASSWORD="${{ secrets.GITHUB_TOKEN }}"
           fi
-          echo "Registry_Password=$PASSWORD" >> "$GITHUB_ENV"
-
-      - name: Assign password from input
-        if: ${{ inputs.Override_Registry_Password != '' }}
-        run: |
-          PASSWORD=$(jq -r '.inputs.Override_Registry_Password' "$GITHUB_EVENT_PATH")
-          echo "::add-mask::$PASSWORD"
           echo "Registry_Password=$PASSWORD" >> "$GITHUB_ENV"
 
       - name: Sanitize image tag

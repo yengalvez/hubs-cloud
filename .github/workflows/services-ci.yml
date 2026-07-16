@@ -1,0 +1,105 @@
+name: services-ci
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/services-ci.yml"
+      - "community-edition/generate_script/**"
+      - "community-edition/package*.json"
+      - "community-edition/services/bot-orchestrator/**"
+      - "community-edition/services/coturn/**"
+      - "community-edition/services/dialog/**"
+      - "community-edition/services/photomnemonic/**"
+      - "community-edition/services/spoke/**"
+  push:
+    paths:
+      - ".github/workflows/services-ci.yml"
+      - "community-edition/generate_script/**"
+      - "community-edition/package*.json"
+      - "community-edition/services/bot-orchestrator/**"
+      - "community-edition/services/coturn/**"
+      - "community-edition/services/dialog/**"
+      - "community-edition/services/photomnemonic/**"
+      - "community-edition/services/spoke/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hubs-cloud-services-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-services:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Verify Hubs CE generator
+        working-directory: community-edition
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm run gen-hcce
+
+      - name: Verify bot orchestrator
+        working-directory: community-edition/services/bot-orchestrator
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm test
+
+      - name: Verify Dialog
+        working-directory: community-edition/services/dialog
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm run lint
+          npm test
+
+      - name: Verify Photomnemonic
+        working-directory: community-edition/services/photomnemonic
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm run check
+          npm test
+
+      - name: Verify Coturn entrypoint
+        working-directory: community-edition/services/coturn
+        run: sh test-entrypoint.sh
+
+  spoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 16.13.2
+
+      - name: Install Yarn Classic
+        run: npm install --global yarn@1.22.22
+
+      - name: Install dependencies
+        working-directory: community-edition/services/spoke
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
+        run: yarn install --frozen-lockfile
+
+      - name: Lint, test and build Spoke
+        working-directory: community-edition/services/spoke
+        run: |
+          yarn lint
+          yarn unit-tests
+          yarn build

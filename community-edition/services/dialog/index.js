@@ -38,6 +38,7 @@ const queue = new AwaitQueue();
 const rooms = utils.rooms;
 
 let httpsServer;
+let adminHttpServer;
 
 let expressApp;
 let expressAdminApp;
@@ -60,13 +61,15 @@ async function run()
 	await createExpressApp();
 	await createAdminExpressApp();
 	await runHttpsServer();
-	try {
+	try
+	{
 		authKey = await readFile(config.authKey, 'utf8');
-	} catch (error) {
-		logger.error("authKey not set; jwt verification will not work.", error);
+	}
+	catch (error)
+	{
+		logger.error('authKey not set; jwt verification will not work.', error);
 	}
 	await runProtooWebSocketServer();
-
 
 	// Log rooms status every X seconds.
 	setInterval(() =>
@@ -108,10 +111,13 @@ async function runMediasoupWorkers()
 
 	utils.workerLoadMan.runSurvey();
 
-	setInterval(async () => { 
+	setInterval(async () =>
+	{
 		const startTimestampNs = process.hrtime.bigint();
+
 		utils.workerLoadMan.runSurvey();
 		const elapsedMs = Number(process.hrtime.bigint() - startTimestampNs) / 1000000;
+
 		if (elapsedMs > 0.1) { logger.warn('runSurvey() took: %s ms', elapsedMs); }
 	}, 5000);
 }
@@ -176,8 +182,10 @@ async function createAdminExpressApp()
 		{
 			const sessions = [];
 
-			for (const room in rooms.values()) {
-				for (let i = 0; i < room.getCCU(); i++) {
+			for (const room of rooms.values())
+			{
+				for (let i = 0; i < room.getCCU(); i++)
+				{
 					sessions.push({});
 				}
 			}
@@ -192,7 +200,7 @@ async function createAdminExpressApp()
 		'/meta', (req, res) =>
 		{
 			res.status(200).json({
-				cap: utils.workerLoadMan.sum(),
+				cap : utils.workerLoadMan.sum()
 				// ip: process.env.MEDIASOUP_ANNOUNCED_IP
 			});
 		});
@@ -204,44 +212,65 @@ async function createAdminExpressApp()
 		'/report', (req, res) =>
 		{
 			const report = new Map(utils.workerLoadMan.get());
+
 			report.set('_hostname', os.hostname());
 			report.set('_capacity', utils.workerLoadMan.sum());
 			res.set({ 'Content-Type': 'application/json' })
 				.status(200)
 				.send(JSON.stringify(report, utils.stableSortReplacer, 2));
 		});
-		/**
+
+	/**
 		 * dump room
 		 */
-		expressAdminApp.get(
-			'/report/rooms/:roomId', (req, res) =>
+	expressAdminApp.get(
+		'/report/rooms/:roomId', (req, res) =>
+		{
+			const room = rooms.get(req.params.roomId);
+
+			if (!room)
 			{
-				const room = rooms.get(req.params.roomId);
-				console.log(room)
-				res.set({ 'Content-Type': 'application/json' })
-					.status(200)
-					.send(room);
-				});
-			/**
+				res.status(404).json({ error: 'Room not found' });
+
+				return;
+			}
+
+			res.set({ 'Content-Type': 'application/json' })
+				.status(200)
+				.send(room);
+		});
+
+	/**
 			 * dump peer
 			 */
-			expressAdminApp.get(
-				'/report/peers/:peerId', (req, res) =>
-				{
-					const peerId = req.params.peerId
-					let room = {}
-					for (const [k,v] of rooms.entries()){
-						if (v._protooRoom.hasPeer(peerId)){
-							room =v
-						}
-					}
+	expressAdminApp.get(
+		'/report/peers/:peerId', (req, res) =>
+		{
+			const peerId = req.params.peerId;
+			let room;
 
-					const peer = room._protooRoom.getPeer(peerId);
-					console.log(peer)
-					res.set({ 'Content-Type': 'application/json' })
-						.status(200)
-						.send(peer._data);
-					});
+			for (const candidateRoom of rooms.values())
+			{
+				if (candidateRoom._protooRoom.hasPeer(peerId))
+				{
+					room = candidateRoom;
+					break;
+				}
+			}
+
+			if (!room)
+			{
+				res.status(404).json({ error: 'Peer not found' });
+
+				return;
+			}
+
+			const peer = room._protooRoom.getPeer(peerId);
+
+			res.set({ 'Content-Type': 'application/json' })
+				.status(200)
+				.send(peer._data);
+		});
 
 	/**
 	 * Error handler.
@@ -300,7 +329,6 @@ async function runHttpsServer()
 	});
 }
 
-
 /**
  * Create a protoo WebSocketServer to allow WebSocket connections from browsers.
  */
@@ -324,6 +352,7 @@ async function runProtooWebSocketServer()
 		const u = url.parse(info.request.url, true);
 		const roomId = u.query['roomId'];
 		const peerId = u.query['peerId'];
+
 		if (!roomId || !peerId)
 		{
 			reject(400, 'Connection request without roomId and/or peerId');
@@ -335,6 +364,7 @@ async function runProtooWebSocketServer()
 			'protoo connection request [roomId:%s, peerId:%s, address:%s, origin:%s]',
 			roomId, peerId, info.socket.remoteAddress, info.origin);
 		const roomSize = info.request.headers['x-ret-max-room-size'];
+
 		logger.info('roomId: %s, x-ret-max-room-size: %s', roomId, roomSize);
 
 		// Serialize this code into the queue to avoid that two peers connecting at

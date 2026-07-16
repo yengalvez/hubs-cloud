@@ -1,9 +1,8 @@
+#!/usr/bin/env bash
 
 set -e
 
-#BLDR_HAB_TOKEN='_Qk9YLTEKYmxkci0yMDE3M...'
-#BLDR_RET_TOKEN='_Qk9YLTEKYmxkci0yMDE5M...'
-#BLDR_RET_PUB_B64='U0lHLVBVQi0xCm1vemls...'
+# Builder credentials must be provided through the CI environment.
 
 ### preps
 apk add curl

@@ -49,4 +49,7 @@ COPY run-ghost-runner.js /app/run-ghost-runner.js
 RUN chown -R 1000:1000 /app
 USER 1000:1000
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 5001) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
 CMD ["npm", "start"]

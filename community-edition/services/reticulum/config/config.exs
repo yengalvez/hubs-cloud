@@ -41,8 +41,8 @@ config :ret, Ret.AppConfig, caching?: true
 # Configures the endpoint
 config :ret, RetWeb.Endpoint,
   url: [host: "localhost"],
-  # This config value is for local development only.
-  secret_key_base: "txlMOtlaY5x3crvOCko4uV5PM29ul3zGo1oBGNO3cDXx+7GHLKqt0gR9qzgThxb5",
+  # Production overrides this value in runtime.exs.
+  secret_key_base: String.duplicate("development-only-", 4),
   render_errors: [view: RetWeb.ErrorView, accepts: ~w(html json)],
   pubsub_server: Ret.PubSub
 
