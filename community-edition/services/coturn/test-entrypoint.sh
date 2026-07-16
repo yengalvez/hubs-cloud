@@ -46,7 +46,15 @@ fi
 grep -Fqx "psql-userdb=$sentinel" "$CAPTURE_CONFIG"
 grep -Fqx "$TURN_CONFIG_PATH" "$CAPTURE_ARGS"
 
-config_mode="$(stat -f '%Lp' "$CAPTURE_CONFIG" 2>/dev/null || stat -c '%a' "$CAPTURE_CONFIG")"
+case "$(uname -s)" in
+  Darwin)
+    config_mode="$(stat -f '%Lp' "$CAPTURE_CONFIG")"
+    ;;
+  *)
+    config_mode="$(stat -c '%a' "$CAPTURE_CONFIG")"
+    ;;
+esac
+
 if [ "$config_mode" != "600" ]; then
   echo "Coturn configuration permissions are $config_mode instead of 600" >&2
   exit 1
