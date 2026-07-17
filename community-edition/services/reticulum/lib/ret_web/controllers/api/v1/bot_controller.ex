@@ -3,7 +3,7 @@ defmodule RetWeb.Api.V1.BotController do
 
   import Canada, only: [can?: 2]
 
-  alias Ret.{AppConfig, BotOrchestrator, Hub, Repo}
+  alias Ret.{AppConfig, BotChatPresence, BotOrchestrator, Hub, Repo}
 
   @max_message_length 800
   @max_waypoints 64
@@ -20,10 +20,19 @@ defmodule RetWeb.Api.V1.BotController do
            |> Repo.get_by(hub_sid: hub_sid)
            |> Repo.preload([:created_by_account, :hub_bindings, :hub_role_memberships]) do
         %Hub{} = hub ->
-          if account |> can?(join_hub(hub)) do
-            chat_with_hub(conn, account, hub, bot_id, message, params["context"])
-          else
-            conn |> send_resp(401, "unauthorized")
+          cond do
+            !can?(account, join_hub(hub)) ->
+              conn |> send_resp(401, "unauthorized")
+
+            !BotChatPresence.present?(
+              hub.hub_sid,
+              account.account_id,
+              params["bot_chat_capability"]
+            ) ->
+              conn |> send_resp(403, "not present in room")
+
+            true ->
+              chat_with_hub(conn, account, hub, bot_id, message, params["context"])
           end
 
         _ ->

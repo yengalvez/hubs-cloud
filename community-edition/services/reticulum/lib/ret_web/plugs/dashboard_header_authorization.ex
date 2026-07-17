@@ -5,16 +5,8 @@ defmodule RetWeb.Plugs.DashboardHeaderAuthorization do
   def init(default), do: default
 
   def call(conn, _default) do
-    configured_value =
-      Application.get_env(:ret, RetWeb.Plugs.DashboardHeaderAuthorization)[:dashboard_access_key]
-
     expected_value =
-      case configured_value do
-        nil -> Application.get_env(:ret, :bot_access_key)
-        "" -> Application.get_env(:ret, :bot_access_key)
-        "<DASHBOARD_ACCESS_KEY>" -> Application.get_env(:ret, :bot_access_key)
-        value -> value
-      end
+      Application.get_env(:ret, RetWeb.Plugs.DashboardHeaderAuthorization)[:dashboard_access_key]
 
     provided_value = conn |> get_req_header(@header_name) |> List.first()
 

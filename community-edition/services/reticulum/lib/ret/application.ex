@@ -62,8 +62,8 @@ defmodule Ret.Application do
       {Phoenix.PubSub, [name: Ret.PubSub, adapter: Phoenix.PubSub.PG2, pool_size: 4]},
       Ret.Statix,
       Ret.Repo,
-      RetWeb.Endpoint,
-      RetWeb.Presence,
+      Ret.BotChatPresence,
+      Ret.BotRuntimeSupervisor,
       Ret.Scheduler,
       Ret.RoomAssignerMonitor,
       %{

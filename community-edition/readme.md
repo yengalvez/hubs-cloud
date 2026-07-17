@@ -44,9 +44,8 @@ Before applying the configuration file to your Kubernetes cluster, you will need
 
 To deploy to your K8s cluster on your chosen hosting solution, follow these steps:
 
-- In `input-values.yaml` edit `HUB_DOMAIN`, `ADM_EMAIL`, `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` and optionally `SKETCHFAB_API_KEY` with the values for your site.  Change `NODE_COOKIE`, `GUARDIAN_KEY`, & `PHX_KEY` to unique random values, using a password generator if you have one handy.
-For a single-node test (not production) instance, you can set `PERSISTENT_VOLUME_STORAGE_CLASS` to `manual` to save a few bucks.
-For a custom setup, you can set `PERSISTENT_VOLUME_STORAGE_CLASS` to any storage class supported on your cluster.
+- In `input-values.yaml` edit `HUB_DOMAIN`, `ADM_EMAIL`, `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` and optionally `SKETCHFAB_API_KEY` with the values for your site. Change `NODE_COOKIE`, `GUARDIAN_KEY`, and `PHX_KEY` to unique random values. Configure four different random values of at least 32 characters for `BOT_ACCESS_KEY` (legacy integrations only), `BOT_RUNNER_ACCESS_KEY`, `BOT_ORCHESTRATOR_ACCESS_KEY`, and `DASHBOARD_ACCESS_KEY`; the generator rejects reuse between these trust domains.
+- Keep `GENERATE_PERSISTENT_VOLUMES: true` and set `PERSISTENT_VOLUME_STORAGE_CLASS` explicitly. Use `default` for the cluster default or an explicit dynamic storage class supported by the cluster. Retained `manual` hostPath volumes are test-only and require the additional explicit `ALLOW_MANUAL_HOSTPATH_STORAGE: true`; omission never falls back to node-local storage.
 - Run `npm run gen-hcce && npm run apply` to generate your configuration in `hcce.yaml` and apply it to your K8s cluster. From the output read your load balancer's external IP address.
 - Expose the services
   - On your DNS service, create four A-records to route your domains to the external IP address of your load balancer
@@ -117,17 +116,81 @@ Kubernetes clusters can also be managed via GUI programs.  Here are some possibi
 
 ## Operations
 
-If you need to edit `hcce.yaml` directly, for example
-1. To have your cluster pull a fresh image whenever you deploy, change `imagePullPolicy` to `Always` for that image.
-2. To work around certain SSL issues, comment out the line `- --default-ssl-certificate=hcce/cert-hcce`
+### YenHubs bot authority and waypoint-reservation rollout
 
-After saving `hcce.yaml`, run
+The complete YenHubs profile currently keeps Reticulum at exactly one replica
+with the exact `Recreate` deployment strategy. Bot-runner authority is
+process-local, so overlapping Reticulum pods could each authorize a runner for
+the same room. Generated-manifest verification rejects any other replica count,
+rolling-update fields, or a HorizontalPodAutoscaler targeting Reticulum. This
+reduces overlap during the standard rollout and deliberately accepts controlled
+Reticulum downtime. It is not fencing against node partitions or a stuck old
+process. Abort whenever inventory shows more than one Reticulum pod or Endpoint;
+full exclusivity still requires a database-backed lease with a fencing token.
 
-`npm run apply`
+The bot trust boundary uses four distinct credentials. The historical
+`BOT_ACCESS_KEY` remains scoped to integration routes such as hub bindings and
+is never mounted into the bot orchestrator. The parent orchestrator receives a
+dedicated inbound key plus the runner key used only for bot snapshots and
+authenticated runner joins; the ghost child receives only the runner key.
+Dashboard administration has a fourth independent key and never falls back to
+any bot key. Generated manifests use an exact environment, mount and volume
+allowlist for the secret-bearing parent process.
 
-then
+That child environment allowlist is defense in depth, not a process-isolation
+boundary. The current candidate runs the parent and all ghost children in one
+container under the same UID, PID namespace, and memory cgroup. Compromised
+child JavaScript can therefore attempt to inspect the parent's environment via
+`/proc`, signal sibling/parent processes, or exhaust the shared memory limit and
+take down every room. Public rollout and capacity certification are blocked
+until each runner has a separate pod/container and process namespace, its own
+runner-only credential and resource limits, a minimal NetworkPolicy, and an
+authenticated control channel to the parent. This separation is not yet
+implemented or deployed.
 
-`kubectl get pods -n hcce`
+Authenticated bot chat is private to the requesting browser and requires an
+exact random capability for that Phoenix channel and account in the same room.
+The capability is returned only in the private channel response, registered in
+server-only `BotChatPresence` after `events:entered`, rotated on sign-in, and
+invalidated on sign-out or channel termination. Neither it nor the account ID
+is added to broadcast Presence metadata, so another browser using the same
+account cannot reuse the proof. Permission to join without an entered channel
+and its current capability receives HTTP 403.
+
+`MAX_ACTIVE_ROOMS` is a hard admission and cost ceiling (five by default, ten
+maximum), not only a readiness threshold. Reticulum serializes active-room
+admission under a global PostgreSQL transaction lock and rejects N+1 before it
+is persisted. Only a non-disabled global administrator may activate or modify
+active bot configuration; ordinary room owners may preserve an approved
+configuration while changing unrelated data or disable it. The generator and
+manifest verifier bind the exact same 1-10 value into Reticulum and the
+orchestrator, whose internal endpoint provides a second fail-closed check. If
+inconsistent external state nevertheless exceeds the ceiling, readiness still
+reports `capacity_exceeded` with HTTP 503 rather than declaring a partial fleet
+ready. This candidate behavior is not deployed.
+
+`DASHBOARD_ACCESS_KEY` is the single Reticulum administrative trust domain. It
+authenticates the dedicated dashboard header and, for compatibility, the
+legacy `x-ret-admin-access-key` wire header used by RetNotice,
+SupportSubscription and Hub deletion. The two header names intentionally share
+one value; no bot or runner service receives it, and the generator rejects any
+binding to a bot credential.
+
+Authoritative waypoint reservations use wire protocol 2. PostgreSQL assigns a
+global, JSON-safe monotonic `state_version` to each state-change batch, and each
+join includes a later `snapshot_state_version` barrier. Deploy and migrate
+Reticulum first, verify it is ready, and only then deploy the matching Hubs
+client. Protocol 1 and protocol 2 peers reject each other, so either mixed
+deployment direction fails closed instead of accepting unversioned seat state.
+The read-only `GET /health/capabilities` endpoint publishes the exact protocol
+and state-version semantics so rollout tooling can negotiate the server/client
+pair before enabling the Hubs client.
+
+Do not edit generated `hcce.yaml`. Change the tracked generator or the private
+input values, regenerate, inspect `kubectl diff`, and apply the generated
+manifest through the approved deployment procedure. The verifier rejects
+untracked containers, environment variables, mounts, RBAC and storage
+resources.
 
 If you just need to get the external IP address of your load balancer, run
 

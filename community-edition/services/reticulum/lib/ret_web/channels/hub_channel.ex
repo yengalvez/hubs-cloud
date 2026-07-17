@@ -11,7 +11,11 @@ defmodule RetWeb.HubChannel do
     HubInvite,
     Account,
     AccountFavorite,
+    BotConfig,
+    BotConfigAdmission,
+    BotChatPresence,
     BotOrchestrator,
+    BotRunnerLease,
     Identity,
     Repo,
     RoomObject,
@@ -20,6 +24,7 @@ defmodule RetWeb.HubChannel do
     Storage,
     SessionStat,
     Statix,
+    WaypointReservation,
     WebPushSubscription
   }
 
@@ -47,7 +52,6 @@ defmodule RetWeb.HubChannel do
 
     socket
     |> assign(:profile, profile)
-    |> assign(:context, context)
     |> assign(:block_naf, false)
     |> assign(:blocked_session_ids, %{})
     |> assign(:blocked_by_session_ids, %{})
@@ -62,7 +66,8 @@ defmodule RetWeb.HubChannel do
         "auth_token",
         "perms_token",
         "bot_access_key",
-        "hub_invite_id"
+        "hub_invite_id",
+        "waypoint_reservation"
       ])
     )
   end
@@ -73,80 +78,110 @@ defmodule RetWeb.HubChannel do
   end
 
   defp perform_join(socket, hub, context, params) do
-    account =
-      case Ret.Guardian.resource_from_token(params["auth_token"]) do
-        {:ok, %Account{} = account, _claims} -> account
-        _ -> nil
-      end
-
-    hub_requires_oauth = hub.hub_bindings |> Enum.empty?() |> Kernel.not()
-
-    bot_access_key = Application.get_env(:ret, :bot_access_key)
+    bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
     has_valid_bot_access_key = secure_compare(params["bot_access_key"], bot_access_key)
 
-    account_has_provider_for_hub =
-      account |> Ret.Account.matching_oauth_providers(hub) |> Enum.empty?() |> Kernel.not()
+    with {:ok, context, authenticated_bot_runner} <-
+           authenticate_bot_runner_context(context, has_valid_bot_access_key) do
+      account =
+        case Ret.Guardian.resource_from_token(params["auth_token"]) do
+          {:ok, %Account{} = account, _claims} -> account
+          _ -> nil
+        end
 
-    account_can_join = account |> can?(join_hub(hub))
-    account_can_update = account |> can?(update_hub(hub))
+      hub_requires_oauth = hub.hub_bindings |> Enum.empty?() |> Kernel.not()
 
-    perms_token = params["perms_token"]
+      socket = assign(socket, :context, context)
 
-    has_perms_token = perms_token != nil
+      account_has_provider_for_hub =
+        account |> Ret.Account.matching_oauth_providers(hub) |> Enum.empty?() |> Kernel.not()
 
-    decoded_perms = perms_token |> Ret.PermsToken.decode_and_verify()
+      account_can_join = account |> can?(join_hub(hub))
+      account_can_update = account |> can?(update_hub(hub))
 
-    perms_token_can_join =
-      case decoded_perms do
-        {:ok, %{"join_hub" => true}} -> true
-        _ -> false
-      end
+      perms_token = params["perms_token"]
 
-    {oauth_account_id, oauth_source} =
-      case decoded_perms do
-        {:ok, %{"oauth_account_id" => oauth_account_id, "oauth_source" => oauth_source}} ->
-          {oauth_account_id, oauth_source |> String.to_atom()}
+      has_perms_token = perms_token != nil
 
-        _ ->
-          {nil, nil}
-      end
+      decoded_perms = perms_token |> Ret.PermsToken.decode_and_verify()
 
-    has_active_invite = Ret.HubInvite.active?(hub, params["hub_invite_id"])
+      perms_token_can_join =
+        case decoded_perms do
+          {:ok, %{"join_hub" => true}} -> true
+          _ -> false
+        end
 
-    params =
-      params
-      |> Map.merge(%{
-        has_active_invite: has_active_invite,
-        hub_requires_oauth: hub_requires_oauth,
-        has_valid_bot_access_key: has_valid_bot_access_key,
-        account_has_provider_for_hub: account_has_provider_for_hub,
-        account_can_join: account_can_join,
-        account_can_update: account_can_update,
-        has_perms_token: has_perms_token,
-        oauth_account_id: oauth_account_id,
-        oauth_source: oauth_source,
-        perms_token_can_join: perms_token_can_join
-      })
+      {oauth_account_id, oauth_source} =
+        case decoded_perms do
+          {:ok, %{"oauth_account_id" => oauth_account_id, "oauth_source" => oauth_source}} ->
+            {oauth_account_id, oauth_source |> String.to_atom()}
 
-    hub |> join_with_hub(account, socket, context, params)
+          _ ->
+            {nil, nil}
+        end
+
+      has_active_invite = Ret.HubInvite.active?(hub, params["hub_invite_id"])
+
+      params =
+        params
+        |> Map.merge(%{
+          has_active_invite: has_active_invite,
+          hub_requires_oauth: hub_requires_oauth,
+          has_valid_bot_access_key: authenticated_bot_runner,
+          account_has_provider_for_hub: account_has_provider_for_hub,
+          account_can_join: account_can_join,
+          account_can_update: account_can_update,
+          has_perms_token: has_perms_token,
+          oauth_account_id: oauth_account_id,
+          oauth_source: oauth_source,
+          perms_token_can_join: perms_token_can_join
+        })
+
+      hub |> join_with_hub(account, socket, context, params)
+    end
   end
 
   # Optimization: "raw" NAF event, with the underlying NAF payload as a string.
   # By going through this event, the server can avoid parsing the NAF messages.
   def handle_in("nafr" = event, %{"naf" => naf_payload} = payload, socket) do
-    # We expect the client to have stripped the "isFirstSync" keys from the message
-    # for this optimization.
-    if !String.contains?(naf_payload, "isFirstSync") do
-      broadcast_from!(
-        socket,
-        event |> internal_naf_event_for(socket),
-        payload |> payload_with_from(socket)
-      )
+    # Decode before using the raw fast path so an escaped dedicated bot
+    # template or protected bot network id can never bypass authorization.
+    case Jason.decode(naf_payload) do
+      {:ok, decoded_payload} ->
+        template = naf_payload_template(decoded_payload)
 
-      {:noreply, socket}
-    else
-      # Full syncs must be properly authorized
-      handle_in("naf", naf_payload |> Jason.decode!(), socket)
+        cond do
+          not valid_naf_network_ids?(decoded_payload) ->
+            {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+          contains_first_sync?(decoded_payload) or
+              bot_sensitive_payload?(decoded_payload, socket) ->
+            handle_in("naf", decoded_payload, socket)
+
+          is_binary(template) and spawn_permitted?(template, socket) ->
+            broadcast_from!(
+              socket,
+              event |> internal_naf_event_for(socket),
+              payload |> payload_with_from(socket)
+            )
+
+            {:noreply, socket}
+
+          is_binary(template) ->
+            {:noreply, socket}
+
+          true ->
+            broadcast_from!(
+              socket,
+              event |> internal_naf_event_for(socket),
+              payload |> payload_with_from(socket)
+            )
+
+            {:noreply, socket}
+        end
+
+      {:error, _reason} ->
+        {:noreply, socket}
     end
   end
 
@@ -158,25 +193,152 @@ defmodule RetWeb.HubChannel do
         socket
       ) do
     data = payload["data"]
+    network_id = data["networkId"]
 
-    if template |> spawn_permitted?(socket) do
-      data =
-        data
-        |> Map.put("creator", socket.assigns.session_id)
-        |> Map.put("owner", socket.assigns.session_id)
+    cond do
+      not valid_network_id?(network_id) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
 
-      payload = payload |> Map.put("data", data)
+      template == "#remote-bot-avatar" and not bot_network_id?(network_id, socket) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
 
-      broadcast_from!(
-        socket,
-        event |> internal_naf_event_for(socket),
-        payload |> payload_with_from(socket)
-      )
+      template != "#remote-bot-avatar" and bot_network_id?(network_id, socket) ->
+        {:reply, {:error, %{reason: "reserved_bot_network_id"}}, socket}
 
-      {:noreply, socket}
-    else
-      {:noreply, socket}
+      not spawn_permitted?(template, socket) ->
+        if template == "#remote-bot-avatar" do
+          {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+        else
+          {:noreply, socket}
+        end
+
+      true ->
+        data =
+          data
+          |> Map.put("creator", socket.assigns.session_id)
+          |> Map.put("owner", socket.assigns.session_id)
+
+        payload = payload |> Map.put("data", data)
+
+        broadcast_from!(
+          socket,
+          event |> internal_naf_event_for(socket),
+          payload |> payload_with_from(socket)
+        )
+
+        if template == "#remote-bot-avatar" do
+          {:reply,
+           {:ok,
+            %{
+              bot_spawn_accepted: true,
+              network_id: data["networkId"],
+              bot_runner_authority_epoch: socket.assigns.bot_runner_authority_epoch
+            }}, socket}
+        else
+          {:noreply, socket}
+        end
     end
+  end
+
+  # Every update targeting the reserved bot namespace must retain the exact
+  # dedicated shape and remain authenticated after the acknowledged first sync.
+  def handle_in(
+        "naf" = event,
+        %{
+          "dataType" => "u",
+          "data" => %{"networkId" => network_id} = data
+        } = payload,
+        socket
+      ) do
+    protected_network_id = bot_network_id?(network_id, socket)
+    dedicated_shape = data["template"] == "#remote-bot-avatar" and data["persistent"] === false
+
+    cond do
+      not valid_network_id?(network_id) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      protected_network_id and not dedicated_shape ->
+        {:reply, {:error, %{reason: "invalid_bot_spawn_payload"}}, socket}
+
+      protected_network_id and not bot_runner?(socket) ->
+        {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+
+      not protected_network_id and data["template"] == "#remote-bot-avatar" ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      true ->
+        broadcast_from!(
+          socket,
+          event |> internal_naf_event_for(socket),
+          payload |> payload_with_from(socket)
+        )
+
+        {:noreply, socket}
+    end
+  end
+
+  def handle_in(
+        "naf" = event,
+        %{"dataType" => "r", "data" => %{"networkId" => network_id}} = payload,
+        socket
+      ) do
+    cond do
+      not valid_network_id?(network_id) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      bot_network_id?(network_id, socket) ->
+        if bot_runner?(socket) do
+          broadcast_from!(
+            socket,
+            event |> internal_naf_event_for(socket),
+            payload |> payload_with_from(socket)
+          )
+
+          {:noreply, socket}
+        else
+          {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+        end
+
+      true ->
+        broadcast_from!(
+          socket,
+          event |> internal_naf_event_for(socket),
+          payload |> payload_with_from(socket)
+        )
+
+        {:noreply, socket}
+    end
+  end
+
+  def handle_in("naf", %{"dataType" => data_type}, socket) when data_type in ["u", "r"] do
+    {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+  end
+
+  def handle_in("naf" = event, %{"data" => %{"networkId" => network_id}} = payload, socket)
+      when is_binary(network_id) and byte_size(network_id) > 0 do
+    cond do
+      payload["dataType"] == "um" ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      bot_network_id?(network_id, socket) ->
+        {:reply, {:error, %{reason: "invalid_bot_spawn_payload"}}, socket}
+
+      payload["data"]["template"] == "#remote-bot-avatar" ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      true ->
+        broadcast_from!(
+          socket,
+          event |> internal_naf_event_for(socket),
+          payload |> payload_with_from(socket)
+        )
+
+        {:noreply, socket}
+    end
+  end
+
+  def handle_in("naf", %{"data" => %{"template" => "#remote-bot-avatar"}}, socket) do
+    {:reply, {:error, %{reason: "invalid_bot_spawn_payload"}}, socket}
   end
 
   # Captures all inbound NAF Update Multi messages
@@ -185,19 +347,42 @@ defmodule RetWeb.HubChannel do
         %{"dataType" => "um", "data" => %{"d" => updates}} = payload,
         socket
       ) do
-    if updates |> Enum.any?(& &1["isFirstSync"]) do
-      # Do not broadcast "um" messages that contain isFirstSyncs. NAF should never send these, so we'd only see them
-      # from a malicious client.
-      {:noreply, socket}
-    else
-      broadcast_from!(
-        socket,
-        event |> internal_naf_event_for(socket),
-        payload |> payload_with_from(socket)
-      )
+    cond do
+      not is_list(updates) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
 
-      {:noreply, socket}
+      not Enum.all?(updates, &valid_naf_update?/1) ->
+        {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      Enum.any?(updates, &(is_map(&1) and Map.has_key?(&1, "isFirstSync"))) ->
+        # NAF should never send first syncs in a multi update.
+        {:noreply, socket}
+
+      Enum.any?(updates, &malformed_bot_avatar_update?(&1, socket)) ->
+        {:reply, {:error, %{reason: "invalid_bot_spawn_payload"}}, socket}
+
+      Enum.any?(updates, &bot_network_update?(&1, socket)) and not bot_runner?(socket) ->
+        {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+
+      Enum.all?(updates, &multi_update_permitted?(&1, socket)) ->
+        broadcast_from!(
+          socket,
+          event |> internal_naf_event_for(socket),
+          payload |> payload_with_from(socket)
+        )
+
+        {:noreply, socket}
+
+      Enum.any?(updates, &bot_sensitive_update?(&1, socket)) ->
+        {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+
+      true ->
+        {:noreply, socket}
     end
+  end
+
+  def handle_in("naf", %{"dataType" => "um"}, socket) do
+    {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
   end
 
   # Fallthrough for all other NAF dataTypes
@@ -248,6 +433,34 @@ defmodule RetWeb.HubChannel do
     Statix.increment("ret.channels.hub.event_entered", 1)
 
     {:noreply, socket}
+  end
+
+  def handle_in("waypoint_reservation:request", payload, socket) do
+    reservation = socket.assigns.waypoint_reservation
+
+    if reservation.supported do
+      context = socket.assigns.context || %{}
+
+      result =
+        WaypointReservation.request(
+          reservation.hub_id,
+          socket.assigns.session_id,
+          reservation.client_instance_id,
+          reservation.channel_id,
+          payload,
+          %{
+            allowed: socket.assigns.presence == :room || context["entering"] == true,
+            bot_runner: reservation.bot_runner
+          }
+        )
+
+      broadcast_waypoint_states(socket, result.states)
+      reply_status = if result.response["status"] == "ok", do: :ok, else: :error
+      {:reply, {reply_status, result.response}, socket}
+    else
+      response = WaypointReservation.unsupported_response(payload)
+      {:reply, {:error, response}, socket}
+    end
   end
 
   def handle_in("events:object_spawned", %{"object_type" => object_type}, socket) do
@@ -363,7 +576,10 @@ defmodule RetWeb.HubChannel do
 
     case Ret.Guardian.resource_from_token(token) do
       {:ok, %Account{} = account, _claims} ->
-        socket = Guardian.Phoenix.Socket.put_current_resource(socket, account)
+        socket =
+          socket
+          |> Guardian.Phoenix.Socket.put_current_resource(account)
+          |> rotate_bot_chat_capability(account)
 
         hub = socket |> hub_for_socket |> Repo.preload(Hub.hub_preloads())
 
@@ -379,7 +595,12 @@ defmodule RetWeb.HubChannel do
         perms_token = get_perms_token(hub, account)
         broadcast_presence_update(socket)
 
-        {:reply, {:ok, %{perms_token: perms_token}}, socket}
+        {:reply,
+         {:ok,
+          %{
+            perms_token: perms_token,
+            bot_chat_capability: socket.assigns.bot_chat_capability
+          }}, socket}
 
       {:error, reason} ->
         {:reply, {:error, %{message: "Sign in failed", reason: reason}}, socket}
@@ -387,7 +608,13 @@ defmodule RetWeb.HubChannel do
   end
 
   def handle_in("sign_out", _payload, socket) do
-    socket = Guardian.Phoenix.Socket.put_current_resource(socket, nil)
+    :ok = BotChatPresence.untrack(self())
+
+    socket =
+      socket
+      |> Guardian.Phoenix.Socket.put_current_resource(nil)
+      |> assign(:bot_chat_capability, nil)
+
     broadcast_presence_update(socket)
 
     # Disconnect if signing out and account is required
@@ -395,7 +622,7 @@ defmodule RetWeb.HubChannel do
       Process.send_after(self(), :close_channel, 5000)
     end
 
-    {:reply, {:ok, %{}}, socket}
+    {:reply, {:ok, %{bot_chat_capability: nil}}, socket}
   end
 
   def handle_in(
@@ -569,20 +796,26 @@ defmodule RetWeb.HubChannel do
 
       stale_fields = if entry_mode_changed, do: ["entry_mode" | stale_fields], else: stale_fields
 
-      updated_hub =
+      update_changeset =
         hub
         |> Hub.add_attrs_to_changeset(payload)
         |> Hub.add_member_permissions_to_changeset(payload)
         |> Hub.maybe_add_promotion_to_changeset(account, hub, payload)
         |> Hub.maybe_add_entry_mode_to_changeset(payload)
-        |> Repo.update!()
-        |> Repo.preload(Hub.hub_preloads())
 
-      sync_bot_orchestrator(updated_hub)
-      broadcast_hub_refresh!(updated_hub, socket, stale_fields)
+      case BotConfigAdmission.update(update_changeset, account) do
+        {:ok, updated_hub} ->
+          updated_hub = Repo.preload(updated_hub, Hub.hub_preloads())
+          sync_bot_orchestrator(updated_hub)
+          broadcast_hub_refresh!(updated_hub, socket, stale_fields)
+          {:noreply, socket}
+
+        {:error, _changeset} ->
+          reply_error(socket, "bot_config_rejected")
+      end
+    else
+      {:noreply, socket}
     end
-
-    {:noreply, socket}
   end
 
   def handle_in("fetch_invite", _payload, socket) do
@@ -903,12 +1136,15 @@ defmodule RetWeb.HubChannel do
     {:noreply, socket}
   end
 
+  defp spawn_permitted?(template, _socket) when not is_binary(template), do: false
+
   defp spawn_permitted?(template, socket) do
     account = Guardian.Phoenix.Socket.current_resource(socket)
     hub = socket |> hub_for_socket
 
     cond do
-      template |> String.ends_with?("-avatar") -> true
+      template == "#remote-bot-avatar" -> bot_runner?(socket)
+      generic_avatar_template?(template) -> true
       template |> String.ends_with?("-media") -> account |> can?(spawn_and_move_media(hub))
       template |> String.ends_with?("-camera") -> account |> can?(spawn_camera(hub))
       template |> String.ends_with?("-drawing") -> account |> can?(spawn_drawing(hub))
@@ -919,19 +1155,121 @@ defmodule RetWeb.HubChannel do
     end
   end
 
+  defp generic_avatar_template?(template) do
+    Regex.match?(~r/\A#[A-Za-z0-9_-]+-avatar\z/, template)
+  end
+
+  defp bot_network_id?(network_id, socket) when is_binary(network_id) do
+    hub_sid = socket.assigns[:hub_sid]
+    prefix = if is_binary(hub_sid), do: "room-bot-#{hub_sid}-bot-", else: nil
+
+    with true <- is_binary(prefix),
+         true <- String.starts_with?(network_id, prefix),
+         suffix <- String.replace_prefix(network_id, prefix, ""),
+         {bot_number, ""} <- Integer.parse(suffix),
+         true <- bot_number in 1..10 do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp bot_network_id?(_network_id, _socket), do: false
+
+  defp valid_network_id?(network_id),
+    do: is_binary(network_id) and byte_size(network_id) > 0
+
+  defp valid_naf_update?(%{"networkId" => network_id}), do: valid_network_id?(network_id)
+  defp valid_naf_update?(_update), do: false
+
+  defp valid_naf_network_ids?(%{
+         "dataType" => data_type,
+         "data" => %{"networkId" => network_id}
+       })
+       when data_type in ["u", "r"],
+       do: valid_network_id?(network_id)
+
+  defp valid_naf_network_ids?(%{"dataType" => data_type}) when data_type in ["u", "r"],
+    do: false
+
+  defp valid_naf_network_ids?(%{"dataType" => "um", "data" => %{"d" => updates}})
+       when is_list(updates),
+       do: Enum.all?(updates, &valid_naf_update?/1)
+
+  defp valid_naf_network_ids?(%{"dataType" => "um"}), do: false
+  defp valid_naf_network_ids?(_payload), do: true
+
+  defp naf_payload_template(%{"data" => %{"template" => template}}), do: template
+  defp naf_payload_template(_payload), do: nil
+
+  defp bot_sensitive_payload?(%{"dataType" => "um", "data" => %{"d" => updates}}, socket)
+       when is_list(updates),
+       do: Enum.any?(updates, &bot_sensitive_update?(&1, socket))
+
+  defp bot_sensitive_payload?(%{"data" => data}, socket) when is_map(data),
+    do: bot_sensitive_update?(data, socket)
+
+  defp bot_sensitive_payload?(_payload, _socket), do: false
+
+  defp contains_first_sync?(value) when is_list(value),
+    do: Enum.any?(value, &contains_first_sync?/1)
+
+  defp contains_first_sync?(value) when is_map(value) do
+    Map.has_key?(value, "isFirstSync") or Enum.any?(Map.values(value), &contains_first_sync?/1)
+  end
+
+  defp contains_first_sync?(_value), do: false
+
+  defp bot_network_update?(%{"networkId" => network_id}, socket),
+    do: bot_network_id?(network_id, socket)
+
+  defp bot_network_update?(_update, _socket), do: false
+
+  defp bot_sensitive_update?(%{"template" => "#remote-bot-avatar"}, _socket), do: true
+
+  defp bot_sensitive_update?(update, socket) when is_map(update),
+    do: bot_network_update?(update, socket)
+
+  defp bot_sensitive_update?(_update, _socket), do: false
+
+  defp malformed_bot_avatar_update?(update, socket) when is_map(update) do
+    protected_network_id = bot_network_update?(update, socket)
+    dedicated_template = update["template"] == "#remote-bot-avatar"
+
+    (protected_network_id and (not dedicated_template or update["persistent"] !== false)) or
+      (dedicated_template and (not protected_network_id or update["persistent"] !== false))
+  end
+
+  defp malformed_bot_avatar_update?(_update, _socket), do: false
+
+  defp multi_update_permitted?(%{"template" => template}, socket),
+    do: spawn_permitted?(template, socket)
+
+  defp multi_update_permitted?(update, _socket), do: is_map(update)
+
   defp handle_entry_mode_change(socket, entry_mode) do
     hub = socket |> hub_for_socket
     account = Guardian.Phoenix.Socket.current_resource(socket)
 
     if account |> can?(close_hub(hub)) do
-      hub
-      |> Hub.changeset_for_entry_mode(entry_mode)
-      |> Repo.update!()
-      |> Repo.preload(Hub.hub_preloads())
-      |> broadcast_hub_refresh!(socket, ["entry_mode"])
-    end
+      result =
+        hub
+        |> Hub.changeset_for_entry_mode(entry_mode)
+        |> BotConfigAdmission.update(account)
 
-    {:noreply, socket}
+      case result do
+        {:ok, updated_hub} ->
+          updated_hub = Repo.preload(updated_hub, Hub.hub_preloads())
+          sync_bot_orchestrator(updated_hub)
+          broadcast_hub_refresh!(updated_hub, socket, ["entry_mode", "user_data"])
+          {:noreply, socket}
+
+        {:error, _changeset} ->
+          reply_error(socket, "hub_close_rejected")
+      end
+    else
+      {:noreply, socket}
+    end
   end
 
   defp with_account(socket, handler) do
@@ -953,6 +1291,129 @@ defmodule RetWeb.HubChannel do
   end
 
   defp secure_compare(_, _), do: false
+
+  defp authenticate_bot_runner_context(context, has_valid_bot_access_key) when is_map(context) do
+    case Map.get(context, "bot_runner") do
+      true when has_valid_bot_access_key ->
+        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", true), true}
+
+      true ->
+        {:error, %{message: "Bot runner authentication failed", reason: "invalid_bot_access_key"}}
+
+      value when value in [nil, false] ->
+        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", false), false}
+
+      _ ->
+        {:error, %{message: "Invalid bot runner request", reason: "invalid_bot_runner_request"}}
+    end
+  end
+
+  defp authenticate_bot_runner_context(_context, _has_valid_bot_access_key) do
+    {:ok, %{"bot_runner" => false}, false}
+  end
+
+  defp authenticated_bot_runner?(socket) do
+    socket.assigns.has_valid_bot_access_key === true and
+      is_map(socket.assigns.context) and socket.assigns.context["bot_runner"] === true
+  end
+
+  defp bot_runner?(socket) do
+    authenticated_bot_runner?(socket) and
+      is_binary(socket.assigns[:bot_runner_lease_id]) and
+      BotRunnerLease.authorized?(
+        socket.assigns.hub_sid,
+        socket.assigns.bot_runner_lease_id,
+        socket.assigns[:bot_runner_authority_epoch]
+      ) and bot_runner_presence_reflects_authority?(socket)
+  end
+
+  defp bot_runner_presence_reflects_authority?(socket) do
+    socket
+    |> Presence.get_by_key(socket.assigns.session_id)
+    |> then(fn
+      entry when is_map(entry) -> Map.get(entry, :metas) || Map.get(entry, "metas") || []
+      _entry -> []
+    end)
+    |> then(fn
+      metas when is_list(metas) -> metas
+      _metas -> []
+    end)
+    |> Enum.any?(fn
+      meta when is_map(meta) ->
+        context = Map.get(meta, :context) || Map.get(meta, "context") || %{}
+
+        is_map(context) and
+          (Map.get(context, :bot_runner) === true or Map.get(context, "bot_runner") === true) and
+          (Map.get(meta, :bot_runner_lease_id) || Map.get(meta, "bot_runner_lease_id")) ==
+            socket.assigns.bot_runner_lease_id and
+          (Map.get(meta, :bot_runner_authority_epoch) ||
+             Map.get(meta, "bot_runner_authority_epoch")) ==
+            socket.assigns.bot_runner_authority_epoch and
+          (Map.get(meta, :bot_runner_authoritative) === true or
+             Map.get(meta, "bot_runner_authoritative") === true)
+
+      _meta ->
+        false
+    end)
+  end
+
+  defp bot_runner_rejection_reason(socket) do
+    if authenticated_bot_runner?(socket),
+      do: "bot_runner_not_authoritative",
+      else: "bot_runner_required"
+  end
+
+  @doc false
+  def authoritative_bot_runner_lease_id(presence_state) when is_map(presence_state) do
+    presence_state
+    |> Enum.flat_map(fn {session_id, entry} ->
+      metas =
+        if is_map(entry), do: Map.get(entry, :metas) || Map.get(entry, "metas") || [], else: []
+
+      Enum.flat_map(metas, fn meta ->
+        context =
+          if is_map(meta), do: Map.get(meta, :context) || Map.get(meta, "context"), else: nil
+
+        lease_id =
+          if is_map(meta),
+            do: Map.get(meta, :bot_runner_lease_id) || Map.get(meta, "bot_runner_lease_id"),
+            else: nil
+
+        authority_epoch =
+          if is_map(meta),
+            do:
+              Map.get(meta, :bot_runner_authority_epoch) ||
+                Map.get(meta, "bot_runner_authority_epoch"),
+            else: nil
+
+        authoritative =
+          if is_map(meta),
+            do:
+              Map.get(meta, :bot_runner_authoritative) === true or
+                Map.get(meta, "bot_runner_authoritative") === true,
+            else: false
+
+        if is_map(context) and
+             (Map.get(context, "bot_runner") === true or Map.get(context, :bot_runner) === true) and
+             is_binary(lease_id) and authoritative and is_integer(authority_epoch) and
+             authority_epoch > 0 do
+          [{authority_epoch, to_string(session_id), lease_id}]
+        else
+          []
+        end
+      end)
+    end)
+    |> Enum.sort_by(fn {authority_epoch, session_id, lease_id} ->
+      {-authority_epoch, session_id, lease_id}
+    end)
+    |> List.first()
+    |> case do
+      {_authority_epoch, _session_id, lease_id} -> lease_id
+      nil -> nil
+    end
+  end
+
+  def authoritative_bot_runner_lease_id(_), do: nil
 
   defp account_for_socket(socket) do
     case Guardian.Phoenix.Socket.current_resource(socket) do
@@ -985,6 +1446,34 @@ defmodule RetWeb.HubChannel do
     {:ok, _} = Presence.track(socket, session_id, socket |> presence_meta_for_socket)
     push(socket, "presence_state", socket |> Presence.list())
 
+    {:noreply, assign(socket, :bot_runner_presence_tracked, true)}
+  end
+
+  def handle_info(
+        {:bot_runner_lease_authority, lease_id, authority_epoch, authoritative},
+        socket
+      ) do
+    if socket.assigns[:bot_runner_lease_id] == lease_id do
+      socket =
+        socket
+        |> assign(:bot_runner_authority_epoch, authority_epoch)
+        |> assign(:bot_runner_authoritative, authoritative)
+
+      socket =
+        if socket.assigns[:bot_runner_presence_tracked] do
+          broadcast_presence_update(socket)
+        else
+          socket
+        end
+
+      {:noreply, socket}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info({:waypoint_reservation_states, states}, socket) do
+    broadcast_waypoint_states(socket, states)
     {:noreply, socket}
   end
 
@@ -1004,6 +1493,8 @@ defmodule RetWeb.HubChannel do
   end
 
   def terminate(_reason, socket) do
+    unregister_bot_runner_lease(socket)
+
     # enable_terminate_actions is set to false during tests. Since the GenServer is forcefully
     # terminated when a test ends, we want to avoid running into an error that would happen if we
     # invoked a DB mutation during termination.
@@ -1011,6 +1502,8 @@ defmodule RetWeb.HubChannel do
       socket
       |> SessionStat.stat_query_for_socket()
       |> Repo.update_all(set: [ended_at: NaiveDateTime.utc_now()])
+
+      terminate_waypoint_reservation(socket)
     end
 
     :ok
@@ -1033,6 +1526,29 @@ defmodule RetWeb.HubChannel do
       pinned_by: socket.assigns.session_id
     })
   end
+
+  defp broadcast_waypoint_states(socket, states) do
+    Enum.each(states, fn state ->
+      broadcast!(socket, "waypoint_reservation:state", state)
+    end)
+  end
+
+  defp terminate_waypoint_reservation(%{assigns: %{waypoint_reservation: reservation}} = socket)
+       when reservation.supported do
+    result =
+      WaypointReservation.terminate_channel(
+        reservation.hub_id,
+        socket.assigns.session_id,
+        reservation.client_instance_id,
+        reservation.channel_id
+      )
+
+    Enum.each(result.states, fn state ->
+      RetWeb.Endpoint.broadcast(socket.topic, "waypoint_reservation:state", state)
+    end)
+  end
+
+  defp terminate_waypoint_reservation(_socket), do: :ok
 
   # Broadcasts the full hub info as well as an (optional) list of specific fields which
   # clients should consider stale and need to be updated in client state from the new
@@ -1072,7 +1588,18 @@ defmodule RetWeb.HubChannel do
       :hand_raised,
       :typing
     ])
+    |> maybe_put_bot_runner_lease(socket.assigns)
   end
+
+  defp maybe_put_bot_runner_lease(meta, %{has_valid_bot_access_key: true} = assigns) do
+    meta
+    |> Map.put(:bot_runner_lease_id, assigns.bot_runner_lease_id)
+    |> Map.put(:bot_runner_join_order, assigns.bot_runner_join_order)
+    |> Map.put(:bot_runner_authority_epoch, assigns.bot_runner_authority_epoch)
+    |> Map.put(:bot_runner_authoritative, assigns.bot_runner_authoritative)
+  end
+
+  defp maybe_put_bot_runner_lease(meta, _assigns), do: meta
 
   # Hubs Bot can set their own display name.
   defp maybe_override_identifiers(
@@ -1294,10 +1821,15 @@ defmodule RetWeb.HubChannel do
            |> assign(:presence, :lobby)
            |> assign(:oauth_account_id, params[:oauth_account_id])
            |> assign(:oauth_source, params[:oauth_source])
-           |> assign(:has_valid_bot_access_key, params[:has_valid_bot_access_key]),
+           |> assign(:has_valid_bot_access_key, params[:has_valid_bot_access_key])
+           |> assign_bot_runner_lease(params[:has_valid_bot_access_key], hub.hub_sid),
+         {socket, waypoint_capability, waypoint_states} <-
+           configure_waypoint_reservation(socket, hub, context, params),
          response <-
            HubView.render("show.json", %{hub: hub, embeddable: account |> can?(embed_hub(hub))}) do
       perms_token = params["perms_token"] || get_perms_token(hub, account)
+      bot_chat_capability = if account, do: new_bot_chat_capability(), else: nil
+      socket = assign(socket, :bot_chat_capability, bot_chat_capability)
 
       response =
         response
@@ -1309,6 +1841,12 @@ defmodule RetWeb.HubChannel do
         |> Map.put(:subscriptions, %{web_push: is_push_subscribed, favorites: is_favorited})
         |> Map.put(:perms_token, perms_token)
         |> Map.put(:hub_requires_oauth, params[:hub_requires_oauth])
+        |> Map.put(:bot_runner, params[:has_valid_bot_access_key] === true)
+        |> Map.put(:bot_runner_lease_id, socket.assigns[:bot_runner_lease_id])
+        |> Map.put(:bot_runner_authority_epoch, socket.assigns[:bot_runner_authority_epoch])
+        |> Map.put(:bot_runner_authoritative, socket.assigns[:bot_runner_authoritative])
+        |> Map.put(:bot_chat_capability, bot_chat_capability)
+        |> Map.put(:waypoint_reservation, waypoint_capability)
 
       existing_stat_count =
         socket
@@ -1326,6 +1864,7 @@ defmodule RetWeb.HubChannel do
       end
 
       send(self(), {:begin_tracking, socket.assigns.session_id, hub.hub_sid})
+      send(self(), {:waypoint_reservation_states, waypoint_states})
 
       # Send join push notification if this is the first joiner
       if Presence.list(socket.topic) |> Enum.count() == 0 do
@@ -1337,6 +1876,95 @@ defmodule RetWeb.HubChannel do
       Statix.increment("ret.channels.hub.joins.ok")
 
       {:ok, response, socket}
+    end
+  end
+
+  defp assign_bot_runner_lease(socket, true, hub_sid) do
+    {:ok, lease} = BotRunnerLease.register(hub_sid)
+
+    socket
+    |> assign(:bot_runner_lease_id, lease.lease_id)
+    |> assign(:bot_runner_join_order, lease.join_order)
+    |> assign(:bot_runner_authority_epoch, lease.authority_epoch)
+    |> assign(:bot_runner_authoritative, lease.authoritative)
+    |> assign(:bot_runner_presence_tracked, false)
+  end
+
+  defp assign_bot_runner_lease(socket, _authenticated, _hub_sid) do
+    socket
+    |> assign(:bot_runner_lease_id, nil)
+    |> assign(:bot_runner_join_order, nil)
+    |> assign(:bot_runner_authority_epoch, nil)
+    |> assign(:bot_runner_authoritative, false)
+    |> assign(:bot_runner_presence_tracked, false)
+  end
+
+  defp unregister_bot_runner_lease(%{
+         assigns: %{
+           hub_sid: hub_sid,
+           bot_runner_lease_id: lease_id,
+           has_valid_bot_access_key: true
+         }
+       })
+       when is_binary(lease_id) do
+    BotRunnerLease.unregister(hub_sid, lease_id)
+  end
+
+  defp unregister_bot_runner_lease(_socket), do: :ok
+
+  defp configure_waypoint_reservation(socket, hub, context, params) do
+    channel_id = SecureRandom.uuid()
+    bot_runner = context["bot_runner"] == true
+
+    registration =
+      if bot_runner do
+        :unsupported
+      else
+        WaypointReservation.join_client_instance(params["waypoint_reservation"])
+      end
+
+    case registration do
+      {:ok, client_instance_id} ->
+        result =
+          WaypointReservation.register_channel(
+            hub.hub_id,
+            socket.assigns.session_id,
+            client_instance_id,
+            channel_id
+          )
+
+        reservation = %{
+          supported: true,
+          hub_id: hub.hub_id,
+          client_instance_id: client_instance_id,
+          channel_id: channel_id,
+          bot_runner: false
+        }
+
+        capability = %{
+          protocol: WaypointReservation.protocol(),
+          supported: true,
+          lease_ms: WaypointReservation.lease_ms(),
+          request_timeout_ms: WaypointReservation.request_timeout_ms(),
+          snapshot_state_version: result.snapshot_state_version,
+          active: result.active,
+          current: result.current,
+          request_seq: result.request_seq
+        }
+
+        {assign(socket, :waypoint_reservation, reservation), capability, result.states}
+
+      :unsupported ->
+        reservation = %{
+          supported: false,
+          hub_id: hub.hub_id,
+          client_instance_id: nil,
+          channel_id: channel_id,
+          bot_runner: bot_runner
+        }
+
+        {assign(socket, :waypoint_reservation, reservation),
+         WaypointReservation.unsupported_capability(), []}
     end
   end
 
@@ -1404,10 +2032,45 @@ defmodule RetWeb.HubChannel do
 
     context = socket.assigns.context || %{}
 
+    socket =
+      socket
+      |> assign(:presence, :room)
+      |> assign(:context, context |> Map.delete("entering"))
+      |> broadcast_presence_update
+
+    case Guardian.Phoenix.Socket.current_resource(socket) do
+      %Ret.Account{account_id: account_id} ->
+        :ok =
+          BotChatPresence.track(
+            self(),
+            socket.assigns.hub_sid,
+            account_id,
+            socket.assigns.bot_chat_capability
+          )
+
+      _account ->
+        :ok
+    end
+
     socket
-    |> assign(:presence, :room)
-    |> assign(:context, context |> Map.delete("entering"))
-    |> broadcast_presence_update
+  end
+
+  defp rotate_bot_chat_capability(socket, %Account{account_id: account_id}) do
+    :ok = BotChatPresence.untrack(self())
+    capability = new_bot_chat_capability()
+    socket = assign(socket, :bot_chat_capability, capability)
+
+    if socket.assigns[:presence] == :room do
+      :ok = BotChatPresence.track(self(), socket.assigns.hub_sid, account_id, capability)
+    end
+
+    socket
+  end
+
+  defp new_bot_chat_capability do
+    24
+    |> :crypto.strong_rand_bytes()
+    |> Base.url_encode64(padding: false)
   end
 
   defp handle_max_occupant_update(socket, occupant_count) do
@@ -1519,9 +2182,9 @@ defmodule RetWeb.HubChannel do
   end
 
   defp sync_bot_orchestrator(%Hub{} = hub) do
-    bots = normalize_bots_config(hub.user_data)
+    bots = BotConfig.normalize(hub.user_data)
 
-    if bots["enabled"] && bots["count"] > 0 do
+    if hub.entry_mode != :deny && bots["enabled"] && bots["count"] > 0 do
       _ =
         BotOrchestrator.room_config(%{
           hub_sid: hub.hub_sid,
@@ -1535,66 +2198,6 @@ defmodule RetWeb.HubChannel do
     end
 
     :ok
-  end
-
-  defp normalize_bots_config(user_data) do
-    bots = map_get(user_data || %{}, "bots") || %{}
-
-    %{
-      "enabled" => normalize_bool(map_get(bots, "enabled")),
-      "count" => normalize_integer(map_get(bots, "count")),
-      "mobility" => normalize_mobility(map_get(bots, "mobility")),
-      "chat_enabled" => normalize_bool(map_get(bots, "chat_enabled")),
-      "prompt" => normalize_bot_prompt(map_get(bots, "prompt"))
-    }
-  end
-
-  defp normalize_integer(value) when is_integer(value), do: value |> max(0) |> min(10)
-
-  defp normalize_integer(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {parsed, ""} -> parsed
-      _ -> 0
-    end
-    |> max(0)
-    |> min(10)
-  end
-
-  defp normalize_integer(_), do: 0
-
-  defp normalize_bool(true), do: true
-  defp normalize_bool("true"), do: true
-  defp normalize_bool(1), do: true
-  defp normalize_bool(_), do: false
-
-  defp normalize_mobility("low"), do: "low"
-  defp normalize_mobility("high"), do: "high"
-  defp normalize_mobility("static"), do: "static"
-  defp normalize_mobility(_), do: "medium"
-
-  defp normalize_bot_prompt(value) when is_binary(value) do
-    value |> String.trim() |> String.slice(0, 1_500)
-  end
-
-  defp normalize_bot_prompt(_), do: ""
-
-  defp map_get(map, key) do
-    atom_key =
-      if is_binary(key) do
-        try do
-          String.to_existing_atom(key)
-        rescue
-          ArgumentError -> nil
-        end
-      else
-        key
-      end
-
-    cond do
-      is_map(map) and Map.has_key?(map, key) -> Map.get(map, key)
-      is_map(map) and atom_key != nil and Map.has_key?(map, atom_key) -> Map.get(map, atom_key)
-      true -> nil
-    end
   end
 
   defp reply_error(socket, reason) do

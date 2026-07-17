@@ -36,6 +36,43 @@ MIX_ENV=turkey mix release --overwrite
 2.18.0. Remove those acknowledgements as soon as a fixed cowlib release is
 available; any additional advisory remains a CI failure.
 
+### YenHubs singleton and reservation protocol
+
+`Ret.BotRunnerLease` arbitrates authenticated bot runners inside one Reticulum
+VM. Until that authority moves to a database lease with a fencing token, the
+complete Hubs CE profile must run exactly one Reticulum replica with a
+`Recreate` strategy and no Reticulum HorizontalPodAutoscaler. The manifest
+generator and verifier enforce this fail-closed boundary; rollouts therefore
+have a controlled Reticulum downtime window. `Recreate` reduces overlap during
+the standard rollout but is not a fencing primitive for node partitions or a
+stuck old VM. Abort readiness/deployment when more than one Reticulum pod or
+Endpoint exists. A database lease with fencing remains required for a complete
+cross-process exclusivity guarantee.
+
+Bot credentials are separated by authority. `bot_access_key` remains for the
+legacy `BotHeaderAuthorization` integration route and never reaches a runner.
+`bot_runner_access_key` alone authenticates bot snapshot reads and the Phoenix
+bot-runner join. `Ret.BotOrchestrator` uses an independent access key when it
+calls the parent bot-orchestrator service. Dashboard authorization has its own
+minimum-32-character key and fails closed when it is absent; it never falls
+back to either bot key. The legacy `x-ret-admin-access-key` header for
+RetNotice, SupportSubscription and Hub deletion is an alias of this same
+dashboard administrative domain in the generated CE config, not a fifth trust
+domain; both plug implementations reject missing, short, wrong or duplicate
+headers.
+
+Waypoint reservations use protocol 2. State-changing transactions allocate one
+global PostgreSQL `state_version` for their whole broadcast batch. Joins take a
+second sequence value after assembling `active` and `current`, exposing it as
+`snapshot_state_version`; clients use that floor to reject delayed pre-snapshot
+events for absent waypoints. Successful reserve, renew, and release replies carry
+the same version as their broadcast. Public state never carries the private
+`reservation_id`.
+
+For a compatible rollout, deploy the Reticulum migration and server first,
+verify readiness, and then deploy Hubs protocol 2. Old and new protocol peers
+negotiate reservations as unsupported in either mixed-version direction.
+
 ## Development
 
 ### 1. Install Prerequisite Packages:

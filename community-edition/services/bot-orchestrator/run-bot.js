@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+// Chromium is a manual visual diagnostic only. Strip authority/provider
+// credentials before loading Puppeteer so neither this wrapper nor the browser
+// process can observe secrets inherited from an operator shell or container.
+delete process.env.BOT_ORCHESTRATOR_ACCESS_KEY;
+delete process.env.BOT_RUNNER_ACCESS_KEY;
+delete process.env.OPENAI_API_KEY;
+
 const doc = `
 Usage:
     ./run-bot.js [options]
@@ -6,7 +13,6 @@ Options:
     -h --help            Show this screen
     -u --url=<url>       URL [default: https://meta-hubs.org]
     -r --room=<room>     Room id
-    --runner             Enable room bot-runner mode for this process
 `;
 
 const docopt = require("docopt").docopt;
@@ -95,10 +101,6 @@ function log(...objs) {
     bot: true,
     allow_multi: true
   };
-
-  if (options["--runner"]) {
-    params.bot_runner = true;
-  }
 
   const buildRunnerUrl = () => {
     const url = new URL(baseUrl);

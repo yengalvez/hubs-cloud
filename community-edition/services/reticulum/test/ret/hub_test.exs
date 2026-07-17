@@ -222,7 +222,7 @@ defmodule Ret.HubTest do
   end
 
   test "normalizes room bot limits and prompt", %{scene: scene} do
-    prompt = String.duplicate("a", 1_600)
+    prompt = String.duplicate("😀", 2_000)
 
     changeset =
       Hub.changeset(%Hub{}, scene, %{
@@ -233,7 +233,7 @@ defmodule Ret.HubTest do
             "count" => 99,
             "mobility" => "invalid",
             "chat_enabled" => true,
-            "prompt" => "  #{prompt}  "
+            "prompt" => "\u0085\uFEFF#{prompt}\uFEFF\u0085"
           }
         }
       })
@@ -244,7 +244,9 @@ defmodule Ret.HubTest do
     assert bots["count"] == 10
     assert bots["mobility"] == "medium"
     assert bots["chat_enabled"]
-    assert String.length(bots["prompt"]) == 1_500
+    assert bots["prompt"] == String.duplicate("😀", 1_500)
+    assert bots["prompt"] |> String.codepoints() |> length() == 1_500
+    assert byte_size(bots["prompt"]) == 6_000
   end
 
   test "preserves static room bot mobility", %{scene: scene} do

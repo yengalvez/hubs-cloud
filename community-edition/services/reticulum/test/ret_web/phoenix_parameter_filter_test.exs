@@ -6,6 +6,7 @@ defmodule RetWeb.PhoenixParameterFilterTest do
 
     values = %{
       "bot_access_key" => "internal-bot-key",
+      "bot_chat_capability" => "private-channel-capability",
       "access_token" => "session-token",
       "password" => "account-password",
       "client_secret" => "oauth-secret",
@@ -15,6 +16,7 @@ defmodule RetWeb.PhoenixParameterFilterTest do
 
     assert Phoenix.Logger.filter_values(values, filter_parameters) == %{
              "bot_access_key" => "[FILTERED]",
+             "bot_chat_capability" => "[FILTERED]",
              "access_token" => "[FILTERED]",
              "password" => "[FILTERED]",
              "client_secret" => "[FILTERED]",

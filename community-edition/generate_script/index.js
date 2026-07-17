@@ -4,6 +4,22 @@ const YAML = require("yaml");
 const pemJwk = require("pem-jwk");
 const utils = require("../utils");
 
+function generationOverrides() {
+  const hasInput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_INPUT_VALUES_PATH");
+  const hasOutput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_OUTPUT_PATH");
+  if (hasInput !== hasOutput) {
+    throw new Error("HCCE_INPUT_VALUES_PATH and HCCE_OUTPUT_PATH must be configured together");
+  }
+  if (!hasInput) return { inputPath: undefined, outputPath: undefined };
+
+  const input = process.env.HCCE_INPUT_VALUES_PATH;
+  const output = process.env.HCCE_OUTPUT_PATH;
+  if (!input || !input.trim() || !output || !output.trim()) {
+    throw new Error("HCCE generator path overrides must not be empty");
+  }
+  return { inputPath: path.resolve(input), outputPath: path.resolve(output) };
+}
+
 // Generate a private key and public key
 function generateKeys() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
@@ -39,9 +55,21 @@ function normalizePemPrivateKey(value) {
 function generatePersistentVolumes(processedConfig, replacedContent) {
   const yamlDocuments = YAML.parseAllDocuments(replacedContent);
   let outputIdx = 2;
-  processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS ||= 'manual';
+  const storageClass =
+    typeof processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS === "string"
+      ? processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS.trim()
+      : "";
+  if (!storageClass) {
+    throw new Error("PERSISTENT_VOLUME_STORAGE_CLASS must be configured explicitly");
+  }
+  processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS = storageClass;
+  if (storageClass === "manual" && processedConfig.ALLOW_MANUAL_HOSTPATH_STORAGE !== true) {
+    throw new Error(
+      "manual hostPath storage requires ALLOW_MANUAL_HOSTPATH_STORAGE: true and is not for production"
+    );
+  }
 
-  if ('manual' === processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+  if ('manual' === storageClass) {
     // Add in the persistent volume configs to the hcce.yaml file
     const persistent_volumes_template = utils.readTemplate("/generate_script", "persistent_volumes.yam");
     const replacedPersistentVolumesContent = utils.replacePlaceholders(persistent_volumes_template, processedConfig);
@@ -55,10 +83,10 @@ function generatePersistentVolumes(processedConfig, replacedContent) {
 
   // Adds in the persistent volume claims to the hcce.yaml file
   YAML.parseAllDocuments(replacedPersistentVolumeClaimsContent).forEach(doc => {
-    if ('default' !== processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+    if ('default' !== storageClass) {
       doc = doc.toJS();
-      doc.spec.storageClassName = processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS;
-      if ('manual' === processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+      doc.spec.storageClassName = storageClass;
+      if ('manual' === storageClass) {
         // ReadWriteOncePod is only supported for CSI volumes
         doc.spec.accessModes = ["ReadWriteOnce"];
       }
@@ -173,11 +201,10 @@ function handleImageOverrides(processedConfig, replacedContent) {
 // Main function to handle the script
 function main() {
   try {
-    const config = utils.readConfig();
-    const processedConfig = YAML.parse(
-      utils.replacePlaceholders(YAML.stringify(config), config),
-      {"schema": "yaml-1.1"} // required to load yes/no as boolean values
-    );
+    const { inputPath, outputPath } = generationOverrides();
+    // Values are already parsed YAML scalars. Do not reinterpret user-provided
+    // strings as templates: a secret containing `$NAME` must remain literal.
+    const processedConfig = utils.readConfig(inputPath);
 
     // Backward compatibility for older local files that still use OPENAI.
     if (!processedConfig.OPENAI_API_KEY && processedConfig.OPENAI) {
@@ -186,11 +213,35 @@ function main() {
 
     if (!processedConfig.BOT_ACCESS_KEY) {
       processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
+    } else if (String(processedConfig.BOT_ACCESS_KEY).length < 32) {
+      throw new Error("BOT_ACCESS_KEY must contain at least 32 characters");
     }
-    processedConfig.BOT_ACCESS_KEY_CHECKSUM = crypto
-      .createHash("sha256")
-      .update(String(processedConfig.BOT_ACCESS_KEY))
-      .digest("hex");
+    processedConfig.BOT_ACCESS_KEY = String(processedConfig.BOT_ACCESS_KEY);
+    for (const keyName of [
+      "BOT_RUNNER_ACCESS_KEY",
+      "BOT_ORCHESTRATOR_ACCESS_KEY",
+      "DASHBOARD_ACCESS_KEY"
+    ]) {
+      if (!processedConfig[keyName] || String(processedConfig[keyName]).length < 32) {
+        throw new Error(`${keyName} must be configured independently with at least 32 characters`);
+      }
+      processedConfig[keyName] = String(processedConfig[keyName]);
+    }
+    const separatedAccessKeys = [
+      "BOT_ACCESS_KEY",
+      "BOT_RUNNER_ACCESS_KEY",
+      "BOT_ORCHESTRATOR_ACCESS_KEY",
+      "DASHBOARD_ACCESS_KEY"
+    ];
+    if (new Set(separatedAccessKeys.map(name => processedConfig[name])).size !== separatedAccessKeys.length) {
+      throw new Error("Bot integration, runner, orchestrator and dashboard access keys must all be distinct");
+    }
+    for (const keyName of separatedAccessKeys) {
+      processedConfig[`${keyName}_CHECKSUM`] = crypto
+        .createHash("sha256")
+        .update(processedConfig[keyName])
+        .digest("hex");
+    }
     processedConfig.DB_CREDENTIAL_CHECKSUM = crypto
       .createHash("sha256")
       .update(
@@ -225,6 +276,10 @@ function main() {
     if (String(processedConfig.GHOST_NAVIGATION_MODE || "").toLowerCase().trim() !== "colliders") {
       processedConfig.GHOST_NAVIGATION_MODE = "navmesh_preferred";
     }
+    processedConfig.GHOST_NAVIGATION_REQUIRE_NAVMESH =
+      String(processedConfig.GHOST_NAVIGATION_REQUIRE_NAVMESH || "true").toLowerCase().trim() === "false"
+        ? "false"
+        : "true";
     if (!processedConfig.GHOST_NAVMESH_MAX_TRIANGLES) {
       processedConfig.GHOST_NAVMESH_MAX_TRIANGLES = "50000";
     }
@@ -234,12 +289,24 @@ function main() {
     if (!processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) {
       processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M = "3";
     }
-    if (!processedConfig.MAX_ACTIVE_ROOMS) {
-      processedConfig.MAX_ACTIVE_ROOMS = "5";
-    }
-    if (!processedConfig.MAX_BOTS_PER_ROOM) {
-      processedConfig.MAX_BOTS_PER_ROOM = "10";
-    }
+    processedConfig.GHOST_FEATURED_FETCH_TIMEOUT_MS = "4000";
+    processedConfig.GHOST_FEATURED_MAX_BYTES = "524288";
+    processedConfig.GHOST_FEATURED_MAX_REDIRECTS = "2";
+    processedConfig.GHOST_FEATURED_MAX_ENTRIES = "256";
+    processedConfig.GHOST_FEATURED_MAX_REFS = "128";
+    // Production generation is intentionally ghost-only. Chromium remains a
+    // manual diagnostic tool and cannot authenticate safely from a browser.
+    processedConfig.RUNNER_BACKEND = "ghost";
+    processedConfig.RUNNER_BACKEND_CANARY_HUBS = "";
+    processedConfig.OPENAI_MODEL = "gpt-5-nano";
+    processedConfig.OPENAI_TOTAL_BUDGET_MS = "4000";
+    const requestedMaxActiveRooms = Number(processedConfig.MAX_ACTIVE_ROOMS || 5);
+    processedConfig.MAX_ACTIVE_ROOMS = String(
+      Number.isFinite(requestedMaxActiveRooms) && requestedMaxActiveRooms > 0
+        ? Math.min(Math.floor(requestedMaxActiveRooms), 10)
+        : 5
+    );
+    processedConfig.MAX_BOTS_PER_ROOM = "10";
 
     // Keep PERMS_KEY stable across runs. Rotate only when missing.
     let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);
@@ -258,13 +325,16 @@ function main() {
     const template = utils.readTemplate("/generate_script", "hcce.yam");
     var replacedContent = utils.replacePlaceholders(template, processedConfig);
 
-    if (processedConfig.GENERATE_PERSISTENT_VOLUMES) {
-      replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
+    if (processedConfig.GENERATE_PERSISTENT_VOLUMES !== true) {
+      throw new Error(
+        "GENERATE_PERSISTENT_VOLUMES must be true; untracked /tmp hostPath storage is not a supported deployment"
+      );
     }
+    replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
 
-    utils.writeOutputFile(replacedContent, "", "hcce.yaml");
+    utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);
 
   } catch (error) {
     console.error("Error in main function:", error);

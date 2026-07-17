@@ -153,9 +153,31 @@ Now that we have uploaded our files, restored our SQL database, and redeployed o
 
 At this point in the process, we have successfully rehosted all of our files, however some parts of your instance may still be pointing towards the assets hosted on your old HC instance. This includes all asset urls referenced in your Spoke projects. We will follow these steps to rewrite the domain names of all incorrect references to point to the rehosted assets.
 
-1. Search for `DashboardHeaderAuthorization` in your hcce.yaml file and replace `dashboard_access_key` with a value of your choosing. Re-deploy your hcce.yaml file once configured and make sure to respawn your reticulum pod so that the changes will take effect.
+1. Configure a unique random `DASHBOARD_ACCESS_KEY` of at least 32 characters in your private input-values file. It must differ from every bot/integration key. Regenerate and deploy the manifest through the normal tracked procedure; never edit generated `hcce.yaml`.
 2. Execute into your reticulum pod: `kubectl exec -i <reticulum-pod-id> -n <your-namespace>`.
-3. Run the following rewrite command from within your reticulum pod: `curl -H "x-ret-dashboard-access-key:'{your-access-key}'" -H "Content-Type: application/json" -X POST -d {"old_domain":"{your-old-hubs-cloud-domain}", "new_domain": "{your-new-domain}"} 'https://localhost:4000/api-internal/v1/rewrite_assets' -k -v`
+3. From inside the Reticulum pod, create a mode-`0600` curl config that reads the already-mounted credential without
+   placing it in argv or shell history. Do not enable `set -x` or curl verbose output:
+
+   ```bash
+   (
+   umask 077
+   dashboard_curl_config="$(mktemp)"
+   trap 'rm -f -- "$dashboard_curl_config"' EXIT INT TERM
+   {
+     printf '%s\n' 'silent' 'show-error' 'fail-with-body'
+     printf 'header = "x-ret-dashboard-access-key: %s"\n' "$turkeyCfg_DASHBOARD_ACCESS_KEY"
+   } >"$dashboard_curl_config"
+   curl --config "$dashboard_curl_config" --insecure \
+     --header 'Content-Type: application/json' \
+     --request POST \
+     --data '{"old_domain":"{your-old-hubs-cloud-domain}","new_domain":"{your-new-domain}"}' \
+     'https://localhost:4000/api-internal/v1/rewrite_assets'
+   )
+   ```
+
+   The subshell exits immediately after the request, so its trap removes the config on success, failure or
+   interruption. Never put the credential literal in the command or use `-v`, because either can expose the
+   administrative header.
 
 ### Conclusion and Alternative Methods
 

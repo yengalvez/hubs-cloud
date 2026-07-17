@@ -19,6 +19,12 @@ defmodule RetWeb.HealthController do
     send_resp(conn, 200, "ok")
   end
 
+  def capabilities(conn, _params) do
+    json(conn, %{
+      waypoint_reservation: Ret.WaypointReservation.capability_contract()
+    })
+  end
+
   defp module_config(key) do
     Application.get_env(:ret, __MODULE__)[key]
   end

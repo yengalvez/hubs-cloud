@@ -3,7 +3,8 @@ import Config
 # General application configuration
 
 config :ret,
-  ecto_repos: [Ret.Repo, Ret.SessionLockRepo]
+  ecto_repos: [Ret.Repo, Ret.SessionLockRepo],
+  max_active_bot_rooms: 5
 
 config :phoenix, :format_encoders, "json-api": Jason
 config :phoenix, :json_library, Jason
@@ -17,6 +18,10 @@ config :phoenix, :filter_parameters, [
   "message",
   "prompt",
   "bot_access_key",
+  "bot_runner_access_key",
+  "bot_orchestrator_access_key",
+  "bot_chat_capability",
+  "dashboard_access_key",
   "token",
   "password",
   "secret"
