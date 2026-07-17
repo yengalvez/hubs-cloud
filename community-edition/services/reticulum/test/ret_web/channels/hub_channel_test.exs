@@ -67,6 +67,344 @@ defmodule RetWeb.HubChannelTest do
     end
   end
 
+  describe "bot runner presence context" do
+    setup do
+      original_bot_access_key = Application.get_env(:ret, :bot_access_key)
+      bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
+
+      Application.put_env(:ret, :bot_access_key, bot_access_key)
+
+      on_exit(fn ->
+        if is_nil(original_bot_access_key) do
+          Application.delete_env(:ret, :bot_access_key)
+        else
+          Application.put_env(:ret, :bot_access_key, original_bot_access_key)
+        end
+      end)
+
+      {:ok, bot_access_key: bot_access_key}
+    end
+
+    test "publishes bot_runner=true only for a boolean request with a valid access key", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, %{session_id: session_id, bot_runner: true}, socket} = join_hub(socket, hub, params)
+
+      assert presence_context(socket, session_id)["bot_runner"] === true
+
+      network_id = bot_network_id(hub, 1)
+
+      assert_reply push(socket, "naf", bot_spawn_payload(network_id)), :ok, %{
+        bot_spawn_accepted: true,
+        network_id: ^network_id
+      }
+    end
+
+    test "rejects bot_runner=true when the access key is omitted", %{
+      socket: socket,
+      hub: hub
+    } do
+      params = join_params(%{"context" => %{"bot_runner" => true}})
+
+      assert {:error, %{reason: "invalid_bot_access_key"}} = join_hub(socket, hub, params)
+    end
+
+    test "rejects bot_runner=true when the access key is incorrect", %{
+      socket: socket,
+      hub: hub
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => String.duplicate("wrong-bot-access-key-", 2),
+          "context" => %{"bot_runner" => true}
+        })
+
+      assert {:error, %{reason: "invalid_bot_access_key"}} = join_hub(socket, hub, params)
+    end
+
+    test "rejects a string bot_runner value even with a valid access key", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => "true"}
+        })
+
+      assert {:error, %{reason: "invalid_bot_runner_request"}} = join_hub(socket, hub, params)
+    end
+
+    test "normalizes a non-map context instead of crashing the join", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => "bot_runner"
+        })
+
+      {:ok, %{session_id: session_id, bot_runner: false}, socket} = join_hub(socket, hub, params)
+
+      assert presence_context(socket, session_id) === %{"bot_runner" => false}
+    end
+
+    test "does not allow a normal client to spawn the dedicated bot avatar template", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+
+      assert_reply push(socket, "naf", bot_spawn_payload(bot_network_id(hub, 1))), :error, %{
+        reason: "bot_runner_required"
+      }
+    end
+
+    test "does not let a bot avatar update fall through the generic NAF handler", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+
+      assert_reply push(socket, "naf", bot_update_payload(bot_network_id(hub, 1))), :error, %{
+        reason: "bot_runner_required"
+      }
+    end
+
+    test "does not let a bot avatar multi-update bypass authorization", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+
+      payload = %{
+        "dataType" => "um",
+        "data" => %{"d" => [bot_update_payload(bot_network_id(hub, 1))["data"]]}
+      }
+
+      assert_reply push(socket, "naf", payload), :error, %{reason: "bot_runner_required"}
+
+      raw_payload = put_in(payload, ["data", "template"], "#remote-avatar")
+
+      assert_reply push(socket, "nafr", %{"naf" => Jason.encode!(raw_payload)}), :error, %{
+        reason: "bot_runner_required"
+      }
+    end
+
+    test "does not let an escaped bot template bypass authorization through raw NAF", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+
+      raw_payload =
+        ~S({"dataType":"u","data":{"networkId":"BOT_NETWORK_ID","template":"#remote-bot-\u0061vatar","persistent":false,"\u0069sFirstSync":true}})
+        |> String.replace("BOT_NETWORK_ID", bot_network_id(hub, 1))
+
+      assert_reply push(socket, "nafr", %{"naf" => raw_payload}), :error, %{
+        reason: "bot_runner_required"
+      }
+    end
+
+    test "does not allow a compound selector to reach the dedicated bot template", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+      {:ok, observer_socket} = connect(SessionSocket, %{})
+      {:ok, _response, _observer_socket} = join_hub(observer_socket, hub, @default_join_params)
+
+      template = "#remote-bot-avatar, #nonexistent-avatar"
+
+      payload =
+        bot_spawn_payload("room-bot-selector")
+        |> put_in(["data", "template"], template)
+
+      push(socket, "naf", payload)
+
+      refute_push "naf", %{"data" => %{"template" => ^template}}, 100
+
+      push(socket, "nafr", %{"naf" => Jason.encode!(payload)})
+
+      refute_push "nafr", %{"naf" => _raw_payload}, 100
+    end
+
+    test "rejects a bot spawn without a usable network id", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, %{bot_runner: true}, socket} = join_hub(socket, hub, params)
+
+      assert_reply push(socket, "naf", bot_spawn_payload("")), :error, %{
+        reason: "invalid_network_id"
+      }
+
+      malformed =
+        bot_update_payload(bot_network_id(hub, 1))
+        |> update_in(["data"], &Map.delete(&1, "persistent"))
+
+      assert_reply push(socket, "naf", malformed), :error, %{
+        reason: "invalid_bot_spawn_payload"
+      }
+    end
+
+    test "reserves the exact per-hub bot network namespace for bot-1 through bot-10", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, %{bot_runner: true}, socket} = join_hub(socket, hub, params)
+
+      for network_id <- [
+            bot_network_id(hub, 11),
+            "room-bot-other-hub-bot-1",
+            "arbitrary-bot-id"
+          ] do
+        assert_reply push(socket, "naf", bot_spawn_payload(network_id)), :error, %{
+          reason: "invalid_network_id"
+        }
+      end
+    end
+
+    test "normal clients cannot precreate, update, or remove a protected bot network id", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+      network_id = bot_network_id(hub, 1)
+
+      generic_spawn =
+        bot_spawn_payload(network_id)
+        |> put_in(["data", "template"], "#remote-avatar")
+
+      assert_reply push(socket, "naf", generic_spawn), :error, %{
+        reason: "reserved_bot_network_id"
+      }
+
+      for update <- [
+            bot_update_payload(network_id) |> update_in(["data"], &Map.delete(&1, "template")),
+            bot_update_payload(network_id) |> put_in(["data", "template"], "#remote-avatar")
+          ] do
+        assert_reply push(socket, "naf", update), :error, %{
+          reason: "invalid_bot_spawn_payload"
+        }
+
+        assert_reply push(socket, "nafr", %{"naf" => Jason.encode!(update)}), :error, %{
+          reason: "invalid_bot_spawn_payload"
+        }
+      end
+
+      remove = %{"dataType" => "r", "data" => %{"networkId" => network_id}}
+      assert_reply push(socket, "naf", remove), :error, %{reason: "bot_runner_required"}
+
+      assert_reply push(socket, "nafr", %{"naf" => Jason.encode!(remove)}), :error, %{
+        reason: "bot_runner_required"
+      }
+    end
+
+    test "rejects array network ids before JavaScript can coerce them into the bot namespace", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+      protected_network_id = bot_network_id(hub, 1)
+      coercible_network_id = [protected_network_id]
+
+      generic_first_sync =
+        bot_spawn_payload(coercible_network_id)
+        |> put_in(["data", "template"], "#remote-avatar")
+
+      for {event, payload} <- [
+            {"naf", generic_first_sync},
+            {"nafr", %{"naf" => Jason.encode!(generic_first_sync)}}
+          ] do
+        assert_reply push(socket, event, payload), :error, %{reason: "invalid_network_id"}
+      end
+
+      update_without_template = %{
+        "dataType" => "u",
+        "data" => %{
+          "networkId" => coercible_network_id,
+          "persistent" => false,
+          "owner" => "attacker",
+          "lastOwnerTime" => 9_007_199_254_740_991,
+          "components" => %{"0" => %{"x" => 999}}
+        }
+      }
+
+      remove = %{"dataType" => "r", "data" => %{"networkId" => coercible_network_id}}
+
+      multi_update = %{
+        "dataType" => "um",
+        "data" => %{
+          "d" => [
+            %{
+              "networkId" => "ordinary-avatar",
+              "template" => "#remote-avatar",
+              "persistent" => false
+            },
+            update_without_template["data"]
+          ]
+        }
+      }
+
+      for malformed <- [update_without_template, remove, multi_update],
+          {event, payload} <- [
+            {"naf", malformed},
+            {"nafr", %{"naf" => Jason.encode!(malformed)}}
+          ] do
+        assert_reply push(socket, event, payload), :error, %{reason: "invalid_network_id"}
+      end
+    end
+
+    test "multi-update authorization follows protected network ids even without a template", %{
+      socket: socket,
+      hub: hub
+    } do
+      {:ok, %{bot_runner: false}, socket} = join_hub(socket, hub, @default_join_params)
+
+      update = %{
+        "networkId" => bot_network_id(hub, 1),
+        "persistent" => false,
+        "components" => %{"0" => %{"x" => 1}}
+      }
+
+      payload = %{"dataType" => "um", "data" => %{"d" => [update]}}
+
+      assert_reply push(socket, "naf", payload), :error, %{
+        reason: "invalid_bot_spawn_payload"
+      }
+
+      assert_reply push(socket, "nafr", %{"naf" => Jason.encode!(payload)}), :error, %{
+        reason: "invalid_bot_spawn_payload"
+      }
+    end
+  end
+
   describe "hub invites" do
     test "join is denied when joining without an invite", %{socket: socket} do
       %{hub: hub} = create_invite_only_hub()
@@ -190,6 +528,44 @@ defmodule RetWeb.HubChannelTest do
 
   defp join_hub(socket, %Hub{} = hub, params) do
     subscribe_and_join(socket, "hub:#{hub.hub_sid}", params)
+  end
+
+  defp presence_context(socket, session_id) do
+    :timer.sleep(100)
+
+    socket
+    |> Presence.list()
+    |> Map.fetch!(session_id)
+    |> Map.fetch!(:metas)
+    |> List.first()
+    |> Map.fetch!(:context)
+  end
+
+  defp bot_spawn_payload(network_id) do
+    %{
+      "dataType" => "u",
+      "data" => %{
+        "isFirstSync" => true,
+        "persistent" => false,
+        "template" => "#remote-bot-avatar",
+        "networkId" => network_id
+      }
+    }
+  end
+
+  defp bot_update_payload(network_id) do
+    %{
+      "dataType" => "u",
+      "data" => %{
+        "persistent" => false,
+        "template" => "#remote-bot-avatar",
+        "networkId" => network_id
+      }
+    }
+  end
+
+  defp bot_network_id(%Hub{hub_sid: hub_sid}, bot_number) do
+    "room-bot-#{hub_sid}-bot-#{bot_number}"
   end
 
   defp create_invite_only_hub() do

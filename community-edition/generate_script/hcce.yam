@@ -715,6 +715,8 @@ spec:
               key: OPENAI_API_KEY
         - name: OPENAI_MODEL
           value: gpt-5-nano
+        - name: OPENAI_TOTAL_BUDGET_MS
+          value: "$OPENAI_TOTAL_BUDGET_MS"
         - name: RUNNER_AUTOSTART
           value: "true"
         - name: RUNNER_BACKEND
@@ -729,12 +731,26 @@ spec:
           value: "$GHOST_RAYCAST_MODE"
         - name: GHOST_NAVIGATION_MODE
           value: "$GHOST_NAVIGATION_MODE"
+        - name: GHOST_NAVIGATION_REQUIRE_NAVMESH
+          value: "$GHOST_NAVIGATION_REQUIRE_NAVMESH"
+        - name: GHOST_NAVIGATION_RECOVERY_RESTART_MS
+          value: "30000"
         - name: GHOST_NAVMESH_MAX_TRIANGLES
           value: "$GHOST_NAVMESH_MAX_TRIANGLES"
         - name: GHOST_NAVMESH_MAX_ROUTE_POINTS
           value: "$GHOST_NAVMESH_MAX_ROUTE_POINTS"
         - name: GHOST_NAVMESH_MAX_SNAP_DISTANCE_M
           value: "$GHOST_NAVMESH_MAX_SNAP_DISTANCE_M"
+        - name: GHOST_FEATURED_FETCH_TIMEOUT_MS
+          value: "$GHOST_FEATURED_FETCH_TIMEOUT_MS"
+        - name: GHOST_FEATURED_MAX_BYTES
+          value: "$GHOST_FEATURED_MAX_BYTES"
+        - name: GHOST_FEATURED_MAX_REDIRECTS
+          value: "$GHOST_FEATURED_MAX_REDIRECTS"
+        - name: GHOST_FEATURED_MAX_ENTRIES
+          value: "$GHOST_FEATURED_MAX_ENTRIES"
+        - name: GHOST_FEATURED_MAX_REFS
+          value: "$GHOST_FEATURED_MAX_REFS"
         - name: GHOST_SCENE_FETCH_TIMEOUT_MS
           value: "10000"
         - name: GHOST_SCENE_MAX_BYTES
@@ -762,7 +778,7 @@ spec:
           periodSeconds: 15
         readinessProbe:
           httpGet:
-            path: /health
+            path: /ready
             port: 5001
           initialDelaySeconds: 5
           periodSeconds: 10

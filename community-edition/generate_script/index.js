@@ -4,6 +4,22 @@ const YAML = require("yaml");
 const pemJwk = require("pem-jwk");
 const utils = require("../utils");
 
+function generationOverrides() {
+  const hasInput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_INPUT_VALUES_PATH");
+  const hasOutput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_OUTPUT_PATH");
+  if (hasInput !== hasOutput) {
+    throw new Error("HCCE_INPUT_VALUES_PATH and HCCE_OUTPUT_PATH must be configured together");
+  }
+  if (!hasInput) return { inputPath: undefined, outputPath: undefined };
+
+  const input = process.env.HCCE_INPUT_VALUES_PATH;
+  const output = process.env.HCCE_OUTPUT_PATH;
+  if (!input || !input.trim() || !output || !output.trim()) {
+    throw new Error("HCCE generator path overrides must not be empty");
+  }
+  return { inputPath: path.resolve(input), outputPath: path.resolve(output) };
+}
+
 // Generate a private key and public key
 function generateKeys() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
@@ -173,7 +189,8 @@ function handleImageOverrides(processedConfig, replacedContent) {
 // Main function to handle the script
 function main() {
   try {
-    const config = utils.readConfig();
+    const { inputPath, outputPath } = generationOverrides();
+    const config = utils.readConfig(inputPath);
     const processedConfig = YAML.parse(
       utils.replacePlaceholders(YAML.stringify(config), config),
       {"schema": "yaml-1.1"} // required to load yes/no as boolean values
@@ -186,7 +203,10 @@ function main() {
 
     if (!processedConfig.BOT_ACCESS_KEY) {
       processedConfig.BOT_ACCESS_KEY = crypto.randomBytes(32).toString("hex");
+    } else if (String(processedConfig.BOT_ACCESS_KEY).length < 32) {
+      throw new Error("BOT_ACCESS_KEY must contain at least 32 characters");
     }
+    processedConfig.BOT_ACCESS_KEY = String(processedConfig.BOT_ACCESS_KEY);
     processedConfig.BOT_ACCESS_KEY_CHECKSUM = crypto
       .createHash("sha256")
       .update(String(processedConfig.BOT_ACCESS_KEY))
@@ -225,6 +245,10 @@ function main() {
     if (String(processedConfig.GHOST_NAVIGATION_MODE || "").toLowerCase().trim() !== "colliders") {
       processedConfig.GHOST_NAVIGATION_MODE = "navmesh_preferred";
     }
+    processedConfig.GHOST_NAVIGATION_REQUIRE_NAVMESH =
+      String(processedConfig.GHOST_NAVIGATION_REQUIRE_NAVMESH || "true").toLowerCase().trim() === "false"
+        ? "false"
+        : "true";
     if (!processedConfig.GHOST_NAVMESH_MAX_TRIANGLES) {
       processedConfig.GHOST_NAVMESH_MAX_TRIANGLES = "50000";
     }
@@ -234,12 +258,24 @@ function main() {
     if (!processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) {
       processedConfig.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M = "3";
     }
-    if (!processedConfig.MAX_ACTIVE_ROOMS) {
-      processedConfig.MAX_ACTIVE_ROOMS = "5";
-    }
-    if (!processedConfig.MAX_BOTS_PER_ROOM) {
-      processedConfig.MAX_BOTS_PER_ROOM = "10";
-    }
+    processedConfig.GHOST_FEATURED_FETCH_TIMEOUT_MS = "4000";
+    processedConfig.GHOST_FEATURED_MAX_BYTES = "524288";
+    processedConfig.GHOST_FEATURED_MAX_REDIRECTS = "2";
+    processedConfig.GHOST_FEATURED_MAX_ENTRIES = "256";
+    processedConfig.GHOST_FEATURED_MAX_REFS = "128";
+    // Production generation is intentionally ghost-only. Chromium remains a
+    // manual diagnostic tool and cannot authenticate safely from a browser.
+    processedConfig.RUNNER_BACKEND = "ghost";
+    processedConfig.RUNNER_BACKEND_CANARY_HUBS = "";
+    processedConfig.OPENAI_MODEL = "gpt-5-nano";
+    processedConfig.OPENAI_TOTAL_BUDGET_MS = "4000";
+    const requestedMaxActiveRooms = Number(processedConfig.MAX_ACTIVE_ROOMS || 5);
+    processedConfig.MAX_ACTIVE_ROOMS = String(
+      Number.isFinite(requestedMaxActiveRooms) && requestedMaxActiveRooms > 0
+        ? Math.min(Math.floor(requestedMaxActiveRooms), 10)
+        : 5
+    );
+    processedConfig.MAX_BOTS_PER_ROOM = "10";
 
     // Keep PERMS_KEY stable across runs. Rotate only when missing.
     let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);
@@ -264,7 +300,7 @@ function main() {
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
 
-    utils.writeOutputFile(replacedContent, "", "hcce.yaml");
+    utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);
 
   } catch (error) {
     console.error("Error in main function:", error);

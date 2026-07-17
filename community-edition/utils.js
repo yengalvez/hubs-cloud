@@ -4,9 +4,8 @@ const YAML = require("yaml");
 
 module.exports = {
   // Function to read and parse YAML config file
-  readConfig: function readConfig() {
+  readConfig: function readConfig(configPath = path.join(process.cwd(), "input-values.yaml")) {
     try {
-      const configPath = path.join(process.cwd(), "input-values.yaml");
       const fileContents = fs.readFileSync(configPath, "utf8");
       return YAML.parse(fileContents);
     } catch (error) {
@@ -28,9 +27,9 @@ module.exports = {
   },
 
   // Function to write the YAML output file
-  writeOutputFile: function writeOutputFile(content, folder, filepath) {
+  writeOutputFile: function writeOutputFile(content, folder, filepath, explicitOutputPath = null) {
     try {
-      const outputPath = path.join(process.cwd(), folder, filepath);
+      const outputPath = explicitOutputPath || path.join(process.cwd(), folder, filepath);
       fs.writeFileSync(outputPath, content, "utf8");
       console.log(`${filepath} file generated successfully.`);
     } catch (error) {

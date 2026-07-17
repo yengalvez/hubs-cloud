@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const YAML = require("yaml");
 
 const manifestPath = process.env.HCCE_MANIFEST_PATH
@@ -167,6 +168,12 @@ if (!fs.existsSync(manifestPath)) {
   });
   const resources = documents.map(document => document.toJS()).filter(Boolean);
 
+  const configsSecret = findResource(resources, "Secret", "configs");
+  const botAccessKey = configsSecret?.stringData?.BOT_ACCESS_KEY;
+  if (typeof botAccessKey !== "string" || botAccessKey.length < 32) {
+    fail("Secret/configs BOT_ACCESS_KEY must contain at least 32 characters");
+  }
+
   const retConfig = findResource(resources, "ConfigMap", "ret-config");
   const reticulum = findResource(resources, "Deployment", "reticulum");
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
@@ -277,8 +284,12 @@ if (!fs.existsSync(manifestPath)) {
     reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
   const botOrchestratorBotKeyChecksum =
     botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
-  if (!/^[a-f0-9]{64}$/i.test(reticulumBotKeyChecksum || "")) {
-    fail("Deployment/reticulum must carry the bot access key checksum annotation");
+  const expectedBotKeyChecksum =
+    typeof botAccessKey === "string"
+      ? crypto.createHash("sha256").update(botAccessKey).digest("hex")
+      : "";
+  if (reticulumBotKeyChecksum !== expectedBotKeyChecksum) {
+    fail("Deployment/reticulum bot access key checksum must match Secret/configs");
   }
   if (botOrchestratorBotKeyChecksum !== reticulumBotKeyChecksum) {
     fail("Reticulum and bot-orchestrator must share the bot access key checksum annotation");
@@ -345,15 +356,51 @@ if (!fs.existsSync(manifestPath)) {
     const botEnv = Object.fromEntries(
       (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
     );
+    if (botEnv.RUNNER_BACKEND !== "ghost" || botEnv.RUNNER_AUTOSTART !== "true") {
+      fail("bot-orchestrator production runtime must autostart the authenticated ghost backend");
+    }
+    if (botEnv.RUNNER_BACKEND_CANARY_HUBS !== "") {
+      fail("bot-orchestrator production runtime must not use Chromium canary routing");
+    }
+    if (
+      botEnv.OPENAI_MODEL !== "gpt-5-nano" ||
+      Number(botEnv.OPENAI_TOTAL_BUDGET_MS) !== 4000
+    ) {
+      fail("bot-orchestrator must use the audited GPT-5 Nano contract within Reticulum's timeout");
+    }
+    if (Number(botEnv.MAX_BOTS_PER_ROOM) !== 10) {
+      fail("bot-orchestrator production runtime must enforce at most ten bots per room");
+    }
+    if (
+      !Number.isInteger(Number(botEnv.MAX_ACTIVE_ROOMS)) ||
+      Number(botEnv.MAX_ACTIVE_ROOMS) < 1 ||
+      Number(botEnv.MAX_ACTIVE_ROOMS) > 10
+    ) {
+      fail("bot-orchestrator production runtime must enforce at most ten active ghost rooms");
+    }
     if (botEnv.GHOST_NAVIGATION_MODE !== "navmesh_preferred") {
       fail("bot-orchestrator must prefer navmesh navigation");
+    }
+    if (botEnv.GHOST_NAVIGATION_REQUIRE_NAVMESH !== "true") {
+      fail("bot-orchestrator must fail closed when the scene navmesh is unavailable");
+    }
+    const botReadinessPath = botContainer.readinessProbe?.httpGet?.path;
+    const botLivenessPath = botContainer.livenessProbe?.httpGet?.path;
+    if (botReadinessPath !== "/ready" || botLivenessPath !== "/health") {
+      fail("bot-orchestrator must separate authoritative readiness from liveness");
     }
     if (
       Number(botEnv.GHOST_NAVMESH_MAX_TRIANGLES) !== 50000 ||
       Number(botEnv.GHOST_NAVMESH_MAX_ROUTE_POINTS) !== 64 ||
-      Number(botEnv.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) !== 3
+      Number(botEnv.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) !== 3 ||
+      Number(botEnv.GHOST_NAVIGATION_RECOVERY_RESTART_MS) !== 30000 ||
+      Number(botEnv.GHOST_FEATURED_FETCH_TIMEOUT_MS) !== 4000 ||
+      Number(botEnv.GHOST_FEATURED_MAX_BYTES) !== 524288 ||
+      Number(botEnv.GHOST_FEATURED_MAX_REDIRECTS) !== 2 ||
+      Number(botEnv.GHOST_FEATURED_MAX_ENTRIES) !== 256 ||
+      Number(botEnv.GHOST_FEATURED_MAX_REFS) !== 128
     ) {
-      fail("bot-orchestrator navmesh safety limits do not match the audited baseline");
+      fail("bot-orchestrator navigation and Featured-fetch limits do not match the audited baseline");
     }
   }
 

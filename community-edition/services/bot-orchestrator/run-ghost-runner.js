@@ -48,6 +48,48 @@ function safeJsonParse(text) {
   }
 }
 
+async function retryWithBackoff(
+  operation,
+  {
+    maxAttempts = 3,
+    baseDelayMs = 500,
+    maxDelayMs = 2000,
+    sleep = delayMs => new Promise(resolve => setTimeout(resolve, delayMs)),
+    onRetry = () => {}
+  } = {}
+) {
+  const boundedAttempts = clamp(Math.floor(Number(maxAttempts) || 1), 1, 5);
+  const boundedBaseDelay = clamp(Math.floor(Number(baseDelayMs) || 0), 0, 5000);
+  const boundedMaxDelay = clamp(Math.floor(Number(maxDelayMs) || 0), boundedBaseDelay, 10_000);
+
+  let lastError;
+  for (let attempt = 1; attempt <= boundedAttempts; attempt += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= boundedAttempts) break;
+      const delayMs = Math.min(boundedBaseDelay * 2 ** (attempt - 1), boundedMaxDelay);
+      onRetry(error, attempt, delayMs);
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+function scheduleNavigationRecoveryRestart({
+  required,
+  delayMs = 30_000,
+  scheduleFn = setTimeout,
+  exitFn = code => process.exit(code)
+}) {
+  if (!required) return null;
+  const boundedDelayMs = clamp(Math.floor(Number(delayMs) || 30_000), 5_000, 300_000);
+  return scheduleFn(() => exitFn(1), boundedDelayMs);
+}
+
 function parseVec3Like(value, fallback = [0, 0, 0]) {
   if (Array.isArray(value) && value.length >= 3) {
     return [
@@ -157,7 +199,7 @@ function createTimekeeper(baseUrl) {
     }
     setInterval(() => {
       update().catch(err => log("time offset update failed:", err.message));
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000).unref();
   };
 
   const nowMs = () => {
@@ -1155,6 +1197,49 @@ function normalizeBotsConfig(bots) {
   };
 }
 
+function navigationReady({ navigationMode, requireNavmesh, waypointData }) {
+  if (navigationMode !== "navmesh_preferred" || !requireNavmesh) return true;
+  if (!waypointData || !waypointData.navPlanner) return false;
+
+  return !!(
+    (Array.isArray(waypointData.spawnPoints) && waypointData.spawnPoints.length) ||
+    (Array.isArray(waypointData.patrolPoints) && waypointData.patrolPoints.length)
+  );
+}
+
+function deriveBotRuntimeStatus({
+  enabled,
+  desired,
+  active,
+  navigationIsReady,
+  authenticated,
+  pending = 0,
+  spawnRejected = false
+}) {
+  const boundedDesired = enabled ? clamp(Number(desired) || 0, 0, 10) : 0;
+  const boundedActive = clamp(Number(active) || 0, 0, 10);
+  const boundedPending = clamp(Number(pending) || 0, 0, 10);
+  let reason = "ready";
+  if (!enabled || boundedDesired === 0) reason = "disabled";
+  else if (authenticated !== true) reason = "unauthenticated";
+  else if (!navigationIsReady) reason = "navmesh_unavailable";
+  else if (boundedActive === boundedDesired) reason = "ready";
+  else if (boundedPending > 0) reason = "spawn_pending";
+  else if (spawnRejected) reason = "spawn_rejected";
+  else reason = "insufficient_clearance";
+
+  return {
+    desired: boundedDesired,
+    active: boundedActive,
+    pending: boundedPending,
+    navigationReady: !!navigationIsReady,
+    authenticated: authenticated === true,
+    authoritativeSpawnAcks: true,
+    ready: reason === "ready",
+    reason
+  };
+}
+
 const MOBILITY_BEHAVIOR = {
   static: { speedMps: 0, idleMinMs: Number.POSITIVE_INFINITY, idleMaxMs: Number.POSITIVE_INFINITY },
   low: { speedMps: 0.45, idleMinMs: 8000, idleMaxMs: 22000 },
@@ -1195,33 +1280,278 @@ function separateNearbyPosition(basePos, botIndex, usedPositions) {
   return pos;
 }
 
+function positionHasClearance(position, usedPositions, minimumDistanceM = 0.65) {
+  const minimumDistanceSq = minimumDistanceM * minimumDistanceM;
+  return usedPositions.every(other => {
+    const dx = other[0] - position[0];
+    const dz = other[2] - position[2];
+    return dx * dx + dz * dz >= minimumDistanceSq;
+  });
+}
+
+function findSeparatedNavmeshPosition(basePos, botIndex, usedPositions, navPlanner) {
+  if (!navPlanner || typeof navPlanner.projectPoint !== "function") return null;
+
+  const candidates = [[basePos[0], basePos[1], basePos[2]]];
+  for (let ring = 1; ring <= 3; ring++) {
+    const radius = 0.7 * ring;
+    for (let step = 0; step < 8; step++) {
+      const angle = (step + botIndex * 0.5) * (Math.PI / 4);
+      candidates.push([
+        basePos[0] + Math.cos(angle) * radius,
+        basePos[1],
+        basePos[2] + Math.sin(angle) * radius
+      ]);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const projected = navPlanner.projectPoint(candidate);
+    if (projected && positionHasClearance(projected.position, usedPositions)) {
+      return [projected.position[0], projected.position[1], projected.position[2]];
+    }
+  }
+
+  return null;
+}
+
+function pointSegmentDistanceSq2D(point, start, end) {
+  const dx = end[0] - start[0];
+  const dz = end[2] - start[2];
+  const lengthSq = dx * dx + dz * dz;
+  if (lengthSq === 0) {
+    const px = point[0] - start[0];
+    const pz = point[2] - start[2];
+    return px * px + pz * pz;
+  }
+  const t = clamp(((point[0] - start[0]) * dx + (point[2] - start[2]) * dz) / lengthSq, 0, 1);
+  const px = point[0] - (start[0] + dx * t);
+  const pz = point[2] - (start[2] + dz * t);
+  return px * px + pz * pz;
+}
+
+function orientation2D(a, b, c) {
+  return (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0]);
+}
+
+function pointOnSegment2D(point, start, end) {
+  const epsilon = 1e-9;
+  return (
+    Math.abs(orientation2D(start, end, point)) <= epsilon &&
+    point[0] >= Math.min(start[0], end[0]) - epsilon &&
+    point[0] <= Math.max(start[0], end[0]) + epsilon &&
+    point[2] >= Math.min(start[2], end[2]) - epsilon &&
+    point[2] <= Math.max(start[2], end[2]) + epsilon
+  );
+}
+
+function segmentsDistanceSq2D(a0, a1, b0, b1) {
+  const ab0 = orientation2D(a0, a1, b0);
+  const ab1 = orientation2D(a0, a1, b1);
+  const ba0 = orientation2D(b0, b1, a0);
+  const ba1 = orientation2D(b0, b1, a1);
+  const properIntersection =
+    ((ab0 > 0 && ab1 < 0) || (ab0 < 0 && ab1 > 0)) &&
+    ((ba0 > 0 && ba1 < 0) || (ba0 < 0 && ba1 > 0));
+  if (
+    properIntersection ||
+    pointOnSegment2D(b0, a0, a1) ||
+    pointOnSegment2D(b1, a0, a1) ||
+    pointOnSegment2D(a0, b0, b1) ||
+    pointOnSegment2D(a1, b0, b1)
+  ) {
+    return 0;
+  }
+
+  return Math.min(
+    pointSegmentDistanceSq2D(a0, b0, b1),
+    pointSegmentDistanceSq2D(a1, b0, b1),
+    pointSegmentDistanceSq2D(b0, a0, a1),
+    pointSegmentDistanceSq2D(b1, a0, a1)
+  );
+}
+
+function routeMaintainsSeparation(route, recordId, records, minimumDistanceM = 0.55) {
+  if (!Array.isArray(route) || route.length < 2) return false;
+  const minimumDistanceSq = minimumDistanceM * minimumDistanceM;
+
+  for (const other of records) {
+    if (!other || other.id === recordId || !Array.isArray(other.position)) continue;
+    const otherRoute = [[...other.position]];
+    if (other.path && Array.isArray(other.path.endPos)) otherRoute.push([...other.path.endPos]);
+    if (Array.isArray(other.routePoints)) otherRoute.push(...other.routePoints.map(point => [...point]));
+    if (otherRoute.length === 1) otherRoute.push([...otherRoute[0]]);
+
+    for (let i = 1; i < route.length; i++) {
+      for (let j = 1; j < otherRoute.length; j++) {
+        if (segmentsDistanceSq2D(route[i - 1], route[i], otherRoute[j - 1], otherRoute[j]) < minimumDistanceSq) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+function findCommandedWaypointPlan(desiredWaypointName, allWaypoints, planRoute) {
+  if (!desiredWaypointName || !Array.isArray(allWaypoints) || typeof planRoute !== "function") return null;
+  const desired = String(desiredWaypointName).trim().toLowerCase();
+  const target = allWaypoints.find(point => (point.name || "").trim().toLowerCase() === desired) || null;
+  if (!target) return null;
+  const route = planRoute(target);
+  return route ? { target, route } : null;
+}
+
 function botIndexFromId(botId) {
   return Math.max(Number(String(botId).replace("bot-", "")) - 1, 0);
 }
 
-async function fetchFeaturedAvatarRefs(baseUrl) {
-  const url = new URL("/api/v1/media/search", baseUrl);
+async function readFeaturedResponseTextLimited(response, maxBytes) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new Error("featured_response_too_large");
+  }
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const body = new Uint8Array(await response.arrayBuffer());
+    if (body.byteLength > maxBytes) throw new Error("featured_response_too_large");
+    return new TextDecoder().decode(body);
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel("featured_response_too_large");
+        throw new Error("featured_response_too_large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
+async function fetchFeaturedAvatarRefs(
+  baseUrl,
+  {
+    fetchImpl = fetch,
+    timeoutMs = parsePositiveInteger(process.env.GHOST_FEATURED_FETCH_TIMEOUT_MS, 4000, 250, 30_000),
+    maxBytes = parsePositiveInteger(process.env.GHOST_FEATURED_MAX_BYTES, 524_288, 1024, 4_194_304),
+    maxRedirects = parsePositiveInteger(process.env.GHOST_FEATURED_MAX_REDIRECTS, 2, 1, 5),
+    maxEntries = parsePositiveInteger(process.env.GHOST_FEATURED_MAX_ENTRIES, 256, 1, 1024),
+    maxRefs = parsePositiveInteger(process.env.GHOST_FEATURED_MAX_REFS, 128, 1, 512)
+  } = {}
+) {
+  const base = new URL(baseUrl);
+  if (!/^https?:$/.test(base.protocol) || base.username || base.password) {
+    throw new Error("featured_base_url_invalid");
+  }
+
+  let url = new URL("/api/v1/media/search", base);
   url.searchParams.set("source", "avatar_listings");
   url.searchParams.set("filter", "featured");
 
-  const res = await fetchJson(url.toString());
-  const entries = Array.isArray(res && res.entries) ? res.entries : [];
+  const signal = AbortSignal.timeout(timeoutMs);
+  let response;
+  let redirectCount = 0;
+  while (true) {
+    response = await fetchImpl(url.toString(), { signal, redirect: "manual" });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+
+    if (redirectCount >= maxRedirects) throw new Error("featured_too_many_redirects");
+    const location = response.headers.get("location");
+    if (!location) throw new Error("featured_redirect_missing_location");
+    const nextUrl = new URL(location, url);
+    if (nextUrl.origin !== base.origin || nextUrl.username || nextUrl.password) {
+      throw new Error("featured_cross_origin_redirect");
+    }
+    url = nextUrl;
+    redirectCount += 1;
+  }
+
+  if (!response.ok) throw new Error(`http_${response.status}`);
+  const contentType = response.headers.get("content-type") || "";
+  if (!/(?:^application\/json\b|^[^;\s]+\/[^;\s]+\+json\b)/i.test(contentType)) {
+    throw new Error("featured_invalid_content_type");
+  }
+
+  const raw = await readFeaturedResponseTextLimited(response, maxBytes);
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (_error) {
+    throw new Error("featured_invalid_json");
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Array.isArray(payload.entries)) {
+    throw new Error("featured_invalid_schema");
+  }
+  if (payload.entries.length > maxEntries) throw new Error("featured_too_many_entries");
+  const entries = payload.entries;
 
   const allRefs = [];
   const fullbodyRefs = [];
+  const seenRefs = new Set();
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    const ref = entry && entry.gltfs && entry.gltfs.avatar;
-    if (!ref) continue;
-    allRefs.push(ref);
-    const tags = ((entry && entry.tags && entry.tags.tags) || []).map(t => String(t).toLowerCase());
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("featured_invalid_entry");
+    }
+    if (!entry.gltfs || typeof entry.gltfs !== "object" || Array.isArray(entry.gltfs)) {
+      throw new Error("featured_invalid_entry");
+    }
+    const ref = entry.gltfs.avatar;
+    if (
+      typeof ref !== "string" ||
+      !ref.trim() ||
+      ref.length > 2048 ||
+      /[\u0000-\u001f\u007f]/.test(ref)
+    ) {
+      throw new Error("featured_invalid_ref");
+    }
+    const tagContainer = entry.tags;
+    if (
+      tagContainer !== undefined &&
+      (!tagContainer ||
+        typeof tagContainer !== "object" ||
+        Array.isArray(tagContainer) ||
+        !Array.isArray(tagContainer.tags))
+    ) {
+      throw new Error("featured_invalid_tags");
+    }
+    const rawTags = tagContainer ? tagContainer.tags : [];
+    if (
+      rawTags.length > 32 ||
+      rawTags.some(tag => typeof tag !== "string" || !tag.trim() || tag.length > 64)
+    ) {
+      throw new Error("featured_invalid_tags");
+    }
+    const normalizedRef = ref.trim();
+    if (seenRefs.has(normalizedRef)) continue;
+    if (seenRefs.size >= maxRefs) throw new Error("featured_too_many_refs");
+    seenRefs.add(normalizedRef);
+    allRefs.push(normalizedRef);
+    const tags = rawTags.map(tag => tag.toLowerCase());
     const isFullbody = tags.includes("fullbody") || tags.includes("rpm");
-    if (isFullbody) fullbodyRefs.push(ref);
+    if (isFullbody) fullbodyRefs.push(normalizedRef);
   }
 
-  const uniq = arr => Array.from(new Set(arr));
-  return { allRefs: uniq(allRefs), fullbodyRefs: uniq(fullbodyRefs) };
+  return { allRefs, fullbodyRefs };
 }
 
 function pickAvatarId(botId, avatarRefs, fullbodyRefs, rotationOffset) {
@@ -1268,6 +1598,62 @@ function buildBotPathSegment(path) {
 
 function sendNaf(channel, payload) {
   channel.push("naf", payload);
+}
+
+function requestBotSpawn(channel, payload, timeoutMs = 5000) {
+  const expectedNetworkId = payload && payload.data && payload.data.networkId;
+  if (!expectedNetworkId) return Promise.reject(new Error("bot_spawn_invalid_network_id"));
+
+  return new Promise((resolve, reject) => {
+    try {
+      channel
+        .push("naf", payload, timeoutMs)
+        .receive("ok", response => {
+          if (
+            !response ||
+            response.bot_spawn_accepted !== true ||
+            response.network_id !== expectedNetworkId
+          ) {
+            reject(new Error("bot_spawn_invalid_ack"));
+            return;
+          }
+          resolve(response);
+        })
+        .receive("error", response =>
+          reject(new Error((response && response.reason) || "bot_spawn_rejected"))
+        )
+        .receive("timeout", () => reject(new Error("bot_spawn_ack_timeout")));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function presenceHasAuthenticatedBotRunner(presence, sessionId) {
+  if (!presence || !sessionId || !presence.state || typeof presence.state !== "object") return false;
+  const entry = presence.state[sessionId];
+  const metas = entry && Array.isArray(entry.metas) ? entry.metas : [];
+  return metas.some(meta => meta && meta.context && meta.context.bot_runner === true);
+}
+
+function waitForAuthenticatedRunnerPresence(presence, sessionId, timeoutMs = 5000) {
+  if (presenceHasAuthenticatedBotRunner(presence, sessionId)) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("authenticated_bot_runner_presence_timeout"));
+    }, timeoutMs);
+
+    presence.onSync(() => {
+      if (settled || !presenceHasAuthenticatedBotRunner(presence, sessionId)) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 function sendNafr(channel, payload) {
@@ -1328,6 +1714,8 @@ async function main() {
     (process.env.GHOST_NAVIGATION_MODE || "navmesh_preferred").trim().toLowerCase() === "colliders"
       ? "colliders"
       : "navmesh_preferred";
+  const requireNavmesh =
+    (process.env.GHOST_NAVIGATION_REQUIRE_NAVMESH || "true").trim().toLowerCase() !== "false";
   const pathStartDelayMs = Number(process.env.PATH_START_DELAY_MS || 450);
   const minWalkDurationMs = Number(process.env.MIN_WALK_DURATION_MS || 600);
   const minRouteSegmentDurationMs = Number(process.env.MIN_ROUTE_SEGMENT_DURATION_MS || 150);
@@ -1339,11 +1727,14 @@ async function main() {
   );
   let botsConfig = null;
   let botsConfigDirty = false;
+  let pendingManagedConfigFingerprint = "";
+  let appliedManagedConfigFingerprint = "";
 
   const handleManagedConfig = message => {
     if (!message || message.type !== "bots-config") return;
     botsConfig = normalizeBotsConfig(message.bots);
     botsConfigDirty = true;
+    pendingManagedConfigFingerprint = typeof message.fingerprint === "string" ? message.fingerprint : "";
     if (process.connected && typeof process.send === "function") {
       try {
         process.send({
@@ -1411,8 +1802,14 @@ async function main() {
     channel
       .join()
       .receive("ok", resolve)
-      .receive("error", err => reject(new Error(err && err.reason ? err.reason : "join_failed")))
-      .receive("timeout", () => reject(new Error("join_timeout")));
+      .receive("error", err => {
+        socket.disconnect();
+        reject(new Error(err && err.reason ? err.reason : "join_failed"));
+      })
+      .receive("timeout", () => {
+        socket.disconnect();
+        reject(new Error("join_timeout"));
+      });
   });
 
   const hubs = Array.isArray(joinData && joinData.hubs) ? joinData.hubs : [];
@@ -1422,8 +1819,28 @@ async function main() {
     log("Join succeeded but did not return hub/session_id; exiting.");
     process.exit(1);
   }
+  if (joinData.bot_runner !== true) {
+    socket.disconnect();
+    throw new Error("join_did_not_authenticate_bot_runner");
+  }
 
-  log("Joined hub:", hubSid, "session:", sessionId);
+  const presence = new Presence(channel);
+  try {
+    await waitForAuthenticatedRunnerPresence(presence, sessionId, 5000);
+  } catch (error) {
+    socket.disconnect();
+    throw error;
+  }
+  if (process.connected && typeof process.send === "function") {
+    try {
+      process.send({ type: "ghost-auth-status", authenticated: true });
+    } catch (_error) {
+      socket.disconnect();
+      throw new Error("ghost_auth_status_ipc_failed");
+    }
+  }
+
+  log("Joined hub as authenticated bot runner:", hubSid, "session:", sessionId);
 
   if (!botsConfig) {
     botsConfig = normalizeBotsConfig((hub.user_data && hub.user_data.bots) || {});
@@ -1442,9 +1859,39 @@ async function main() {
   let avatarRotationOffset = Math.floor(Math.random() * 1000);
 
   const bots = new Map();
+  const pendingSpawns = new Map();
+  const spawnAttempts = new Map();
+  const spawnRetryAt = new Map();
   const reservedTargets = new Map();
   const knownOccupants = new Set();
   const fullSyncTimers = new Set();
+  let lastRuntimeStatusFingerprint = "";
+  let lastRuntimeStatusSentAt = 0;
+
+  const publishRuntimeStatus = (force = false) => {
+    const status = {
+      ...deriveBotRuntimeStatus({
+        enabled: !!botsConfig.enabled,
+        desired: botsConfig.count,
+        active: bots.size,
+        pending: pendingSpawns.size,
+        authenticated: presenceHasAuthenticatedBotRunner(presence, sessionId),
+        spawnRejected: Array.from(spawnAttempts.values()).some(attempts => attempts >= 3),
+        navigationIsReady: navigationReady({ navigationMode, requireNavmesh, waypointData })
+      }),
+      configFingerprint: appliedManagedConfigFingerprint
+    };
+    const fingerprint = JSON.stringify(status);
+    const now = Date.now();
+    if (!force && fingerprint === lastRuntimeStatusFingerprint && now - lastRuntimeStatusSentAt < 5000) return;
+    lastRuntimeStatusFingerprint = fingerprint;
+    lastRuntimeStatusSentAt = now;
+    if (process.connected && typeof process.send === "function") {
+      try {
+        process.send({ type: "ghost-runtime-status", ...status });
+      } catch (_err) {}
+    }
+  };
 
   const scheduleTimeout = (fn, delayMs) => {
     const timer = setTimeout(() => {
@@ -1459,6 +1906,9 @@ async function main() {
     let changed = false;
 
     if (!botsConfig.enabled || botsConfig.count <= 0) {
+      pendingSpawns.clear();
+      spawnAttempts.clear();
+      spawnRetryAt.clear();
       if (bots.size > 0) {
         bots.forEach(record => {
           sendNaf(channel, removeEntityPayload(record.networkId));
@@ -1467,6 +1917,21 @@ async function main() {
         reservedTargets.clear();
         changed = true;
       }
+      publishRuntimeStatus();
+      return changed;
+    }
+
+    if (!navigationReady({ navigationMode, requireNavmesh, waypointData })) {
+      pendingSpawns.clear();
+      spawnAttempts.clear();
+      spawnRetryAt.clear();
+      if (bots.size > 0) {
+        bots.forEach(record => sendNaf(channel, removeEntityPayload(record.networkId)));
+        bots.clear();
+        reservedTargets.clear();
+        changed = true;
+      }
+      publishRuntimeStatus();
       return changed;
     }
 
@@ -1475,6 +1940,9 @@ async function main() {
     // Remove extra bots.
     for (let i = desired + 1; i <= 10; i++) {
       const botId = `bot-${i}`;
+      pendingSpawns.delete(botId);
+      spawnAttempts.delete(botId);
+      spawnRetryAt.delete(botId);
       const record = bots.get(botId);
       if (!record) continue;
       reservedTargets.delete(record.reservedTargetName);
@@ -1484,19 +1952,26 @@ async function main() {
     }
 
     // Add missing bots.
-    const usedPositions = Array.from(bots.values()).map(r => r.position);
+    const usedPositions = [
+      ...Array.from(bots.values()).map(record => record.position),
+      ...Array.from(pendingSpawns.values()).map(pending => pending.record.position)
+    ];
     for (let i = 1; i <= desired; i++) {
       const botId = `bot-${i}`;
-      if (bots.has(botId)) continue;
+      if (bots.has(botId) || pendingSpawns.has(botId)) continue;
+      if ((spawnRetryAt.get(botId) || 0) > Date.now()) continue;
+      if ((spawnAttempts.get(botId) || 0) >= 3) continue;
 
       const index = botIndexFromId(botId);
       const spawnPoints = waypointData.spawnPoints.length ? waypointData.spawnPoints : waypointData.patrolPoints;
       const spawn = spawnPoints.length ? spawnPoints[index % spawnPoints.length] : null;
       const basePos = spawn ? spawn.position : [0, 0, 0];
-      let pos = separateNearbyPosition(basePos, index, usedPositions);
-      if (waypointData.navPlanner) {
-        const projected = waypointData.navPlanner.projectPoint(pos);
-        pos = projected ? projected.position : [basePos[0], basePos[1], basePos[2]];
+      const pos = waypointData.navPlanner
+        ? findSeparatedNavmeshPosition(basePos, index, usedPositions, waypointData.navPlanner)
+        : separateNearbyPosition(basePos, index, usedPositions);
+      if (!pos) {
+        log(`[ghost] No separated navmesh spawn is available for ${botId}; leaving it absent.`);
+        continue;
       }
       usedPositions.push(pos);
 
@@ -1508,19 +1983,15 @@ async function main() {
       const path = buildBotPathFreeze(pos, normalizeAngleDeg(yaw), nowMs);
       const info = { botId, avatarId, displayName: botId, isBot: true };
 
-      sendNaf(
-        channel,
-        createEntityPayload({
-          networkId,
-          owner: sessionId,
-          creator: sessionId,
-          lastOwnerTime,
-          isFirstSync: true,
-          components: { 0: path, 1: info }
-        })
-      );
-
-      bots.set(botId, {
+      const payload = createEntityPayload({
+        networkId,
+        owner: sessionId,
+        creator: sessionId,
+        lastOwnerTime,
+        isFirstSync: true,
+        components: { 0: path, 1: info }
+      });
+      const record = {
         id: botId,
         networkId,
         lastOwnerTime,
@@ -1534,7 +2005,50 @@ async function main() {
         reservedTargetName: null,
         path: null,
         routePoints: []
-      });
+      };
+      const pending = { payload, record };
+      const attempt = (spawnAttempts.get(botId) || 0) + 1;
+      spawnAttempts.set(botId, attempt);
+      pendingSpawns.set(botId, pending);
+
+      requestBotSpawn(channel, payload)
+        .then(() => {
+          if (pendingSpawns.get(botId) !== pending) {
+            sendNaf(channel, removeEntityPayload(networkId));
+            return;
+          }
+          pendingSpawns.delete(botId);
+
+          const stillDesired =
+            botsConfig.enabled &&
+            botsConfig.count >= i &&
+            navigationReady({ navigationMode, requireNavmesh, waypointData });
+          if (!stillDesired) {
+            sendNaf(channel, removeEntityPayload(networkId));
+            publishRuntimeStatus();
+            return;
+          }
+
+          spawnAttempts.delete(botId);
+          spawnRetryAt.delete(botId);
+          record.mobility = botsConfig.mobility;
+          record.stateEndsAt = timekeeper.nowMs() + initialIdleDurationMs(record.mobility);
+          bots.set(botId, record);
+          publishRuntimeStatus();
+        })
+        .catch(error => {
+          if (pendingSpawns.get(botId) !== pending) return;
+          pendingSpawns.delete(botId);
+          // A timeout or malformed ACK is ambiguous: Ret may have accepted the
+          // first sync even though we cannot count it. Remove that network id
+          // best-effort before a bounded retry so no untracked bot remains.
+          sendNaf(channel, removeEntityPayload(networkId));
+          if (attempt < 3) {
+            spawnRetryAt.set(botId, Date.now() + Math.min(1000 * 2 ** (attempt - 1), 4000));
+          }
+          log(`[ghost] Spawn ACK rejected for ${botId} (attempt ${attempt}/3):`, error.message);
+          publishRuntimeStatus();
+        });
 
       changed = true;
     }
@@ -1554,6 +2068,26 @@ async function main() {
         record.stateEndsAt = nowMs + initialIdleDurationMs(record.mobility);
       }
     });
+
+    publishRuntimeStatus();
+    return changed;
+  };
+
+  const reconcileManagedConfig = nowMs => {
+    botsConfigDirty = false;
+    const configFingerprint = pendingManagedConfigFingerprint;
+    const changed = reconcileBots(nowMs);
+
+    if (configFingerprint) {
+      appliedManagedConfigFingerprint = configFingerprint;
+      if (pendingManagedConfigFingerprint === configFingerprint) {
+        pendingManagedConfigFingerprint = "";
+      }
+      // The status emitted inside reconcileBots still carried the previously
+      // applied fingerprint. Force a post-application status so the parent can
+      // distinguish this configuration from an in-flight or stale heartbeat.
+      publishRuntimeStatus(true);
+    }
 
     return changed;
   };
@@ -1590,21 +2124,25 @@ async function main() {
   const planRouteToPoint = (record, point) => {
     if (!record || !point) return null;
 
+    let route = null;
+
     if (waypointData.navPlanner) {
-      return waypointData.navPlanner.findRoute(record.position, point.position);
+      route = waypointData.navPlanner.findRoute(record.position, point.position);
+    } else {
+      if (navigationMode === "navmesh_preferred" && requireNavmesh) return null;
+      if (
+        raycastMode === "spoke_colliders" &&
+        !isPathClearWithColliders(waypointData.colliders, record.position, point.position)
+      ) {
+        return null;
+      }
+      route = [
+        [record.position[0], record.position[1], record.position[2]],
+        [point.position[0], point.position[1], point.position[2]]
+      ];
     }
 
-    if (
-      raycastMode === "spoke_colliders" &&
-      !isPathClearWithColliders(waypointData.colliders, record.position, point.position)
-    ) {
-      return null;
-    }
-
-    return [
-      [record.position[0], record.position[1], record.position[2]],
-      [point.position[0], point.position[1], point.position[2]]
-    ];
+    return routeMaintainsSeparation(route, record.id, bots.values()) ? route : null;
   };
 
   const pickPatrolPlan = (record, excludeName) => {
@@ -1726,13 +2264,15 @@ async function main() {
     let plan = null;
     if (desiredWaypointName) {
       const desired = String(desiredWaypointName).trim().toLowerCase();
-      const target =
-        waypointData.allWaypoints.find(p => (p.name || "").trim().toLowerCase() === desired) || null;
-      const route = target ? planRouteToPoint(record, target) : null;
-      if (target && route) {
-        plan = { target, route };
-      } else {
+      plan = findCommandedWaypointPlan(
+        desired,
+        waypointData.allWaypoints,
+        target => planRouteToPoint(record, target)
+      );
+      if (!plan) {
         log(`[ghost] Commanded waypoint is not reachable, skipping: ${desired}`);
+        setIdle(record, nowMs);
+        return;
       }
     }
 
@@ -1839,9 +2379,14 @@ async function main() {
     botsConfigDirty = true;
   });
 
-  // Presence / late joiners.
-  const presence = new Presence(channel);
+  // Presence / late joiners. Losing the authenticated self-presence is fatal:
+  // the orchestrator will restart and reauthenticate before another spawn.
   presence.onSync(() => {
+    if (!presenceHasAuthenticatedBotRunner(presence, sessionId)) {
+      log("Authenticated bot-runner presence was lost; exiting.");
+      process.exit(1);
+      return;
+    }
     const keys = presence.list(key => key) || [];
     const currentOccupants = new Set();
 
@@ -1873,18 +2418,28 @@ async function main() {
       sceneUrl = validateSceneUrl(rawSceneUrl, sceneFetchPolicy).toString();
     } catch (err) {
       sceneUrlRejected = true;
-      log("Rejected scene model_url. Bots will use origin fallback.", err.message);
+      log(
+        requireNavmesh
+          ? "Rejected scene model_url. Navmesh-required bots will remain blocked."
+          : "Rejected scene model_url. Bots will use origin fallback.",
+        err.message
+      );
     }
   }
   if (!sceneUrl && !sceneUrlRejected) {
-    log("No scene model_url found in hub payload. Bots will use origin fallback.");
+    log(
+      requireNavmesh
+        ? "No scene model_url found. Navmesh-required bots will remain blocked."
+        : "No scene model_url found in hub payload. Bots will use origin fallback."
+    );
   } else {
     log("Scene URL:", sceneUrl);
   }
 
   const initScenePromise = sceneUrl
-    ? fetchGltfScene(sceneUrl, sceneFetchPolicy)
-        .then(async scene => {
+    ? retryWithBackoff(
+        () =>
+          fetchGltfScene(sceneUrl, sceneFetchPolicy).then(async scene => {
           const extracted = extractWaypointsAndColliders(scene.gltf);
           let navPlanner = null;
 
@@ -1894,13 +2449,18 @@ async function main() {
               navPlanner = createNavMeshPlanner(navMesh, sceneFetchPolicy);
               if (navMesh && navMesh.geometry) navMesh.geometry.dispose();
             } catch (error) {
-              log("Navmesh rejected. Falling back to collider/direct waypoint movement.", error.message);
+              log(
+                requireNavmesh
+                  ? "Navmesh rejected. Navmesh-required bots will remain blocked."
+                  : "Navmesh rejected. Falling back to collider/direct waypoint movement.",
+                error.message
+              );
             }
           }
 
           let navigable = projectWaypointsToNavmesh(extracted, navPlanner);
           if (navPlanner && extracted.allWaypoints.length && !navigable.allWaypoints.length) {
-            log("No waypoints could be projected to the navmesh. Disabling navmesh for this scene.");
+            log("No waypoints could be projected to the navmesh. Blocking navmesh-required bots.");
             navPlanner = null;
             navigable = extracted;
           }
@@ -1923,14 +2483,37 @@ async function main() {
               `Navmesh ready: triangles=${navPlanner.triangleCount} groups=${navPlanner.groupCount} mode=${navigationMode}`
             );
           } else if (navigationMode === "navmesh_preferred") {
-            log("No valid navmesh found. Falling back to collider/direct waypoint movement.");
+            log(
+              requireNavmesh
+                ? "No valid navmesh found. Navmesh-required bots are blocked."
+                : "No valid navmesh found. Falling back to collider/direct waypoint movement."
+            );
           }
           log(
             `Waypoints: all=${waypointData.allWaypoints.length} spawn=${waypointData.spawnPoints.length} patrol=${waypointData.patrolPoints.length} colliders=${waypointData.colliders.length}`
           );
-        })
+          if (
+            requireNavmesh &&
+            !navigationReady({ navigationMode, requireNavmesh, waypointData })
+          ) {
+            throw new Error("required_navmesh_unavailable");
+          }
+        }),
+        {
+          maxAttempts: 3,
+          baseDelayMs: 500,
+          maxDelayMs: 2000,
+          onRetry: (error, attempt, delayMs) =>
+            log(`Scene/navmesh attempt ${attempt}/3 failed; retrying in ${delayMs}ms:`, error.message)
+        }
+      )
         .catch(err => {
-          log("Failed to load/parse scene glTF. Bots will use origin fallback.", err.message);
+          log(
+            requireNavmesh
+              ? "Failed to load/parse scene glTF. Navmesh-required bots will remain blocked."
+              : "Failed to load/parse scene glTF. Bots will use origin fallback.",
+            err.message
+          );
         })
     : Promise.resolve();
 
@@ -1947,6 +2530,29 @@ async function main() {
 
   await Promise.all([initScenePromise, initAvatarsPromise]);
 
+  if (requireNavmesh && !navigationReady({ navigationMode, requireNavmesh, waypointData })) {
+    scheduleNavigationRecoveryRestart({
+      required: true,
+      delayMs: process.env.GHOST_NAVIGATION_RECOVERY_RESTART_MS || 30_000,
+      scheduleFn: scheduleTimeout,
+      exitFn: code => {
+        log("Required navmesh is still unavailable; restarting ghost runner for a clean retry.");
+        process.exit(code);
+      }
+    });
+  }
+
+  if (process.connected && typeof process.send === "function") {
+    try {
+      process.send({
+        type: "ghost-navigation-status",
+        ready: navigationReady({ navigationMode, requireNavmesh, waypointData }),
+        required: requireNavmesh,
+        mode: navigationMode
+      });
+    } catch (_err) {}
+  }
+
   // Main loop.
   let lastConfigRefreshAt = 0;
   let lastFeaturedRefreshAt = 0;
@@ -1958,9 +2564,8 @@ async function main() {
 
     // Reconcile bots periodically so config changes take effect.
     if (botsConfigDirty || now - lastConfigRefreshAt >= CONFIG_REFRESH_INTERVAL_MS) {
-      botsConfigDirty = false;
       lastConfigRefreshAt = now;
-      const changed = reconcileBots(now);
+      const changed = reconcileManagedConfig(now);
       if (changed) {
         scheduleFullSyncBurst("reconcile");
       }
@@ -1991,7 +2596,7 @@ async function main() {
     });
   };
 
-  const initialChanged = reconcileBots(timekeeper.nowMs());
+  const initialChanged = reconcileManagedConfig(timekeeper.nowMs());
   if (initialChanged) {
     scheduleFullSyncBurst("startup");
   }
@@ -2035,14 +2640,24 @@ module.exports = {
     computeWorldNodeMatrices,
     createNavMeshPlanner,
     createSceneFetchPolicy,
+    deriveBotRuntimeStatus,
     extractNavMeshGeometry,
     extractWaypointsAndColliders,
+    fetchFeaturedAvatarRefs,
     fetchGltfJson,
     fetchGltfScene,
+    findCommandedWaypointPlan,
+    findSeparatedNavmeshPosition,
+    navigationReady,
     normalizeBotsConfig,
     parseGlbJson,
+    presenceHasAuthenticatedBotRunner,
     projectWaypointsToNavmesh,
     readAccessor,
+    requestBotSpawn,
+    retryWithBackoff,
+    routeMaintainsSeparation,
+    scheduleNavigationRecoveryRestart,
     validateGltfShape,
     validateSceneUrl
   }

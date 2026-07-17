@@ -217,6 +217,363 @@ test("keeps static mobility instead of silently normalizing it to medium", () =>
   assert.equal(internals.normalizeBotsConfig({ enabled: true, count: 2, mobility: "static" }).mobility, "static");
 });
 
+test("blocks navmesh-required bots until a projected navigation point exists", () => {
+  const empty = { navPlanner: null, spawnPoints: [], patrolPoints: [] };
+  assert.equal(
+    internals.navigationReady({ navigationMode: "navmesh_preferred", requireNavmesh: true, waypointData: empty }),
+    false
+  );
+
+  const plannerWithoutPoints = { ...empty, navPlanner: { findRoute() {} } };
+  assert.equal(
+    internals.navigationReady({
+      navigationMode: "navmesh_preferred",
+      requireNavmesh: true,
+      waypointData: plannerWithoutPoints
+    }),
+    false
+  );
+
+  assert.equal(
+    internals.navigationReady({
+      navigationMode: "navmesh_preferred",
+      requireNavmesh: true,
+      waypointData: { ...plannerWithoutPoints, spawnPoints: [{ name: "spawbot-safe" }] }
+    }),
+    true
+  );
+});
+
+test("allows an explicit legacy navigation opt-out without a navmesh", () => {
+  const empty = { navPlanner: null, spawnPoints: [], patrolPoints: [] };
+  assert.equal(
+    internals.navigationReady({ navigationMode: "colliders", requireNavmesh: true, waypointData: empty }),
+    true
+  );
+  assert.equal(
+    internals.navigationReady({ navigationMode: "navmesh_preferred", requireNavmesh: false, waypointData: empty }),
+    true
+  );
+});
+
+test("reports desired versus active bots and the blocking reason", () => {
+  assert.deepEqual(
+    internals.deriveBotRuntimeStatus({
+      enabled: true,
+      desired: 10,
+      active: 3,
+      navigationIsReady: true,
+      authenticated: true
+    }),
+    {
+      desired: 10,
+      active: 3,
+      pending: 0,
+      navigationReady: true,
+      authenticated: true,
+      authoritativeSpawnAcks: true,
+      ready: false,
+      reason: "insufficient_clearance"
+    }
+  );
+  assert.equal(
+    internals.deriveBotRuntimeStatus({
+      enabled: true,
+      desired: 5,
+      active: 0,
+      navigationIsReady: false,
+      authenticated: true
+    }).reason,
+    "navmesh_unavailable"
+  );
+  assert.equal(
+    internals.deriveBotRuntimeStatus({
+      enabled: false,
+      desired: 5,
+      active: 0,
+      navigationIsReady: true,
+      authenticated: false
+    }).reason,
+    "disabled"
+  );
+  assert.equal(
+    internals.deriveBotRuntimeStatus({
+      enabled: true,
+      desired: 1,
+      active: 0,
+      pending: 1,
+      navigationIsReady: true,
+      authenticated: true
+    }).reason,
+    "spawn_pending"
+  );
+  assert.equal(
+    internals.deriveBotRuntimeStatus({
+      enabled: true,
+      desired: 1,
+      active: 0,
+      navigationIsReady: true,
+      authenticated: false
+    }).reason,
+    "unauthenticated"
+  );
+});
+
+test("requires authenticated self-presence and a matching Reticulum spawn ACK", async () => {
+  const presence = {
+    state: {
+      session: { metas: [{ context: { bot_runner: true } }] }
+    }
+  };
+  assert.equal(internals.presenceHasAuthenticatedBotRunner(presence, "session"), true);
+  assert.equal(internals.presenceHasAuthenticatedBotRunner({ state: {} }, "session"), false);
+
+  const payload = { data: { networkId: "room-bot-room-bot-1" } };
+  const ackingChannel = {
+    push(_event, _payload, timeoutMs) {
+      assert.equal(timeoutMs, 5000);
+      const callbacks = {};
+      const push = {
+        receive(kind, callback) {
+          callbacks[kind] = callback;
+          return push;
+        }
+      };
+      queueMicrotask(() =>
+        callbacks.ok({ bot_spawn_accepted: true, network_id: "room-bot-room-bot-1" })
+      );
+      return push;
+    }
+  };
+  await internals.requestBotSpawn(ackingChannel, payload);
+
+  const mismatchedChannel = {
+    push() {
+      const callbacks = {};
+      const push = {
+        receive(kind, callback) {
+          callbacks[kind] = callback;
+          return push;
+        }
+      };
+      queueMicrotask(() => callbacks.ok({ bot_spawn_accepted: true, network_id: "other" }));
+      return push;
+    }
+  };
+  await assert.rejects(internals.requestBotSpawn(mismatchedChannel, payload), /invalid_ack/);
+});
+
+test("bounds Featured avatar discovery and keeps only usable unique refs", async () => {
+  const discovered = await internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+    timeoutMs: 100,
+    fetchImpl: async (_url, { signal, redirect }) => {
+      assert.ok(signal);
+      assert.equal(redirect, "manual");
+      return new Response(
+        JSON.stringify({
+          entries: [
+            { gltfs: { avatar: "fullbody-a" }, tags: { tags: ["fullbody"] } },
+            { gltfs: { avatar: "fullbody-a" }, tags: { tags: ["rpm"] } },
+            { gltfs: { avatar: "upperbody-b" }, tags: { tags: [] } }
+          ]
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+  });
+
+  assert.deepEqual(discovered.allRefs, ["fullbody-a", "upperbody-b"]);
+  assert.deepEqual(discovered.fullbodyRefs, ["fullbody-a"]);
+});
+
+test("rejects cross-origin redirects while discovering Featured avatars", async () => {
+  let requests = 0;
+  await assert.rejects(
+    internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+      fetchImpl: async (_url, { redirect }) => {
+        requests += 1;
+        assert.equal(redirect, "manual");
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://attacker.invalid/featured.json" }
+        });
+      }
+    }),
+    /cross_origin_redirect/
+  );
+  assert.equal(requests, 1);
+});
+
+test("rejects oversized and malformed Featured responses", async () => {
+  await assert.rejects(
+    internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+      maxBytes: 32,
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ entries: [{ gltfs: { avatar: "a".repeat(64) } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+    }),
+    /response_too_large/
+  );
+
+  await assert.rejects(
+    internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ entries: [{ gltfs: {} }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+    }),
+    /invalid_ref/
+  );
+
+  await assert.rejects(
+    internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+      fetchImpl: async () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "content-type": "text/html" }
+        })
+    }),
+    /invalid_content_type/
+  );
+});
+
+test("aborts a stalled Featured avatar request", async () => {
+  await assert.rejects(
+    internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
+      timeoutMs: 10,
+      fetchImpl: (_url, { signal }) =>
+        new Promise((_resolve, reject) => {
+          const keepAlive = setInterval(() => {}, 1000);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearInterval(keepAlive);
+              reject(signal.reason);
+            },
+            { once: true }
+          );
+        })
+    }),
+    /abort|timeout/i
+  );
+});
+
+test("retries scene/navmesh work with a small bounded exponential backoff", async () => {
+  const delays = [];
+  let attempts = 0;
+  const result = await internals.retryWithBackoff(
+    async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error("temporary_navmesh_failure");
+      return "ready";
+    },
+    {
+      maxAttempts: 99,
+      baseDelayMs: 10,
+      maxDelayMs: 20,
+      sleep: async delayMs => delays.push(delayMs)
+    }
+  );
+
+  assert.equal(result, "ready");
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [10, 20]);
+});
+
+test("schedules a bounded clean restart when required navigation stays unavailable", () => {
+  let scheduledDelay = null;
+  let scheduledCallback = null;
+  let exitCode = null;
+
+  const timer = internals.scheduleNavigationRecoveryRestart({
+    required: true,
+    delayMs: 1,
+    scheduleFn(callback, delayMs) {
+      scheduledCallback = callback;
+      scheduledDelay = delayMs;
+      return "recovery-timer";
+    },
+    exitFn(code) {
+      exitCode = code;
+    }
+  });
+
+  assert.equal(timer, "recovery-timer");
+  assert.equal(scheduledDelay, 5000);
+  scheduledCallback();
+  assert.equal(exitCode, 1);
+  assert.equal(
+    internals.scheduleNavigationRecoveryRestart({ required: false, scheduleFn: () => assert.fail() }),
+    null
+  );
+});
+
+test("projects separated bot spawns and refuses a collapsed navmesh", () => {
+  const identityPlanner = { projectPoint: position => ({ position }) };
+  const used = [[0, 0, 0]];
+  const separated = internals.findSeparatedNavmeshPosition([0, 0, 0], 1, used, identityPlanner);
+  assert.ok(separated);
+  assert.ok(Math.hypot(separated[0], separated[2]) >= 0.65);
+
+  const collapsedPlanner = { projectPoint: () => ({ position: [0, 0, 0] }) };
+  assert.equal(internals.findSeparatedNavmeshPosition([0, 0, 0], 1, used, collapsedPlanner), null);
+});
+
+test("rejects crossing or too-close bot routes", () => {
+  const otherBots = [
+    {
+      id: "bot-2",
+      position: [1, 0, -1],
+      path: { endPos: [1, 0, 1] },
+      routePoints: []
+    }
+  ];
+
+  assert.equal(
+    internals.routeMaintainsSeparation(
+      [
+        [0, 0, 0],
+        [2, 0, 0]
+      ],
+      "bot-1",
+      otherBots
+    ),
+    false
+  );
+  assert.equal(
+    internals.routeMaintainsSeparation(
+      [
+        [0, 0, 3],
+        [2, 0, 3]
+      ],
+      "bot-1",
+      otherBots
+    ),
+    true
+  );
+});
+
+test("an invalid commanded waypoint cannot fall through to random patrol", () => {
+  let planned = 0;
+  const waypoints = [{ name: "spawbot-lobby", position: [1, 0, 1] }];
+  const missing = internals.findCommandedWaypointPlan("spawbot-unknown", waypoints, () => {
+    planned += 1;
+    return [[0, 0, 0], [1, 0, 1]];
+  });
+  assert.equal(missing, null);
+  assert.equal(planned, 0);
+
+  const unreachable = internals.findCommandedWaypointPlan("spawbot-lobby", waypoints, () => {
+    planned += 1;
+    return null;
+  });
+  assert.equal(unreachable, null);
+  assert.equal(planned, 1);
+});
+
 test("loads the GLB navmesh by byte range and finds a route around missing floor", async () => {
   const glb = makeLShapedNavmeshGlb();
   const policy = internals.createSceneFetchPolicy("https://meta-hubs.org", {
