@@ -39,6 +39,36 @@ defmodule RetWeb.ApiInternal.V1.StorageControllerTest do
     assert resp.status === 401
   end
 
+  test "dashboard authorization never falls back to a bot key", %{conn: conn} do
+    bot_key = "test-legacy-bot-access-key-32bytes"
+    original_bot_key = Application.get_env(:ret, :bot_access_key)
+
+    Application.put_env(:ret, :bot_access_key, bot_key)
+
+    merge_module_config(:ret, RetWeb.Plugs.DashboardHeaderAuthorization, %{
+      dashboard_access_key: nil
+    })
+
+    on_exit(fn ->
+      if is_nil(original_bot_key) do
+        Application.delete_env(:ret, :bot_access_key)
+      else
+        Application.put_env(:ret, :bot_access_key, original_bot_key)
+      end
+
+      Ret.TestHelpers.merge_module_config(:ret, RetWeb.Plugs.DashboardHeaderAuthorization, %{
+        dashboard_access_key: @dashboard_access_key
+      })
+    end)
+
+    resp =
+      conn
+      |> put_req_header(@dashboard_access_header, bot_key)
+      |> get("/api-internal/v1/storage")
+
+    assert resp.status === 401
+  end
+
   test "storage endpoint errors when storage usage is not available", %{conn: conn} do
     mock_storage_used(nil)
     resp = request_storage(conn, expected_status: 503)

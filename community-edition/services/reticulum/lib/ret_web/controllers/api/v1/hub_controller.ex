@@ -1,7 +1,7 @@
 defmodule RetWeb.Api.V1.HubController do
   use RetWeb, :controller
 
-  alias Ret.{Hub, Scene, Repo}
+  alias Ret.{BotConfig, BotConfigAdmission, BotOrchestrator, Hub, Scene, Repo}
 
   import Canada, only: [can?: 2]
 
@@ -23,7 +23,7 @@ defmodule RetWeb.Api.V1.HubController do
       {result, hub} =
         hub_changeset
         |> Hub.add_account_to_changeset(account)
-        |> Repo.insert()
+        |> BotConfigAdmission.insert(account)
 
       case result do
         :ok -> render(conn, "create.json", hub: hub)
@@ -71,9 +71,14 @@ defmodule RetWeb.Api.V1.HubController do
       |> Hub.maybe_add_member_permissions(hub, hub_params)
       |> Hub.maybe_add_promotion(account, hub, hub_params)
 
-    hub = changeset |> Repo.update!() |> Repo.preload(Hub.hub_preloads())
+    case BotConfigAdmission.update(changeset, account) do
+      {:ok, hub} ->
+        hub = Repo.preload(hub, Hub.hub_preloads())
+        conn |> render("show.json", %{hub: hub, embeddable: account |> can?(embed_hub(hub))})
 
-    conn |> render("show.json", %{hub: hub, embeddable: account |> can?(embed_hub(hub))})
+      {:error, _changeset} ->
+        conn |> send_resp(422, "invalid hub")
+    end
   end
 
   defp maybe_add_new_scene(changeset, nil), do: changeset
@@ -82,11 +87,18 @@ defmodule RetWeb.Api.V1.HubController do
     do: changeset |> Hub.add_new_scene_to_changeset(scene)
 
   def delete(conn, %{"id" => hub_sid}) do
-    Hub
-    |> Repo.get_by(hub_sid: hub_sid)
-    |> Hub.changeset_for_entry_mode(:deny)
-    |> Repo.update!()
+    hub = Repo.get_by(Hub, hub_sid: hub_sid)
 
-    conn |> send_resp(200, "OK")
+    case hub |> Hub.changeset_for_entry_mode(:deny) |> BotConfigAdmission.update(nil) do
+      {:ok, _closed_hub} ->
+        if BotConfig.active?(hub.user_data) do
+          _ = BotOrchestrator.room_stop(%{hub_sid: hub.hub_sid})
+        end
+
+        conn |> send_resp(200, "OK")
+
+      {:error, _changeset} ->
+        conn |> send_resp(422, "invalid hub")
+    end
   end
 end

@@ -16,6 +16,8 @@ defmodule Ret.Hub do
 
   alias Ret.{
     Account,
+    BotConfig,
+    BotConfigAdmission,
     Hub,
     Repo,
     Scene,
@@ -166,6 +168,7 @@ defmodule Ret.Hub do
         %Hub{}
         |> change()
         |> cast(params, @permitted_keys)
+        |> update_change(:user_data, &normalize_user_data/1)
         |> add_account_to_changeset(account_or_nil)
         |> add_scene_changes_to_changeset(params)
         |> HubSlug.maybe_generate_slug()
@@ -177,7 +180,7 @@ defmodule Ret.Hub do
           less_than_or_equal_to: AppConfig.get_cached_config_value("features|max_room_size")
         )
         |> unique_constraint(:hub_sid)
-        |> Repo.insert()
+        |> BotConfigAdmission.insert(account_or_nil)
 
       case result do
         {:ok, hub} ->
@@ -322,7 +325,7 @@ defmodule Ret.Hub do
 
     %Hub{}
     |> changeset(scene_or_scene_listing, params)
-    |> Repo.insert()
+    |> BotConfigAdmission.insert(nil)
   end
 
   # Create new room, does NOT insert into db
@@ -339,7 +342,7 @@ defmodule Ret.Hub do
 
     %Hub{}
     |> changeset(scene_or_scene_listing, params)
-    |> Repo.insert()
+    |> BotConfigAdmission.insert(nil)
   end
 
   defp get_scene_or_scene_listing(params) do
@@ -451,56 +454,10 @@ defmodule Ret.Hub do
   defp normalize_bots_config(nil), do: nil
 
   defp normalize_bots_config(%{} = bots) do
-    enabled = normalize_bool(map_get(bots, "enabled", false), false)
-    count = normalize_integer(map_get(bots, "count", 0), 0, 10, 0)
-    mobility = normalize_mobility(map_get(bots, "mobility", "medium"))
-    chat_enabled = normalize_bool(map_get(bots, "chat_enabled", false), false)
-    prompt = normalize_bot_prompt(map_get(bots, "prompt", ""))
-
-    %{
-      "enabled" => enabled,
-      "count" => count,
-      "mobility" => mobility,
-      "chat_enabled" => chat_enabled,
-      "prompt" => prompt
-    }
+    BotConfig.normalize(%{"bots" => bots})
   end
 
   defp normalize_bots_config(_), do: nil
-
-  defp normalize_mobility("low"), do: "low"
-  defp normalize_mobility("high"), do: "high"
-  defp normalize_mobility("medium"), do: "medium"
-  defp normalize_mobility("static"), do: "static"
-  defp normalize_mobility(_), do: "medium"
-
-  defp normalize_bot_prompt(value) when is_binary(value) do
-    value |> String.trim() |> String.slice(0, 1_500)
-  end
-
-  defp normalize_bot_prompt(_), do: ""
-
-  defp normalize_integer(value, min, max, _default) when is_integer(value) do
-    value
-    |> max(min)
-    |> min(max)
-  end
-
-  defp normalize_integer(value, min, max, default) when is_binary(value) do
-    case Integer.parse(value) do
-      {parsed, _} -> normalize_integer(parsed, min, max, default)
-      _ -> default
-    end
-  end
-
-  defp normalize_integer(_, _min, _max, default), do: default
-
-  defp normalize_bool(value, _default) when is_boolean(value), do: value
-  defp normalize_bool("true", _default), do: true
-  defp normalize_bool("false", _default), do: false
-  defp normalize_bool(1, _default), do: true
-  defp normalize_bool(0, _default), do: false
-  defp normalize_bool(_value, default), do: default
 
   defp map_get(map, key, default \\ nil) do
     atom_key =
@@ -558,10 +515,14 @@ defmodule Ret.Hub do
   end
 
   def maybe_add_entry_mode_to_changeset(changeset, attrs) do
-    if attrs["entry_mode"] === nil do
+    requested_entry_mode = attrs["entry_mode"]
+    current_entry_mode = get_field(changeset, :entry_mode)
+
+    if requested_entry_mode === nil or
+         to_string(requested_entry_mode) == to_string(current_entry_mode) do
       changeset
     else
-      changeset |> put_change(:entry_mode, attrs["entry_mode"])
+      changeset |> put_change(:entry_mode, requested_entry_mode)
     end
   end
 
@@ -639,8 +600,33 @@ defmodule Ret.Hub do
     |> validate_required([:spawned_object_types])
   end
 
+  def changeset_for_entry_mode(%Hub{} = hub, :deny) do
+    hub
+    |> cast(%{entry_mode: :deny}, [:entry_mode])
+    |> disable_bots_for_closed_room()
+  end
+
   def changeset_for_entry_mode(%Hub{} = hub, entry_mode),
     do: hub |> cast(%{entry_mode: entry_mode}, [:entry_mode])
+
+  defp disable_bots_for_closed_room(changeset) do
+    user_data = get_field(changeset, :user_data)
+
+    case map_get(user_data || %{}, "bots") do
+      %{} ->
+        disabled_bots = user_data |> BotConfig.normalize() |> Map.put("enabled", false)
+
+        updated_user_data =
+          user_data
+          |> Map.delete(:bots)
+          |> Map.put("bots", disabled_bots)
+
+        put_change(changeset, :user_data, updated_user_data)
+
+      _bots ->
+        changeset
+    end
+  end
 
   def changeset_for_new_host(%Hub{} = hub, host), do: hub |> cast(%{host: host}, [:host])
 

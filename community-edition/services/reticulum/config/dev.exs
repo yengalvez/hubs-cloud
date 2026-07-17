@@ -89,7 +89,7 @@ config :ret, Ret.SessionLockRepo,
 
 config :ret, RetWeb.Plugs.HeaderAuthorization,
   header_name: "x-ret-admin-access-key",
-  header_value: "admin-only"
+  header_value: "development-admin-access-key-at-least-32bytes"
 
 config :ret, Ret.SlackClient,
   client_id: "",
@@ -114,7 +114,8 @@ config :cors_plug, origin: ["*"]
 
 config :ret,
   upload_encryption_key: String.duplicate("00", 20),
-  bot_access_key: ""
+  bot_access_key: "",
+  bot_runner_access_key: ""
 
 config :ret, Ret.BotOrchestrator,
   endpoint: "http://localhost:5001",

@@ -3,31 +3,19 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
 
   import Ecto.Query
 
-  alias Ret.{Hub, Repo}
+  alias Ret.{BotConfig, Hub, Repo}
+
+  @max_configured_bot_hubs 10
+  @max_bot_config_bytes 16_384
 
   def configured_with_bots(conn, _params) do
     # Used by the bot-orchestrator to rehydrate desired runner state after restarts.
     # This lists hubs by config (user_data.bots) rather than Presence.
-    hubs =
-      Hub
-      |> where(
-        [h],
-        fragment("COALESCE((?->'bots'->>'enabled')::boolean, false) = true", h.user_data)
-      )
-      |> where([h], fragment("COALESCE((?->'bots'->>'count')::int, 0) > 0", h.user_data))
-      |> where([h], h.hub_sid != "admin")
-      |> select([h], %{
-        hub_sid: h.hub_sid,
-        user_data: h.user_data,
-        last_active_at: h.last_active_at
-      })
-      |> Repo.all()
-      |> Enum.map(&to_bot_hub_entry/1)
-      |> Enum.filter(& &1)
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, Poison.encode!(%{hubs: hubs}))
+    Hub
+    |> where([h], h.hub_sid != "admin")
+    |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
+    |> BotConfig.with_active_bot_config()
+    |> send_bot_snapshot(conn)
   end
 
   def active_with_bots(conn, _params) do
@@ -41,41 +29,79 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
       |> Enum.reject(&(&1 == "admin"))
       |> Enum.uniq()
 
-    hubs =
-      Hub
-      |> where([h], h.hub_sid in ^present_hub_sids)
+    Hub
+    |> where([h], h.hub_sid in ^present_hub_sids)
+    |> where([h], h.hub_sid != "admin")
+    |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
+    |> BotConfig.with_active_bot_config()
+    |> send_bot_snapshot(conn)
+  end
+
+  defp send_bot_snapshot(query, conn) do
+    candidates =
+      query
+      |> order_by([h], asc: h.hub_sid)
+      |> limit(^(@max_configured_bot_hubs + 1))
       |> select([h], %{
         hub_sid: h.hub_sid,
-        user_data: h.user_data,
+        bot_config_bytes: fragment("octet_length((?->'bots')::text)", h.user_data),
+        bots:
+          fragment(
+            "CASE WHEN octet_length((?->'bots')::text) <= ? THEN ?->'bots' ELSE '{}'::jsonb END",
+            h.user_data,
+            ^@max_bot_config_bytes,
+            h.user_data
+          ),
         last_active_at: h.last_active_at
       })
       |> Repo.all()
-      |> Enum.map(&to_bot_hub_entry/1)
-      |> Enum.filter(& &1)
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, Poison.encode!(%{hubs: hubs}))
+    cond do
+      Enum.any?(candidates, &(&1.bot_config_bytes > @max_bot_config_bytes)) ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          409,
+          Poison.encode!(%{
+            error: "bot_config_too_large",
+            max_bot_config_bytes: @max_bot_config_bytes
+          })
+        )
+
+      length(candidates) > @max_configured_bot_hubs ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          409,
+          Poison.encode!(%{
+            error: "configured_room_limit_exceeded",
+            max_configured_rooms: @max_configured_bot_hubs
+          })
+        )
+
+      true ->
+        hubs = candidates |> Enum.map(&to_bot_hub_entry/1) |> Enum.filter(& &1)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Poison.encode!(%{hubs: hubs}))
+    end
   end
 
-  defp to_bot_hub_entry(%{hub_sid: hub_sid, user_data: user_data, last_active_at: last_active_at}) do
-    bots = map_get(user_data || %{}, "bots") || %{}
-    enabled = normalize_bool(map_get(bots, "enabled"))
-    count = normalize_integer(map_get(bots, "count"), 0)
+  defp to_bot_hub_entry(%{hub_sid: hub_sid, bots: raw_bots, last_active_at: last_active_at}) do
+    bots = BotConfig.normalize(%{"bots" => raw_bots})
+    enabled = bots["enabled"]
+    count = bots["count"]
 
     if enabled && count > 0 do
-      mobility = normalize_mobility(map_get(bots, "mobility"))
-      chat_enabled = normalize_bool(map_get(bots, "chat_enabled"))
-      prompt = normalize_bot_prompt(map_get(bots, "prompt"))
-
       %{
         hub_sid: hub_sid,
         bots: %{
           enabled: enabled,
           count: count,
-          mobility: mobility,
-          chat_enabled: chat_enabled,
-          prompt: prompt
+          mobility: bots["mobility"],
+          chat_enabled: bots["chat_enabled"],
+          prompt: bots["prompt"]
         },
         last_active_at: serialize_datetime(last_active_at)
       }
@@ -84,55 +110,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     end
   end
 
-  defp normalize_integer(value, _default) when is_integer(value), do: value |> max(0) |> min(10)
-
-  defp normalize_integer(value, default) when is_binary(value) do
-    case Integer.parse(value) do
-      {parsed, ""} -> parsed
-      _ -> default
-    end
-    |> max(0)
-    |> min(10)
-  end
-
-  defp normalize_integer(_, default), do: default
-
-  defp normalize_bool(true), do: true
-  defp normalize_bool("true"), do: true
-  defp normalize_bool(1), do: true
-  defp normalize_bool(_), do: false
-
-  defp normalize_mobility("low"), do: "low"
-  defp normalize_mobility("high"), do: "high"
-  defp normalize_mobility("static"), do: "static"
-  defp normalize_mobility(_), do: "medium"
-
-  defp normalize_bot_prompt(value) when is_binary(value) do
-    value |> String.trim() |> String.slice(0, 1_500)
-  end
-
-  defp normalize_bot_prompt(_), do: ""
-
   defp serialize_datetime(nil), do: nil
   defp serialize_datetime(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
   defp serialize_datetime(%DateTime{} = value), do: DateTime.to_iso8601(value)
-
-  defp map_get(map, key) do
-    atom_key =
-      if is_binary(key) do
-        try do
-          String.to_existing_atom(key)
-        rescue
-          ArgumentError -> nil
-        end
-      else
-        key
-      end
-
-    cond do
-      is_map(map) and Map.has_key?(map, key) -> Map.get(map, key)
-      is_map(map) and atom_key != nil and Map.has_key?(map, atom_key) -> Map.get(map, atom_key)
-      true -> nil
-    end
-  end
 end

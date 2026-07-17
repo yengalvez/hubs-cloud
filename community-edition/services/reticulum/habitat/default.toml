@@ -1,5 +1,8 @@
 [ret]
 pool = "default"
+bot_access_key = ""
+bot_runner_access_key = ""
+max_active_bot_rooms = 5
 
 [phx]
 port = 4000

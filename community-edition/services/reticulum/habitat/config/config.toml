@@ -183,6 +183,8 @@ oauth_token_key = "{{ cfg.guardian.oauth_token_key }}"
 
 [ret]
 bot_access_key = "{{ cfg.ret.bot_access_key }}"
+bot_runner_access_key = "{{ cfg.ret.bot_runner_access_key }}"
+max_active_bot_rooms = {{ cfg.ret.max_active_bot_rooms }}
 
 [ret."Elixir.Ret.MediaResolver"]
 ytdl_host = "{{ cfg.resolver.ytdl_host }}"
@@ -314,4 +316,3 @@ hostname_dns_suffix = "{{ cfg.run.hostname_dns_suffix }}"
 
 [hackney]
 max_connections = {{ cfg.hackney.max_connections }}
-

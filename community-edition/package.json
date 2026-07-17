@@ -6,6 +6,7 @@
     "start": "echo \"Follow the steps in readme.md\nUse gen-hcce for generating your kubernetes config file, apply to apply it, and gen-ssl for adding ssl certificates\" && exit 1",
     "gen-hcce": "node generate_script/index.js && node generate_script/verify-generated-manifest.js",
     "verify-hcce": "node generate_script/verify-generated-manifest.js",
+    "test:generator": "node --test generate_script/test/*.test.js",
     "apply": "node apply/index.js && node get_ip/index.js",
     "get-ip": "node get_ip/index.js",
     "gen-ssl": "node ssl_script/index.js",

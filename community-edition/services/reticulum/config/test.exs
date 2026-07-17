@@ -1,5 +1,9 @@
 import Config
 
+config :ret, RetWeb.Plugs.HeaderAuthorization,
+  header_name: "x-ret-admin-access-key",
+  header_value: "test-admin-access-key-at-least-32bytes"
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :ret, RetWeb.Endpoint,

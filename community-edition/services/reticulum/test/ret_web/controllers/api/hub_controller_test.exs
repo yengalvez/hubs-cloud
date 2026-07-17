@@ -6,6 +6,28 @@ defmodule RetWeb.HubControllerTest do
 
   setup [:create_account, :create_owned_file, :create_scene]
 
+  setup do
+    original_orchestrator_config = Application.get_env(:ret, Ret.BotOrchestrator)
+    original_test_receiver = Application.get_env(:ret, Ret.BotOrchestratorTestHttpClient)
+
+    Application.put_env(
+      :ret,
+      Ret.BotOrchestrator,
+      endpoint: "http://bot-orchestrator.test",
+      access_key: String.duplicate("k", 32),
+      http_client: Ret.BotOrchestratorTestHttpClient
+    )
+
+    Application.put_env(:ret, Ret.BotOrchestratorTestHttpClient, self())
+
+    on_exit(fn ->
+      restore_application_env(:ret, Ret.BotOrchestrator, original_orchestrator_config)
+      restore_application_env(:ret, Ret.BotOrchestratorTestHttpClient, original_test_receiver)
+    end)
+
+    :ok
+  end
+
   test "anyone can create a hub", %{conn: conn} do
     %{"status" => "ok"} =
       conn
@@ -57,6 +79,30 @@ defmodule RetWeb.HubControllerTest do
     assert created_hub.user_data["test"] == "Hello World"
   end
 
+  test "a non-admin cannot create an active bot room", %{conn: conn} do
+    conn
+    |> create_hub_with_attrs(%{name: "Denied bot room", user_data: active_bot_user_data()})
+    |> response(422)
+
+    refute Repo.get_by(Hub, name: "Denied bot room")
+  end
+
+  test "a global admin can create an active bot room", %{conn: conn} do
+    admin = create_account("hub-controller-bot-admin", true)
+
+    %{"hub_id" => hub_id} =
+      conn
+      |> auth_with_account(admin)
+      |> create_hub_with_attrs(%{name: "Admin bot room", user_data: active_bot_user_data()})
+      |> json_response(200)
+
+    assert Hub
+           |> Repo.get_by!(hub_sid: hub_id)
+           |> Map.fetch!(:user_data)
+           |> get_in(["bots", "count"]) ==
+             1
+  end
+
   test "non-room owners can't update a hub", %{conn: conn} do
     %{"hub_id" => hub_id} =
       conn
@@ -81,6 +127,52 @@ defmodule RetWeb.HubControllerTest do
       |> json_response(200)
 
     assert Enum.at(hubs, 0)["name"] === "New Name"
+  end
+
+  @tag :authenticated
+  test "a non-admin room owner cannot activate bots through REST update", %{conn: conn} do
+    %{"hub_id" => hub_id} =
+      conn
+      |> create_hub("REST denied bot room")
+      |> json_response(200)
+
+    conn
+    |> update_hub(hub_id, %{user_data: active_bot_user_data()})
+    |> response(422)
+
+    refute Hub
+           |> Repo.get_by!(hub_sid: hub_id)
+           |> Map.fetch!(:user_data)
+           |> get_in(["bots", "enabled"])
+  end
+
+  test "REST delete closes the room and disables its bots atomically", %{conn: conn} do
+    admin = create_account("hub-delete-bot-admin", true)
+
+    %{"hub_id" => hub_id} =
+      conn
+      |> auth_with_account(admin)
+      |> create_hub_with_attrs(%{name: "Delete bot room", user_data: active_bot_user_data()})
+      |> json_response(200)
+
+    conn
+    |> put_req_header("x-ret-admin-access-key", "test-admin-access-key-at-least-32bytes")
+    |> delete(api_v1_hub_path(conn, :delete, hub_id))
+    |> response(200)
+
+    closed = Repo.get_by!(Hub, hub_sid: hub_id)
+    assert closed.entry_mode == :deny
+    refute closed.user_data["bots"]["enabled"]
+    assert closed.user_data["bots"]["count"] == 1
+
+    assert_receive {:bot_orchestrator_request, :post,
+                    "http://bot-orchestrator.test/internal/bots/room-stop", body, headers,
+                    options}
+
+    assert Poison.decode!(body) == %{"hub_sid" => hub_id}
+    assert {"x-ret-bot-orchestrator-access-key", String.duplicate("k", 32)} in headers
+    assert options[:timeout] == 5_000
+    assert options[:recv_timeout] == 5_000
   end
 
   @tag :authenticated
@@ -208,4 +300,19 @@ defmodule RetWeb.HubControllerTest do
     |> put_req_header("content-type", "application/json")
     |> patch(api_v1_hub_path(conn, :update, hub_id), body)
   end
+
+  defp active_bot_user_data do
+    %{
+      bots: %{
+        enabled: true,
+        count: 1,
+        mobility: "static",
+        chat_enabled: true,
+        prompt: ""
+      }
+    }
+  end
+
+  defp restore_application_env(app, key, nil), do: Application.delete_env(app, key)
+  defp restore_application_env(app, key, value), do: Application.put_env(app, key, value)
 end
