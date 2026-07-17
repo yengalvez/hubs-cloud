@@ -57,7 +57,10 @@ defmodule Ret.WaypointReservationTest do
     for result <- results,
         state <- result.states do
       assert Map.keys(state) |> Enum.sort() ==
-               ~w(expires_at occupied protocol waypoint_id) |> Enum.sort()
+               ~w(expires_at occupied protocol state_version waypoint_id) |> Enum.sort()
+
+      assert state["protocol"] == 2
+      assert state["state_version"] in 1..9_007_199_254_740_991
 
       refute Map.has_key?(state, "session_id")
       refute Map.has_key?(state, "client_instance_id")
@@ -69,8 +72,16 @@ defmodule Ret.WaypointReservationTest do
     observer = actor()
     join = register(hub, observer)
 
-    assert [%{waypoint_id: "seat-a", expires_at: expires_at}] = join.active
+    assert [
+             %{
+               waypoint_id: "seat-a",
+               expires_at: expires_at,
+               state_version: state_version
+             }
+           ] = join.active
+
     assert is_binary(expires_at)
+    assert state_version < join.snapshot_state_version
     assert join.current == nil
     assert join.request_seq == 0
   end
@@ -100,7 +111,7 @@ defmodule Ret.WaypointReservationTest do
     assert result.response["status"] == "ok"
     assert [%{"waypoint_id" => "seat-a", "occupied" => true}] = result.states
 
-    invalid = %{request(3, "renew", "seat-a") | "protocol" => 2}
+    invalid = %{request(3, "renew", "seat-a") | "protocol" => 1}
 
     expired =
       WaypointReservation.request(
@@ -122,13 +133,92 @@ defmodule Ret.WaypointReservationTest do
     assert expired_join.states == []
   end
 
+  test "state versions order replies, batches and join snapshots without exposing lease tokens",
+       %{
+         hub: hub
+       } do
+    owner = actor()
+    register(hub, owner)
+
+    initial_request = request(1, "reserve", "seat-a")
+    initial = reserve(hub, owner, initial_request)
+    initial_version = initial.response["state_version"]
+
+    assert initial.response["action"] == "reserve"
+    assert initial_version in 1..9_007_199_254_740_991
+
+    assert [
+             %{
+               "waypoint_id" => "seat-a",
+               "occupied" => true,
+               "state_version" => ^initial_version
+             } = initial_state
+           ] = initial.states
+
+    refute Map.has_key?(initial_state, "reservation_id")
+
+    assert %{response: retried_response, states: []} =
+             reserve(hub, owner, initial_request, 1)
+
+    assert retried_response == initial.response
+
+    moved_request = request(2, "reserve", "seat-b")
+    moved = reserve(hub, owner, moved_request, 1)
+    moved_version = moved.response["state_version"]
+
+    assert moved_version > initial_version
+    assert moved.response["action"] == "reserve"
+    assert Enum.map(moved.states, & &1["waypoint_id"]) == ["seat-a", "seat-b"]
+    assert Enum.map(moved.states, & &1["occupied"]) == [false, true]
+    assert Enum.uniq(Enum.map(moved.states, & &1["state_version"])) == [moved_version]
+    assert Enum.all?(moved.states, &(not Map.has_key?(&1, "reservation_id")))
+
+    reloaded = %{owner | channel_id: SecureRandom.uuid()}
+    snapshot = register(hub, reloaded, 2)
+
+    assert [active] = snapshot.active
+    assert active.waypoint_id == "seat-b"
+    assert active.state_version == moved_version
+    assert snapshot.current.state_version == moved_version
+    assert snapshot.snapshot_state_version > moved_version
+
+    renew_request =
+      request(3, "renew", "seat-b", reservation_id: moved_request["reservation_id"])
+
+    renewed = reserve(hub, reloaded, renew_request, 3)
+    renewed_version = renewed.response["state_version"]
+    assert renewed.response["action"] == "renew"
+    assert renewed_version > snapshot.snapshot_state_version
+    assert [%{"state_version" => ^renewed_version}] = renewed.states
+
+    release_request =
+      request(4, "release", "seat-b", reservation_id: moved_request["reservation_id"])
+
+    released = reserve(hub, reloaded, release_request, 4)
+    released_version = released.response["state_version"]
+    assert released.response["action"] == "release"
+    assert released_version > renewed_version
+
+    assert [
+             %{
+               "occupied" => false,
+               "expires_at" => nil,
+               "state_version" => ^released_version
+             }
+           ] = released.states
+
+    empty_snapshot = register(hub, actor(), 5)
+    assert empty_snapshot.active == []
+    assert empty_snapshot.snapshot_state_version > released_version
+  end
+
   test "same-client channel migration preserves private state and a new client invalidates it", %{
     hub: hub
   } do
     original = actor()
     register(hub, original)
     reserve_request = request(1, "reserve", "seat-a")
-    reserve(hub, original, reserve_request)
+    reserved = reserve(hub, original, reserve_request)
 
     migrated = %{original | channel_id: SecureRandom.uuid()}
     join = register(hub, migrated, 1)
@@ -139,8 +229,11 @@ defmodule Ret.WaypointReservationTest do
              waypoint_id: "seat-a",
              operation_id: reserve_request["operation_id"],
              reservation_id: reserve_request["reservation_id"],
-             expires_at: DateTime.add(@now, 15, :second) |> DateTime.to_iso8601()
+             expires_at: DateTime.add(@now, 15, :second) |> DateTime.to_iso8601(),
+             state_version: reserved.response["state_version"]
            }
+
+    assert join.snapshot_state_version > reserved.response["state_version"]
 
     assert reserve(hub, original, request(2, "renew", "seat-a"), 1).response["reason"] ==
              "stale_channel"
@@ -340,7 +433,7 @@ defmodule Ret.WaypointReservationTest do
     register(hub, actor)
 
     invalid_requests = [
-      %{request(1, "reserve", "seat-a") | "protocol" => 2},
+      %{request(1, "reserve", "seat-a") | "protocol" => 1},
       Map.put(request(1, "reserve", "seat-a"), "extra", true),
       %{request(1, "reserve", "seat-a") | "operation_id" => "not-a-uuid"},
       %{request(1, "reserve", "seat-a") | "waypoint_id" => String.duplicate("x", 513)},
@@ -367,15 +460,161 @@ defmodule Ret.WaypointReservationTest do
     assert row.last_request_seq == 0
 
     assert WaypointReservation.join_client_instance(%{
-             "protocol" => 1,
+             "protocol" => 2,
              "client_instance_id" => actor.client_instance_id
            }) == {:ok, actor.client_instance_id}
 
     assert WaypointReservation.join_client_instance(%{
              "protocol" => 1,
+             "client_instance_id" => actor.client_instance_id
+           }) == :unsupported
+
+    assert WaypointReservation.join_client_instance(%{
+             "protocol" => 2,
              "client_instance_id" => actor.client_instance_id,
              "extra" => true
            }) == :unsupported
+  end
+
+  test "front limiter counts invalid, stale, replay and duplicate traffic before any DB lock", %{
+    hub: hub
+  } do
+    actor = actor()
+    lock_calls = :counters.new(1, [])
+
+    fake_lock = fn _hub_id, _operation ->
+      :counters.add(lock_calls, 1, 1)
+      %{response: %{"status" => "fake"}, states: []}
+    end
+
+    valid = request(1, "reserve", "seat-a")
+    invalid = Map.put(valid, "protocol", 1)
+    replay = %{valid | "request_seq" => 1, "operation_id" => SecureRandom.uuid()}
+    traffic = [invalid, valid, valid, replay]
+
+    for index <- 1..WaypointReservation.front_rate_limit() do
+      payload = Enum.at(traffic, rem(index - 1, length(traffic)))
+
+      assert WaypointReservation.request_with_dependencies(
+               hub.hub_id,
+               actor.session_id,
+               actor.client_instance_id,
+               actor.channel_id,
+               payload,
+               @allowed,
+               @now,
+               with_hub_lock: fake_lock
+             ).response["status"] == "fake"
+    end
+
+    assert :counters.get(lock_calls, 1) == WaypointReservation.front_rate_limit()
+
+    limited =
+      WaypointReservation.request_with_dependencies(
+        hub.hub_id,
+        actor.session_id,
+        actor.client_instance_id,
+        actor.channel_id,
+        invalid,
+        @allowed,
+        @now,
+        with_hub_lock: fn _hub_id, _operation ->
+          flunk("front-limited requests must not invoke the advisory lock or DB path")
+        end
+      )
+
+    assert limited.response["reason"] == "rate_limited"
+    assert limited.states == []
+    assert :counters.get(lock_calls, 1) == WaypointReservation.front_rate_limit()
+
+    migrated_channel = %{actor | channel_id: SecureRandom.uuid()}
+
+    migrated_limited =
+      WaypointReservation.request_with_dependencies(
+        hub.hub_id,
+        migrated_channel.session_id,
+        migrated_channel.client_instance_id,
+        migrated_channel.channel_id,
+        valid,
+        @allowed,
+        @now,
+        with_hub_lock: fn _hub_id, _operation ->
+          flunk("a new channel for the same session must share the exhausted front quota")
+        end
+      )
+
+    assert migrated_limited.response["reason"] == "rate_limited"
+
+    new_session = %{migrated_channel | session_id: SecureRandom.uuid()}
+
+    assert WaypointReservation.request_with_dependencies(
+             hub.hub_id,
+             new_session.session_id,
+             new_session.client_instance_id,
+             new_session.channel_id,
+             valid,
+             @allowed,
+             @now,
+             with_hub_lock: fake_lock
+           ).response["status"] == "fake"
+  end
+
+  test "front limiter allows bounded exact idempotent retries and resets per socket window", %{
+    hub: hub
+  } do
+    actor = actor()
+    payload = request(1, "reserve", "seat-a")
+    lock_calls = :counters.new(1, [])
+
+    fake_lock = fn _hub_id, _operation ->
+      :counters.add(lock_calls, 1, 1)
+      %{response: %{"status" => "fake"}, states: []}
+    end
+
+    for _retry <- 1..3 do
+      assert WaypointReservation.request_with_dependencies(
+               hub.hub_id,
+               actor.session_id,
+               actor.client_instance_id,
+               actor.channel_id,
+               payload,
+               @allowed,
+               @now,
+               with_hub_lock: fake_lock
+             ).response["status"] == "fake"
+    end
+
+    assert :counters.get(lock_calls, 1) == 3
+
+    next_window = DateTime.add(@now, 10, :second)
+
+    assert WaypointReservation.request_with_dependencies(
+             hub.hub_id,
+             actor.session_id,
+             actor.client_instance_id,
+             actor.channel_id,
+             payload,
+             @allowed,
+             next_window,
+             with_hub_lock: fake_lock
+           ).response["status"] == "fake"
+
+    other_socket = %{
+      actor
+      | session_id: SecureRandom.uuid(),
+        channel_id: SecureRandom.uuid()
+    }
+
+    assert WaypointReservation.request_with_dependencies(
+             hub.hub_id,
+             other_socket.session_id,
+             other_socket.client_instance_id,
+             other_socket.channel_id,
+             payload,
+             @allowed,
+             @now,
+             with_hub_lock: fake_lock
+           ).response["status"] == "fake"
   end
 
   test "current-channel termination releases the lease but preserves the sequence tombstone", %{
@@ -462,7 +701,7 @@ defmodule Ret.WaypointReservationTest do
 
   defp request(sequence, action, waypoint_id, opts \\ []) do
     %{
-      "protocol" => 1,
+      "protocol" => 2,
       "action" => action,
       "waypoint_id" => waypoint_id,
       "operation_id" => Keyword.get(opts, :operation_id, SecureRandom.uuid()),

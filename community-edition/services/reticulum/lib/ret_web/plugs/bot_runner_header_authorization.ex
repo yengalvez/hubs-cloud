@@ -1,13 +1,11 @@
-defmodule RetWeb.Plugs.DashboardHeaderAuthorization do
+defmodule RetWeb.Plugs.BotRunnerHeaderAuthorization do
   import Plug.Conn
-  @header_name "x-ret-dashboard-access-key"
+  @header_name "x-ret-bot-runner-access-key"
 
   def init(default), do: default
 
   def call(conn, _default) do
-    expected_value =
-      Application.get_env(:ret, RetWeb.Plugs.DashboardHeaderAuthorization)[:dashboard_access_key]
-
+    expected_value = Application.get_env(:ret, :bot_runner_access_key)
     provided_value = conn |> get_req_header(@header_name) |> List.first()
 
     if secure_match?(provided_value, expected_value) do

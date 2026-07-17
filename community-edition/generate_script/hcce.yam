@@ -33,6 +33,9 @@ stringData:
   SKETCHFAB_API_KEY: "$SKETCHFAB_API_KEY"
   TENOR_API_KEY: "$TENOR_API_KEY"
   BOT_ACCESS_KEY: "$BOT_ACCESS_KEY"
+  BOT_RUNNER_ACCESS_KEY: "$BOT_RUNNER_ACCESS_KEY"
+  BOT_ORCHESTRATOR_ACCESS_KEY: "$BOT_ORCHESTRATOR_ACCESS_KEY"
+  DASHBOARD_ACCESS_KEY: "$DASHBOARD_ACCESS_KEY"
   OPENAI_API_KEY: "$OPENAI_API_KEY"
   PSQL: "$PSQL"
   PERMS_KEY: '$PERMS_KEY'
@@ -217,8 +220,13 @@ data:
     pool = "hubs"
 
     [ret."Elixir.RetWeb.Plugs.DashboardHeaderAuthorization"]
-    # Empty means the internal bot access key is reused by the authorization plug.
-    dashboard_access_key = ""
+    dashboard_access_key = "<DASHBOARD_ACCESS_KEY>"
+
+    # Legacy wire alias for RetNotice, SupportSubscription and Hub delete.
+    # These are dashboard-administrative actions, so they intentionally share
+    # the dashboard trust domain while retaining their existing header name.
+    [ret."Elixir.RetWeb.Plugs.HeaderAuthorization"]
+    header_value = "<DASHBOARD_ACCESS_KEY>"
 
     [ret."Elixir.Ret.DiscordClient"]
     client_id = ""
@@ -308,12 +316,14 @@ data:
 
     [ret]
     bot_access_key = "<BOT_ACCESS_KEY>"
+    bot_runner_access_key = "<BOT_RUNNER_ACCESS_KEY>"
+    max_active_bot_rooms = <MAX_ACTIVE_ROOMS>
     # pgrest_host = ""
     # ita_host = ""
 
     [ret."Elixir.Ret.BotOrchestrator"]
     endpoint = "http://bot-orchestrator.<POD_NS>:5001"
-    access_key = "<BOT_ACCESS_KEY>"
+    access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"
 
     [ret."Elixir.Ret.MediaResolver"]
     ytdl_host = "<YTDL_HOST>"
@@ -423,12 +433,15 @@ metadata:
   annotations:
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
 spec:
+  # BotRunnerLease authority is process-local. Keep this complete profile singleton;
+  # manifest verification also rejects Reticulum HPAs until DB fencing is implemented.
   replicas: 1
   selector:
     matchLabels:
       app: reticulum
   minReadySeconds: 15
-  # ret-pvc is single-writer storage. Never overlap Reticulum revisions.
+  # Recreate reduces overlap during the standard rollout. Operators must still
+  # abort on duplicate pods/endpoints until bot authority has database fencing.
   strategy:
     type: Recreate
   revisionHistoryLimit: 1
@@ -438,6 +451,9 @@ spec:
         app: reticulum
       annotations:
         yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-runner-access-key-checksum: "$BOT_RUNNER_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-orchestrator-access-key-checksum: "$BOT_ORCHESTRATOR_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/dashboard-access-key-checksum: "$DASHBOARD_ACCESS_KEY_CHECKSUM"
         yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
       automountServiceAccountToken: false
@@ -583,6 +599,23 @@ spec:
             secretKeyRef:
               name: configs
               key: BOT_ACCESS_KEY
+        - name: turkeyCfg_BOT_RUNNER_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: BOT_RUNNER_ACCESS_KEY
+        - name: turkeyCfg_BOT_ORCHESTRATOR_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: BOT_ORCHESTRATOR_ACCESS_KEY
+        - name: turkeyCfg_MAX_ACTIVE_ROOMS
+          value: "$MAX_ACTIVE_ROOMS"
+        - name: turkeyCfg_DASHBOARD_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: DASHBOARD_ACCESS_KEY
         - name: turkeyCfg_YTDL_HOST
           value: "http://ytdl:5000"
         - name: turkeyCfg_PHOTOMNEMONIC
@@ -667,6 +700,9 @@ metadata:
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
 spec:
   replicas: 1
+  # A second orchestrator must never overlap the authenticated runner lease.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: bot-orchestrator
@@ -675,7 +711,8 @@ spec:
       labels:
         app: bot-orchestrator
       annotations:
-        yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-runner-access-key-checksum: "$BOT_RUNNER_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-orchestrator-access-key-checksum: "$BOT_ORCHESTRATOR_ACCESS_KEY_CHECKSUM"
     spec:
       automountServiceAccountToken: false
       containers:
@@ -703,11 +740,16 @@ spec:
         - containerPort: 5001
           name: http
         env:
-        - name: BOT_ACCESS_KEY
+        - name: BOT_RUNNER_ACCESS_KEY
           valueFrom:
             secretKeyRef:
               name: configs
-              key: BOT_ACCESS_KEY
+              key: BOT_RUNNER_ACCESS_KEY
+        - name: BOT_ORCHESTRATOR_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: configs
+              key: BOT_ORCHESTRATOR_ACCESS_KEY
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:
@@ -720,21 +762,29 @@ spec:
         - name: RUNNER_AUTOSTART
           value: "true"
         - name: RUNNER_BACKEND
-          value: "$RUNNER_BACKEND"
+          value: ghost
         - name: RUNNER_BACKEND_CANARY_HUBS
-          value: "$RUNNER_BACKEND_CANARY_HUBS"
+          value: ""
         - name: RUNNER_SCRIPT
           value: /app/run-bot.js
+        - name: RET_INTERNAL_ENDPOINT
+          value: http://ret:4001
+        - name: RET_INTERNAL_PATH
+          value: /api-internal/v1/hubs/configured_with_bots
+        - name: RET_INTERNAL_ACCESS_HEADER
+          value: x-ret-bot-runner-access-key
         - name: GHOST_RUNNER_SCRIPT
-          value: "$GHOST_RUNNER_SCRIPT"
+          value: /app/run-ghost-runner.js
         - name: GHOST_RAYCAST_MODE
-          value: "$GHOST_RAYCAST_MODE"
+          value: spoke_colliders
         - name: GHOST_NAVIGATION_MODE
-          value: "$GHOST_NAVIGATION_MODE"
+          value: navmesh_preferred
         - name: GHOST_NAVIGATION_REQUIRE_NAVMESH
-          value: "$GHOST_NAVIGATION_REQUIRE_NAVMESH"
+          value: "true"
         - name: GHOST_NAVIGATION_RECOVERY_RESTART_MS
           value: "30000"
+        - name: GHOST_SPAWN_RECOVERY_RESTART_MS
+          value: "5000"
         - name: GHOST_NAVMESH_MAX_TRIANGLES
           value: "$GHOST_NAVMESH_MAX_TRIANGLES"
         - name: GHOST_NAVMESH_MAX_ROUTE_POINTS
@@ -763,6 +813,30 @@ spec:
           value: "200000"
         - name: HUBS_BASE_URL
           value: https://$HUB_DOMAIN
+        - name: RET_SYNC_TIMEOUT_MS
+          value: "5000"
+        - name: RET_SNAPSHOT_TTL_MS
+          value: "120000"
+        - name: RUNNER_CONFIG_ACK_TIMEOUT_MS
+          value: "15000"
+        - name: RUNNER_STARTUP_GRACE_MS
+          value: "60000"
+        - name: RUNNER_STALE_RESTART_MS
+          value: "30000"
+        - name: RUNNER_TERMINAL_RECOVERY_GRACE_MS
+          value: "15000"
+        - name: RUNNER_WATCHDOG_INTERVAL_MS
+          value: "5000"
+        - name: RUNNER_RESTART_BASE_MS
+          value: "3000"
+        - name: RUNNER_RESTART_MAX_MS
+          value: "60000"
+        - name: RUNNER_STABLE_RESET_MS
+          value: "30000"
+        - name: RUNNER_TERMINATION_GRACE_MS
+          value: "10000"
+        - name: RUNNER_KILL_GRACE_MS
+          value: "5000"
         - name: MAX_ACTIVE_ROOMS
           value: "$MAX_ACTIVE_ROOMS"
         - name: MAX_BOTS_PER_ROOM

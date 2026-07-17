@@ -2,6 +2,24 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const YAML = require("yaml");
+const {
+  findExactResource,
+  hasExactOwnKeys,
+  verifyAuditedDeploymentContainers,
+  verifyBotOrchestratorContainers,
+  verifyBotOrchestratorDeploymentContract,
+  verifyBotOrchestratorIsolationContract,
+  verifyBotOrchestratorRuntimeEnv,
+  verifyBotOrchestratorSecurityContext,
+  verifyBotOrchestratorSecretEnv,
+  verifyExactIngressPolicy,
+  verifyHaproxyClusterRole,
+  verifyManifestResourceIdentities,
+  verifyManifestResourceInventory,
+  verifyNoYamlIndirections,
+  verifyNoReticulumHorizontalPodAutoscaler,
+  verifyReticulumBotRunnerAuthorityContract
+} = require("./verify-manifest-contracts");
 
 const manifestPath = process.env.HCCE_MANIFEST_PATH
   ? path.resolve(process.env.HCCE_MANIFEST_PATH)
@@ -12,65 +30,22 @@ function fail(message) {
   errors.push(message);
 }
 
-function findResource(resources, kind, name) {
-  return resources.find(resource => resource && resource.kind === kind && resource.metadata?.name === name);
-}
-
-function hasRule(clusterRole, apiGroup, resource, requiredVerbs) {
-  return (clusterRole?.rules || []).some(rule => {
-    const groups = rule.apiGroups || [];
-    const resources = rule.resources || [];
-    const verbs = rule.verbs || [];
-    return (
-      groups.includes(apiGroup) &&
-      (resources.includes(resource) || resources.includes("*")) &&
-      requiredVerbs.every(verb => verbs.includes(verb) || verbs.includes("*"))
-    );
-  });
-}
-
 function isDigestPinnedImage(image) {
   return typeof image === "string" && /@sha256:[a-f0-9]{64}$/i.test(image);
 }
 
-function verifyIngressPolicy(resources, name, targetApp, allowedApps, port) {
-  const policy = findResource(resources, "NetworkPolicy", name);
+function verifyIngressPolicy(resources, namespace, name, targetApp, allowedApps, port) {
+  const policy = findExactResource(resources, "networking.k8s.io", "NetworkPolicy", namespace, name);
   if (!policy) {
     fail(`missing NetworkPolicy/${name}`);
     return;
   }
-  if (policy.spec?.podSelector?.matchLabels?.app !== targetApp) {
-    fail(`NetworkPolicy/${name} must select app=${targetApp}`);
-  }
-  const policyTypes = policy.spec?.policyTypes || [];
-  if (!policyTypes.includes("Ingress") || policyTypes.includes("Egress")) {
-    fail(`NetworkPolicy/${name} must isolate ingress only`);
-  }
-
-  const rules = policy.spec?.ingress || [];
-  const peers = rules.flatMap(rule => rule.from || []);
-  const actualApps = peers.map(peer => peer.podSelector?.matchLabels?.app).filter(Boolean).sort();
-  const expectedApps = [...allowedApps].sort();
-  if (
-    peers.some(peer => !peer.podSelector || peer.namespaceSelector || peer.ipBlock) ||
-    JSON.stringify(actualApps) !== JSON.stringify(expectedApps)
-  ) {
-    fail(`NetworkPolicy/${name} must allow only same-namespace apps: ${expectedApps.join(", ")}`);
-  }
-
-  const ports = rules.flatMap(rule => rule.ports || []);
-  if (
-    ports.length !== 1 ||
-    String(ports[0].protocol || "TCP") !== "TCP" ||
-    Number(ports[0].port) !== Number(port)
-  ) {
-    fail(`NetworkPolicy/${name} must allow only TCP/${port}`);
-  }
+  verifyExactIngressPolicy(policy, { name, targetApp, allowedApps, port }).forEach(fail);
 }
 
-function verifyPhotomnemonicEgressPolicy(resources) {
+function verifyPhotomnemonicEgressPolicy(resources, namespace) {
   const name = "photomnemonic-egress";
-  const policy = findResource(resources, "NetworkPolicy", name);
+  const policy = findExactResource(resources, "networking.k8s.io", "NetworkPolicy", namespace, name);
   if (!policy) {
     fail(`missing NetworkPolicy/${name}`);
     return;
@@ -131,8 +106,8 @@ function verifyPhotomnemonicEgressPolicy(resources) {
   }
 }
 
-function verifyResourceBudget(resources, deploymentName, containerName, expected) {
-  const deployment = findResource(resources, "Deployment", deploymentName);
+function verifyResourceBudget(resources, namespace, deploymentName, containerName, expected) {
+  const deployment = findExactResource(resources, "apps", "Deployment", namespace, deploymentName);
   const container = deployment?.spec?.template?.spec?.containers?.find(value => value.name === containerName);
   if (!container) {
     fail(`missing Deployment/${deploymentName} container ${containerName}`);
@@ -158,27 +133,78 @@ if (!fs.existsSync(manifestPath)) {
   fail(`manifest not found: ${manifestPath}`);
 } else {
   const raw = fs.readFileSync(manifestPath, "utf8");
-  if (/\$[A-Za-z_][A-Za-z0-9_]*/.test(raw)) {
-    fail("manifest contains unresolved template placeholders");
-  }
-
   const documents = YAML.parseAllDocuments(raw);
   documents.forEach((document, index) => {
     document.errors.forEach(error => fail(`YAML document ${index + 1}: ${error.message}`));
   });
+  verifyNoYamlIndirections(documents, YAML).forEach(fail);
   const resources = documents.map(document => document.toJS()).filter(Boolean);
+  verifyManifestResourceIdentities(resources).forEach(fail);
+  verifyManifestResourceInventory(resources).forEach(fail);
+  verifyNoReticulumHorizontalPodAutoscaler(resources).forEach(fail);
+  const namespaceResource = resources.find(resource => {
+    return resource?.apiVersion === "v1" &&
+      resource?.kind === "Namespace" &&
+      resource?.metadata?.namespace === undefined;
+  });
+  const manifestNamespace = namespaceResource?.metadata?.name || "";
+  verifyAuditedDeploymentContainers(resources, manifestNamespace).forEach(fail);
 
-  const configsSecret = findResource(resources, "Secret", "configs");
-  const botAccessKey = configsSecret?.stringData?.BOT_ACCESS_KEY;
-  if (typeof botAccessKey !== "string" || botAccessKey.length < 32) {
-    fail("Secret/configs BOT_ACCESS_KEY must contain at least 32 characters");
+  const configsSecret = findExactResource(resources, "", "Secret", manifestNamespace, "configs");
+  const accessKeyNames = [
+    "BOT_ACCESS_KEY",
+    "BOT_RUNNER_ACCESS_KEY",
+    "BOT_ORCHESTRATOR_ACCESS_KEY",
+    "DASHBOARD_ACCESS_KEY"
+  ];
+  const accessKeys = Object.fromEntries(
+    accessKeyNames.map(name => [name, configsSecret?.stringData?.[name]])
+  );
+  for (const name of accessKeyNames) {
+    if (typeof accessKeys[name] !== "string" || accessKeys[name].length < 32) {
+      fail(`Secret/configs ${name} must contain at least 32 characters`);
+    }
+  }
+  if (new Set(accessKeyNames.map(name => accessKeys[name])).size !== accessKeyNames.length) {
+    fail("Secret/configs bot integration, runner, orchestrator and dashboard keys must be distinct");
   }
 
-  const retConfig = findResource(resources, "ConfigMap", "ret-config");
-  const reticulum = findResource(resources, "Deployment", "reticulum");
+  const retConfig = findExactResource(resources, "", "ConfigMap", manifestNamespace, "ret-config");
+  const reticulum = findExactResource(resources, "apps", "Deployment", manifestNamespace, "reticulum");
+  verifyReticulumBotRunnerAuthorityContract(reticulum).forEach(fail);
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
     container => container.name === "reticulum"
   );
+  const reticulumEnv = Array.isArray(reticulumContainer?.env) ? reticulumContainer.env : [];
+  const reticulumAccessKeyContracts = accessKeyNames.map(name => ({
+    envName: `turkeyCfg_${name}`,
+    secretKey: name
+  }));
+  for (const contract of reticulumAccessKeyContracts) {
+    const entries = reticulumEnv.filter(entry => entry?.name === contract.envName);
+    const entry = entries[0];
+    const valueFrom = entry?.valueFrom;
+    const secretKeyRef = valueFrom?.secretKeyRef;
+    if (
+      entries.length !== 1 ||
+      !hasExactOwnKeys(entry, ["name", "valueFrom"]) ||
+      !hasExactOwnKeys(valueFrom, ["secretKeyRef"]) ||
+      !hasExactOwnKeys(secretKeyRef, ["name", "key"]) ||
+      secretKeyRef.name !== "configs" ||
+      secretKeyRef.key !== contract.secretKey
+    ) {
+      fail(
+        `Deployment/reticulum ${contract.envName} must exclusively reference ` +
+        `Secret/configs key ${contract.secretKey}`
+      );
+    }
+  }
+  const reticulumAccessKeyReferences = reticulumEnv.filter(entry =>
+    accessKeyNames.includes(entry?.valueFrom?.secretKeyRef?.key)
+  );
+  if (reticulumAccessKeyReferences.length !== reticulumAccessKeyContracts.length) {
+    fail("Deployment/reticulum must contain exactly four scoped access-key Secret references");
+  }
   const runtimeConfig = retConfig?.data?.["config.toml.template"] || "";
   const runtimePlaceholders = [...runtimeConfig.matchAll(/<([A-Z][A-Z0-9_]*)>/g)].map(match => match[1]);
   const runtimeVariables = new Set(
@@ -194,6 +220,75 @@ if (!fs.existsSync(manifestPath)) {
     fail(
       `ret-config placeholders have no matching turkeyCfg_ environment variable: ${missingRuntimeVariables.join(", ")}`
     );
+  }
+  const accessKeyPlaceholderSet = new Set(accessKeyNames);
+  const observedAccessKeyMappings = [];
+  const observedBotRoomLimitMappings = [];
+  let currentRuntimeSection = "";
+  for (const rawLine of runtimeConfig.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (/^\[[^\r\n]+\]$/.test(line)) {
+      currentRuntimeSection = line;
+      continue;
+    }
+    const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"<([A-Z][A-Z0-9_]*)>"\s*$/);
+    if (assignment && accessKeyPlaceholderSet.has(assignment[2])) {
+      observedAccessKeyMappings.push(`${currentRuntimeSection}\t${assignment[1]}\t${assignment[2]}`);
+    }
+    const botRoomLimitAssignment = line.match(
+      /^(max_active_bot_rooms)\s*=\s*<([A-Z][A-Z0-9_]*)>\s*$/
+    );
+    if (botRoomLimitAssignment) {
+      observedBotRoomLimitMappings.push(
+        `${currentRuntimeSection}\t${botRoomLimitAssignment[1]}\t${botRoomLimitAssignment[2]}`
+      );
+    }
+  }
+  const expectedAccessKeyMappings = [
+    '[ret."Elixir.RetWeb.Plugs.DashboardHeaderAuthorization"]\tdashboard_access_key\tDASHBOARD_ACCESS_KEY',
+    '[ret."Elixir.RetWeb.Plugs.HeaderAuthorization"]\theader_value\tDASHBOARD_ACCESS_KEY',
+    '[ret]\tbot_access_key\tBOT_ACCESS_KEY',
+    '[ret]\tbot_runner_access_key\tBOT_RUNNER_ACCESS_KEY',
+    '[ret."Elixir.Ret.BotOrchestrator"]\taccess_key\tBOT_ORCHESTRATOR_ACCESS_KEY'
+  ];
+  if (
+    JSON.stringify(observedAccessKeyMappings.sort()) !== JSON.stringify(expectedAccessKeyMappings.sort())
+  ) {
+    fail("ret-config must preserve the exact scoped access-key placeholder mappings");
+  }
+  if (
+    JSON.stringify(observedBotRoomLimitMappings) !==
+    JSON.stringify(["[ret]\tmax_active_bot_rooms\tMAX_ACTIVE_ROOMS"])
+  ) {
+    fail("ret-config must bind max_active_bot_rooms exactly to MAX_ACTIVE_ROOMS");
+  }
+
+  const reticulumBotRoomLimitEntries = reticulumEnv.filter(
+    entry => entry?.name === "turkeyCfg_MAX_ACTIVE_ROOMS"
+  );
+  const reticulumBotRoomLimitEntry = reticulumBotRoomLimitEntries[0];
+  const capacityBotOrchestrator = findExactResource(
+    resources,
+    "apps",
+    "Deployment",
+    manifestNamespace,
+    "bot-orchestrator"
+  );
+  const capacityBotContainer = capacityBotOrchestrator?.spec?.template?.spec?.containers?.find(
+    container => container.name === "bot-orchestrator"
+  );
+  const botRoomLimitEntries = (capacityBotContainer?.env || []).filter(
+    entry => entry?.name === "MAX_ACTIVE_ROOMS"
+  );
+  const botRoomLimitEntry = botRoomLimitEntries[0];
+  if (
+    reticulumBotRoomLimitEntries.length !== 1 ||
+    botRoomLimitEntries.length !== 1 ||
+    !hasExactOwnKeys(reticulumBotRoomLimitEntry, ["name", "value"]) ||
+    !hasExactOwnKeys(botRoomLimitEntry, ["name", "value"]) ||
+    String(reticulumBotRoomLimitEntry.value) !== String(botRoomLimitEntry.value)
+  ) {
+    fail("Reticulum and bot-orchestrator must receive the same MAX_ACTIVE_ROOMS value");
   }
 
   for (const deployment of resources.filter(resource => resource.kind === "Deployment")) {
@@ -221,18 +316,18 @@ if (!fs.existsSync(manifestPath)) {
     "coturn"
   ];
   for (const name of tokenlessDeployments) {
-    const deployment = findResource(resources, "Deployment", name);
+    const deployment = findExactResource(resources, "apps", "Deployment", manifestNamespace, name);
     if (deployment?.spec?.template?.spec?.automountServiceAccountToken !== false) {
       fail(`Deployment/${name} must disable service-account token automounting`);
     }
   }
 
-  const haproxyDeployment = findResource(resources, "Deployment", "haproxy");
+  const haproxyDeployment = findExactResource(resources, "apps", "Deployment", manifestNamespace, "haproxy");
   if (haproxyDeployment?.spec?.template?.spec?.serviceAccountName !== "haproxy-sa") {
     fail("Deployment/haproxy must keep its dedicated service account");
   }
 
-  const coturnDeployment = findResource(resources, "Deployment", "coturn");
+  const coturnDeployment = findExactResource(resources, "apps", "Deployment", manifestNamespace, "coturn");
   const credentialLeakingCoturnImage =
     "docker.io/mozillareality/coturn@sha256:8380269c7bb2dc369f4126251199f0d603711debe8537b22cb7be470a50c51ce";
   if (coturnDeployment?.spec?.template?.spec?.containers?.[0]?.image === credentialLeakingCoturnImage) {
@@ -265,11 +360,11 @@ if (!fs.existsSync(manifestPath)) {
     fail(`all Deployment containers need an audited resource budget: ${unbudgetedContainers.join(", ")}`);
   }
   resourceBudgets.forEach(([deployment, container, expected]) =>
-    verifyResourceBudget(resources, deployment, container, expected)
+    verifyResourceBudget(resources, manifestNamespace, deployment, container, expected)
   );
 
-  for (const name of ["reticulum", "pgsql", "dialog", "coturn"]) {
-    const deployment = findResource(resources, "Deployment", name);
+  for (const name of ["reticulum", "bot-orchestrator", "pgsql", "dialog", "coturn"]) {
+    const deployment = findExactResource(resources, "apps", "Deployment", manifestNamespace, name);
     if (deployment?.spec?.strategy?.type !== "Recreate") {
       fail(`Deployment/${name} must use Recreate for single-writer storage or exclusive host ports`);
     }
@@ -278,26 +373,62 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  const botOrchestrator = findResource(resources, "Deployment", "bot-orchestrator");
-  const dialog = findResource(resources, "Deployment", "dialog");
+  const botOrchestrator = findExactResource(
+    resources,
+    "apps",
+    "Deployment",
+    manifestNamespace,
+    "bot-orchestrator"
+  );
+  verifyBotOrchestratorContainers(botOrchestrator).forEach(fail);
+  verifyBotOrchestratorDeploymentContract(botOrchestrator).forEach(fail);
+  verifyBotOrchestratorIsolationContract(botOrchestrator).forEach(fail);
+  const dialog = findExactResource(resources, "apps", "Deployment", manifestNamespace, "dialog");
   const reticulumBotKeyChecksum =
     reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
-  const botOrchestratorBotKeyChecksum =
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
-  const expectedBotKeyChecksum =
-    typeof botAccessKey === "string"
-      ? crypto.createHash("sha256").update(botAccessKey).digest("hex")
+  const reticulumRunnerKeyChecksum =
+    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
+  const reticulumOrchestratorKeyChecksum =
+    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
+  const reticulumDashboardKeyChecksum =
+    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"];
+  const botOrchestratorRunnerKeyChecksum =
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
+  const botOrchestratorAccessKeyChecksum =
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
+  const checksumFor = name =>
+    typeof accessKeys[name] === "string"
+      ? crypto.createHash("sha256").update(accessKeys[name]).digest("hex")
       : "";
+  const expectedBotKeyChecksum = checksumFor("BOT_ACCESS_KEY");
   if (reticulumBotKeyChecksum !== expectedBotKeyChecksum) {
     fail("Deployment/reticulum bot access key checksum must match Secret/configs");
   }
-  if (botOrchestratorBotKeyChecksum !== reticulumBotKeyChecksum) {
-    fail("Reticulum and bot-orchestrator must share the bot access key checksum annotation");
+  if (
+    reticulumRunnerKeyChecksum !== checksumFor("BOT_RUNNER_ACCESS_KEY") ||
+    botOrchestratorRunnerKeyChecksum !== reticulumRunnerKeyChecksum
+  ) {
+    fail("Reticulum and bot-orchestrator runner key checksums must match Secret/configs");
+  }
+  if (
+    reticulumOrchestratorKeyChecksum !== checksumFor("BOT_ORCHESTRATOR_ACCESS_KEY") ||
+    botOrchestratorAccessKeyChecksum !== reticulumOrchestratorKeyChecksum
+  ) {
+    fail("Reticulum and bot-orchestrator access key checksums must match Secret/configs");
+  }
+  if (reticulumDashboardKeyChecksum !== checksumFor("DASHBOARD_ACCESS_KEY")) {
+    fail("Deployment/reticulum dashboard key checksum must match Secret/configs");
+  }
+  if (
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"] ||
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"]
+  ) {
+    fail("bot-orchestrator must not receive legacy integration or dashboard key checksums");
   }
 
   const databaseConsumers = ["reticulum", "pgbouncer", "pgbouncer-t", "coturn"];
   const databaseChecksums = databaseConsumers.map(name => {
-    const deployment = findResource(resources, "Deployment", name);
+    const deployment = findExactResource(resources, "apps", "Deployment", manifestNamespace, name);
     return deployment?.spec?.template?.metadata?.annotations?.["yenhubs.org/db-credential-checksum"];
   });
   if (
@@ -336,23 +467,9 @@ if (!fs.existsSync(manifestPath)) {
   if (!botContainer) {
     fail("missing bot-orchestrator container");
   } else {
-    const security = botContainer.securityContext || {};
-    const droppedCapabilities = security.capabilities?.drop || [];
-    if (security.runAsNonRoot !== true) {
-      fail("bot-orchestrator container must run as non-root");
-    }
-    if (Number(security.runAsUser) !== 1000 || Number(security.runAsGroup) !== 1000) {
-      fail("bot-orchestrator container must use the audited uid/gid 1000");
-    }
-    if (security.allowPrivilegeEscalation !== false) {
-      fail("bot-orchestrator container must disable privilege escalation");
-    }
-    if (!droppedCapabilities.includes("ALL")) {
-      fail("bot-orchestrator container must drop all Linux capabilities");
-    }
-    if (security.seccompProfile?.type !== "RuntimeDefault") {
-      fail("bot-orchestrator container must use the RuntimeDefault seccomp profile");
-    }
+    verifyBotOrchestratorSecretEnv(botContainer).forEach(fail);
+    verifyBotOrchestratorSecurityContext(botContainer).forEach(fail);
+    verifyBotOrchestratorRuntimeEnv(botContainer).forEach(fail);
     const botEnv = Object.fromEntries(
       (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
     );
@@ -394,6 +511,7 @@ if (!fs.existsSync(manifestPath)) {
       Number(botEnv.GHOST_NAVMESH_MAX_ROUTE_POINTS) !== 64 ||
       Number(botEnv.GHOST_NAVMESH_MAX_SNAP_DISTANCE_M) !== 3 ||
       Number(botEnv.GHOST_NAVIGATION_RECOVERY_RESTART_MS) !== 30000 ||
+      Number(botEnv.GHOST_SPAWN_RECOVERY_RESTART_MS) !== 5000 ||
       Number(botEnv.GHOST_FEATURED_FETCH_TIMEOUT_MS) !== 4000 ||
       Number(botEnv.GHOST_FEATURED_MAX_BYTES) !== 524288 ||
       Number(botEnv.GHOST_FEATURED_MAX_REDIRECTS) !== 2 ||
@@ -401,6 +519,22 @@ if (!fs.existsSync(manifestPath)) {
       Number(botEnv.GHOST_FEATURED_MAX_REFS) !== 128
     ) {
       fail("bot-orchestrator navigation and Featured-fetch limits do not match the audited baseline");
+    }
+    if (
+      Number(botEnv.RET_SYNC_TIMEOUT_MS) !== 5000 ||
+      Number(botEnv.RET_SNAPSHOT_TTL_MS) !== 120000 ||
+      Number(botEnv.RUNNER_CONFIG_ACK_TIMEOUT_MS) !== 15000 ||
+      Number(botEnv.RUNNER_STARTUP_GRACE_MS) !== 60000 ||
+      Number(botEnv.RUNNER_STALE_RESTART_MS) !== 30000 ||
+      Number(botEnv.RUNNER_TERMINAL_RECOVERY_GRACE_MS) !== 15000 ||
+      Number(botEnv.RUNNER_WATCHDOG_INTERVAL_MS) !== 5000 ||
+      Number(botEnv.RUNNER_RESTART_BASE_MS) !== 3000 ||
+      Number(botEnv.RUNNER_RESTART_MAX_MS) !== 60000 ||
+      Number(botEnv.RUNNER_STABLE_RESET_MS) !== 30000 ||
+      Number(botEnv.RUNNER_TERMINATION_GRACE_MS) !== 10000 ||
+      Number(botEnv.RUNNER_KILL_GRACE_MS) !== 5000
+    ) {
+      fail("bot-orchestrator desired-state and runner recovery bounds do not match the audited baseline");
     }
   }
 
@@ -432,7 +566,13 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  const photomnemonic = findResource(resources, "Deployment", "photomnemonic");
+  const photomnemonic = findExactResource(
+    resources,
+    "apps",
+    "Deployment",
+    manifestNamespace,
+    "photomnemonic"
+  );
   const photomnemonicContainer = photomnemonic?.spec?.template?.spec?.containers?.find(
     container => container.name === "photomnemonic"
   );
@@ -464,7 +604,7 @@ if (!fs.existsSync(manifestPath)) {
   }
 
   for (const name of ["ret", "dialog", "nearspark"]) {
-    const ingress = findResource(resources, "Ingress", name);
+    const ingress = findExactResource(resources, "networking.k8s.io", "Ingress", manifestNamespace, name);
     if (!ingress) {
       fail(`missing Ingress/${name}`);
       continue;
@@ -481,12 +621,12 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  const haproxyConfig = findResource(resources, "ConfigMap", "haproxy-config");
+  const haproxyConfig = findExactResource(resources, "", "ConfigMap", manifestNamespace, "haproxy-config");
   if (String(haproxyConfig?.data?.["ssl-redirect"]) !== "false") {
     fail("ConfigMap/haproxy-config must keep global ssl-redirect=false for ACME HTTP-01");
   }
 
-  const haproxy = findResource(resources, "Deployment", "haproxy");
+  const haproxy = findExactResource(resources, "apps", "Deployment", manifestNamespace, "haproxy");
   const haproxyContainer = haproxy?.spec?.template?.spec?.containers?.find(container => container.name === "haproxy");
   if (!haproxyContainer) {
     fail("missing haproxy container");
@@ -505,22 +645,23 @@ if (!fs.existsSync(manifestPath)) {
     }
   }
 
-  const haproxyRole = findResource(resources, "ClusterRole", "haproxy-cr");
-  if (!hasRule(haproxyRole, "apiextensions.k8s.io", "customresourcedefinitions", ["get", "list", "watch"])) {
-    fail("ClusterRole/haproxy-cr is missing CRD read permissions");
-  }
-  if (!hasRule(haproxyRole, "gateway.networking.k8s.io", "gateways", ["get", "list", "watch"])) {
-    fail("ClusterRole/haproxy-cr is missing Gateway API read permissions");
-  }
+  const haproxyRole = findExactResource(
+    resources,
+    "rbac.authorization.k8s.io",
+    "ClusterRole",
+    "",
+    "haproxy-cr"
+  );
+  verifyHaproxyClusterRole(haproxyRole).forEach(fail);
 
-  verifyIngressPolicy(resources, "bot-orchestrator-ingress", "bot-orchestrator", ["reticulum"], 5001);
-  verifyIngressPolicy(resources, "pgsql-ingress", "pgsql", ["pgbouncer", "pgbouncer-t"], 5432);
-  verifyIngressPolicy(resources, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
-  verifyIngressPolicy(resources, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);
-  verifyIngressPolicy(resources, "photomnemonic-ingress", "photomnemonic", ["reticulum"], 5000);
-  verifyPhotomnemonicEgressPolicy(resources);
+  verifyIngressPolicy(resources, manifestNamespace, "bot-orchestrator-ingress", "bot-orchestrator", ["reticulum"], 5001);
+  verifyIngressPolicy(resources, manifestNamespace, "pgsql-ingress", "pgsql", ["pgbouncer", "pgbouncer-t"], 5432);
+  verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
+  verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);
+  verifyIngressPolicy(resources, manifestNamespace, "photomnemonic-ingress", "photomnemonic", ["reticulum"], 5000);
+  verifyPhotomnemonicEgressPolicy(resources, manifestNamespace);
 
-  if (findResource(resources, "Secret", "cert-hcce")) {
+  if (findExactResource(resources, "", "Secret", manifestNamespace, "cert-hcce")) {
     fail("unused self-signed Secret/cert-hcce must not be generated");
   }
 
@@ -537,13 +678,95 @@ if (!fs.existsSync(manifestPath)) {
   ) {
     fail("manifest must create exactly the pgsql-pvc and ret-pvc PersistentVolumeClaims");
   }
-  for (const claim of persistentVolumeClaims) {
-    if (claim.spec?.storageClassName !== "do-block-storage") {
-      fail(`PersistentVolumeClaim/${claim.metadata?.name} must use do-block-storage`);
+  const claimByName = Object.fromEntries(
+    persistentVolumeClaims.map(claim => [claim.metadata?.name, claim])
+  );
+  const claimSizes = persistentVolumeClaims.map(claim => String(claim.spec?.resources?.requests?.storage || ""));
+  if (
+    claimSizes.length !== 2 ||
+    new Set(claimSizes).size !== 1 ||
+    !/^[1-9][0-9]*(?:Mi|Gi|Ti)$/.test(claimSizes[0] || "")
+  ) {
+    fail("pgsql-pvc and ret-pvc must request the same positive Mi/Gi/Ti storage quantity");
+  }
+  const claimStorageClasses = persistentVolumeClaims.map(claim => claim.spec?.storageClassName);
+  const sameExplicitStorageClass =
+    claimStorageClasses.every(value => typeof value === "string" && value.length > 0) &&
+    new Set(claimStorageClasses).size === 1;
+  const bothUseClusterDefault = claimStorageClasses.every(value => value === undefined);
+  if (!sameExplicitStorageClass && !bothUseClusterDefault) {
+    fail("pgsql-pvc and ret-pvc must use one identical explicit storageClassName or both use the cluster default");
+  }
+  const storageClassName = bothUseClusterDefault ? "default" : claimStorageClasses[0];
+  const manualStorage = storageClassName === "manual";
+  const expectedAccessModes = manualStorage
+    ? { "pgsql-pvc": ["ReadWriteOnce"], "ret-pvc": ["ReadWriteOnce"] }
+    : { "pgsql-pvc": ["ReadWriteOncePod"], "ret-pvc": ["ReadWriteOnce"] };
+  for (const [name, accessModes] of Object.entries(expectedAccessModes)) {
+    if (JSON.stringify(claimByName[name]?.spec?.accessModes) !== JSON.stringify(accessModes)) {
+      fail(`PersistentVolumeClaim/${name} must use ${accessModes.join(",")} for ${storageClassName} storage`);
     }
-    if (String(claim.spec?.resources?.requests?.storage) !== "10Gi") {
-      fail(`PersistentVolumeClaim/${claim.metadata?.name} must request exactly 10Gi`);
+  }
+
+  const persistentVolumes = resources.filter(resource => resource.kind === "PersistentVolume");
+  if (manualStorage) {
+    const volumeByName = Object.fromEntries(persistentVolumes.map(volume => [volume.metadata?.name, volume]));
+    if (
+      persistentVolumes.length !== 2 ||
+      !volumeByName["pgsql-pv"] ||
+      !volumeByName["ret-pv"]
+    ) {
+      fail("manual storage must create exactly pgsql-pv and ret-pv");
     }
+    for (const [name, claimName, hostPath] of [
+      ["pgsql-pv", "pgsql-pvc", "/mnt/pgsql_data"],
+      ["ret-pv", "ret-pvc", "/mnt/ret_storage_data"]
+    ]) {
+      const volume = volumeByName[name];
+      const spec = volume?.spec;
+      if (
+        !hasExactOwnKeys(spec, [
+          "storageClassName",
+          "capacity",
+          "accessModes",
+          "persistentVolumeReclaimPolicy",
+          "claimRef",
+          "hostPath"
+        ]) ||
+        spec.storageClassName !== "manual" ||
+        String(spec.capacity?.storage) !== claimSizes[0] ||
+        JSON.stringify(spec.accessModes) !== JSON.stringify(["ReadWriteOnce"]) ||
+        spec.persistentVolumeReclaimPolicy !== "Retain" ||
+        !hasExactOwnKeys(spec.claimRef, ["name", "namespace"]) ||
+        spec.claimRef.name !== claimName ||
+        spec.claimRef.namespace !== manifestNamespace ||
+        !hasExactOwnKeys(spec.hostPath, ["path", "type"]) ||
+        spec.hostPath.path !== hostPath ||
+        spec.hostPath.type !== "DirectoryOrCreate"
+      ) {
+        fail(`PersistentVolume/${name} does not match the audited retained manual-storage contract`);
+      }
+    }
+  } else if (persistentVolumes.length !== 0) {
+    fail("dynamic or cluster-default storage must not create static PersistentVolumes");
+  }
+
+  const pgsql = findExactResource(resources, "apps", "Deployment", manifestNamespace, "pgsql");
+  const pgsqlVolume = pgsql?.spec?.template?.spec?.volumes?.find(volume => volume.name === "postgresql-data");
+  const reticulumVolume = reticulum?.spec?.template?.spec?.volumes?.find(volume => volume.name === "storage");
+  if (
+    !hasExactOwnKeys(pgsqlVolume, ["name", "persistentVolumeClaim"]) ||
+    !hasExactOwnKeys(pgsqlVolume?.persistentVolumeClaim, ["claimName"]) ||
+    pgsqlVolume.persistentVolumeClaim.claimName !== "pgsql-pvc"
+  ) {
+    fail("Deployment/pgsql must mount only PersistentVolumeClaim/pgsql-pvc for database storage");
+  }
+  if (
+    !hasExactOwnKeys(reticulumVolume, ["name", "persistentVolumeClaim"]) ||
+    !hasExactOwnKeys(reticulumVolume?.persistentVolumeClaim, ["claimName"]) ||
+    reticulumVolume.persistentVolumeClaim.claimName !== "ret-pvc"
+  ) {
+    fail("Deployment/reticulum must mount only PersistentVolumeClaim/ret-pvc for media storage");
   }
 
   if (!errors.length) {

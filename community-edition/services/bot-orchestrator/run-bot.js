@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+// Chromium is a manual visual diagnostic only. Strip authority/provider
+// credentials before loading Puppeteer so neither this wrapper nor the browser
+// process can observe secrets inherited from an operator shell or container.
+delete process.env.BOT_ORCHESTRATOR_ACCESS_KEY;
+delete process.env.BOT_RUNNER_ACCESS_KEY;
+delete process.env.OPENAI_API_KEY;
+
 const doc = `
 Usage:
     ./run-bot.js [options]
@@ -6,7 +13,6 @@ Options:
     -h --help            Show this screen
     -u --url=<url>       URL [default: https://meta-hubs.org]
     -r --room=<room>     Room id
-    --runner             Enable room bot-runner mode for this process
 `;
 
 const docopt = require("docopt").docopt;
@@ -18,11 +24,6 @@ const executablePath =
   process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 const NAVIGATION_TIMEOUT_MS = Number(process.env.RUNNER_NAV_TIMEOUT_MS || 120000);
 const STARTUP_TIMEOUT_MS = Number(process.env.RUNNER_STARTUP_TIMEOUT_MS || 120000);
-const requestedRunnerAuthTimeoutMs = Number(process.env.RUNNER_AUTH_TIMEOUT_MS || 10000);
-const RUNNER_AUTH_TIMEOUT_MS =
-  Number.isFinite(requestedRunnerAuthTimeoutMs) && requestedRunnerAuthTimeoutMs > 0
-    ? Math.min(requestedRunnerAuthTimeoutMs, 10000)
-    : 10000;
 const HEALTH_CHECK_INTERVAL_MS = Number(process.env.RUNNER_HEALTH_CHECK_INTERVAL_MS || 15000);
 const HEALTH_FAILURE_EXIT_THRESHOLD = Number(process.env.RUNNER_HEALTH_FAILURE_EXIT_THRESHOLD || 6);
 const FATAL_PAGE_ERROR_PATTERNS = [
@@ -101,10 +102,6 @@ function log(...objs) {
     allow_multi: true
   };
 
-  if (options["--runner"]) {
-    params.bot_runner = true;
-  }
-
   const buildRunnerUrl = () => {
     const url = new URL(baseUrl);
     const isLegacyHubHtml = /\/hub\.html$/i.test(url.pathname);
@@ -148,26 +145,6 @@ function log(...objs) {
           },
           { timeout: STARTUP_TIMEOUT_MS }
         );
-        if (options["--runner"]) {
-          try {
-            await page.waitForFunction(
-              () => {
-                const sessionId = window.NAF?.clientId;
-                const metas = window.APP?.hubChannel?.presence?.state?.[sessionId]?.metas;
-                const currentMeta = Array.isArray(metas) && metas.length ? metas[metas.length - 1] : null;
-                return currentMeta?.context?.bot_runner === true;
-              },
-              { timeout: RUNNER_AUTH_TIMEOUT_MS }
-            );
-          } catch (_error) {
-            await requestExit(
-              1,
-              "Runner presence was not authenticated by Reticulum; Chromium runner is disabled.",
-              browser
-            );
-            return;
-          }
-        }
         log("Runner startup complete (scene entered + network connected).");
         return;
       } catch (e) {

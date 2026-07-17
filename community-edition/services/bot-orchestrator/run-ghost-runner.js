@@ -90,6 +90,46 @@ function scheduleNavigationRecoveryRestart({
   return scheduleFn(() => exitFn(1), boundedDelayMs);
 }
 
+function scheduleSpawnRecoveryRestart({
+  attempts,
+  delayMs = 5_000,
+  scheduleFn = setTimeout,
+  shouldRestart = () => true,
+  exitFn = code => process.exit(code)
+}) {
+  if (!Number.isFinite(attempts) || attempts < 3) return null;
+  const boundedDelayMs = clamp(Math.floor(Number(delayMs) || 5_000), 5_000, 60_000);
+  return scheduleFn(() => {
+    if (shouldRestart()) exitFn(1);
+  }, boundedDelayMs);
+}
+
+function redactUrlForLog(value) {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch (_error) {
+    return "invalid-url";
+  }
+}
+
+function errorCodeForLog(error) {
+  const message = error && typeof error.message === "string" ? error.message : "";
+  if (
+    /^(?:http_\d{3}|missing_date_header|invalid_date_header|(?:scene|gltf|glb|navmesh|featured|bot_spawn|authenticated)_[a-z0-9_]+|required_navmesh_unavailable)$/.test(
+      message
+    )
+  ) {
+    return message;
+  }
+  const name = error && typeof error.name === "string" ? error.name : "";
+  return /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "Error";
+}
+
 function parseVec3Like(value, fallback = [0, 0, 0]) {
   if (Array.isArray(value) && value.length >= 3) {
     return [
@@ -141,7 +181,7 @@ async function loadPhoenix() {
   } catch (err) {
     // Support ESM-only builds.
     // eslint-disable-next-line no-console
-    console.warn("phoenix require failed, falling back to dynamic import:", err.message);
+    console.warn("phoenix require failed, falling back to dynamic import:", errorCodeForLog(err));
     const mod = await import("phoenix");
     return mod.default || mod;
   }
@@ -194,11 +234,11 @@ function createTimekeeper(baseUrl) {
         // eslint-disable-next-line no-await-in-loop
         await update();
       } catch (err) {
-        log("time offset update failed:", err.message);
+        log("time offset update failed:", errorCodeForLog(err));
       }
     }
     setInterval(() => {
-      update().catch(err => log("time offset update failed:", err.message));
+      update().catch(err => log("time offset update failed:", errorCodeForLog(err)));
     }, 5 * 60 * 1000).unref();
   };
 
@@ -649,7 +689,7 @@ function readComponent(view, byteOffset, componentType) {
   }
 }
 
-async function readAccessor(scene, accessorIndex, policy, cache = new Map()) {
+function accessorMetadata(scene, accessorIndex) {
   const gltf = scene.gltf;
   const accessors = Array.isArray(gltf.accessors) ? gltf.accessors : [];
   const bufferViews = Array.isArray(gltf.bufferViews) ? gltf.bufferViews : [];
@@ -665,7 +705,7 @@ async function readAccessor(scene, accessorIndex, policy, cache = new Map()) {
   const itemSize = ACCESSOR_COMPONENTS[accessor.type];
   const componentBytes = COMPONENT_BYTES[accessor.componentType];
   const count = Number(accessor.count);
-  if (!itemSize || !componentBytes || !Number.isInteger(count) || count < 0) {
+  if (!itemSize || !componentBytes || !Number.isSafeInteger(count) || count <= 0) {
     throw new Error("gltf_invalid_accessor");
   }
 
@@ -682,40 +722,74 @@ async function readAccessor(scene, accessorIndex, policy, cache = new Map()) {
     viewByteOffset < 0 ||
     viewByteLength <= 0 ||
     accessorByteOffset < 0 ||
-    byteStride < elementBytes
+    byteStride < elementBytes ||
+    byteStride > 252
   ) {
     throw new Error("gltf_invalid_buffer_view");
   }
 
-  const requiredBytes = count === 0 ? 0 : accessorByteOffset + (count - 1) * byteStride + elementBytes;
-  if (requiredBytes > viewByteLength) throw new Error("gltf_accessor_out_of_bounds");
+  const rangeByteLength = (count - 1) * byteStride + elementBytes;
+  const requiredBytes = accessorByteOffset + rangeByteLength;
+  if (
+    !Number.isSafeInteger(rangeByteLength) ||
+    !Number.isSafeInteger(requiredBytes) ||
+    requiredBytes > viewByteLength ||
+    !Number.isSafeInteger(count * itemSize)
+  ) {
+    throw new Error("gltf_accessor_out_of_bounds");
+  }
 
-  const cacheKey = `${viewByteOffset}:${viewByteLength}`;
+  return {
+    accessor,
+    count,
+    itemSize,
+    componentBytes,
+    componentType: accessor.componentType,
+    byteStride,
+    rangeByteOffset: viewByteOffset + accessorByteOffset,
+    rangeByteLength
+  };
+}
+
+async function readAccessor(scene, accessorIndex, policy, cache = new Map(), limits = {}) {
+  const metadata = accessorMetadata(scene, accessorIndex);
+  if (Number.isSafeInteger(limits.maxCount) && metadata.count > limits.maxCount) {
+    throw new Error("navmesh_accessor_count_exceeded");
+  }
+
+  const cacheKey = `${metadata.rangeByteOffset}:${metadata.rangeByteLength}`;
   let buffer = cache.get(cacheKey);
   if (!buffer) {
-    const absoluteStart = scene.glbBinStart + viewByteOffset;
-    buffer = await fetchSceneByteRange(scene, absoluteStart, viewByteLength, policy);
+    if (
+      limits.byteBudget &&
+      limits.byteBudget.used + metadata.rangeByteLength > limits.byteBudget.maximum
+    ) {
+      throw new Error("navmesh_accessor_byte_budget_exceeded");
+    }
+    const absoluteStart = scene.glbBinStart + metadata.rangeByteOffset;
+    buffer = await fetchSceneByteRange(scene, absoluteStart, metadata.rangeByteLength, policy);
     cache.set(cacheKey, buffer);
+    if (limits.byteBudget) limits.byteBudget.used += metadata.rangeByteLength;
   }
 
   const dataView = new DataView(buffer);
-  const values = new Float64Array(count * itemSize);
-  for (let itemIndex = 0; itemIndex < count; itemIndex++) {
-    const elementOffset = accessorByteOffset + itemIndex * byteStride;
-    for (let componentIndex = 0; componentIndex < itemSize; componentIndex++) {
-      values[itemIndex * itemSize + componentIndex] = readComponent(
+  const values = new Float64Array(metadata.count * metadata.itemSize);
+  for (let itemIndex = 0; itemIndex < metadata.count; itemIndex++) {
+    const elementOffset = itemIndex * metadata.byteStride;
+    for (let componentIndex = 0; componentIndex < metadata.itemSize; componentIndex++) {
+      values[itemIndex * metadata.itemSize + componentIndex] = readComponent(
         dataView,
-        elementOffset + componentIndex * componentBytes,
-        accessor.componentType
+        elementOffset + componentIndex * metadata.componentBytes,
+        metadata.componentType
       );
     }
   }
 
   return {
     values,
-    count,
-    itemSize,
-    componentType: accessor.componentType
+    count: metadata.count,
+    itemSize: metadata.itemSize,
+    componentType: metadata.componentType
   };
 }
 
@@ -899,6 +973,14 @@ async function extractNavMeshGeometry(scene, policy) {
   const bufferCache = new Map();
   const positions = [];
   const indices = [];
+  const accessorIndexes = new Set();
+  const maximumAccessorCount = policy.maxNavmeshTriangles * 3;
+  const byteBudget = {
+    used: 0,
+    maximum: Math.min(policy.maxSceneBytes, Math.max(64 * 1024, maximumAccessorCount * 64))
+  };
+  let navmeshPrimitiveCount = 0;
+  let vertexCount = 0;
   let triangleCount = 0;
 
   for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
@@ -922,10 +1004,58 @@ async function extractNavMeshGeometry(scene, policy) {
       const positionAccessorIndex = primitive.attributes && primitive.attributes.POSITION;
       if (!Number.isInteger(positionAccessorIndex)) continue;
 
-      // eslint-disable-next-line no-await-in-loop
-      const positionAccessor = await readAccessor(scene, positionAccessorIndex, policy, bufferCache);
-      if (positionAccessor.itemSize !== 3 || positionAccessor.componentType !== 5126) {
+      navmeshPrimitiveCount += 1;
+      if (navmeshPrimitiveCount > Math.min(policy.maxNavmeshTriangles, 4096)) {
+        throw new Error("navmesh_too_many_primitives");
+      }
+
+      const positionMetadata = accessorMetadata(scene, positionAccessorIndex);
+      if (positionMetadata.itemSize !== 3 || positionMetadata.componentType !== 5126) {
         throw new Error("navmesh_position_accessor_invalid");
+      }
+      vertexCount += positionMetadata.count;
+      if (vertexCount > maximumAccessorCount) throw new Error("navmesh_too_many_vertices");
+
+      let primitiveTriangleCount;
+      let indexMetadata = null;
+      if (Number.isInteger(primitive.indices)) {
+        indexMetadata = accessorMetadata(scene, primitive.indices);
+        if (
+          indexMetadata.itemSize !== 1 ||
+          ![5121, 5123, 5125].includes(indexMetadata.componentType) ||
+          indexMetadata.count % 3 !== 0
+        ) {
+          throw new Error("navmesh_index_accessor_invalid");
+        }
+        primitiveTriangleCount = indexMetadata.count / 3;
+        accessorIndexes.add(primitive.indices);
+      } else {
+        if (positionMetadata.count % 3 !== 0) {
+          throw new Error("navmesh_nonindexed_triangle_count_invalid");
+        }
+        primitiveTriangleCount = positionMetadata.count / 3;
+      }
+      triangleCount += primitiveTriangleCount;
+      if (triangleCount > policy.maxNavmeshTriangles) throw new Error("navmesh_too_many_triangles");
+      accessorIndexes.add(positionAccessorIndex);
+      if (accessorIndexes.size > 4096) throw new Error("navmesh_too_many_accessors");
+
+      // eslint-disable-next-line no-await-in-loop
+      const positionAccessor = await readAccessor(scene, positionAccessorIndex, policy, bufferCache, {
+        maxCount: maximumAccessorCount,
+        byteBudget
+      });
+
+      let primitiveIndices;
+      if (indexMetadata) {
+        // eslint-disable-next-line no-await-in-loop
+        const indexAccessor = await readAccessor(scene, primitive.indices, policy, bufferCache, {
+          maxCount: maximumAccessorCount,
+          byteBudget
+        });
+        primitiveIndices = indexAccessor.values;
+      } else {
+        primitiveIndices = Array.from({ length: positionAccessor.count }, (_value, index) => index);
       }
 
       const baseVertex = positions.length / 3;
@@ -941,26 +1071,6 @@ async function extractNavMeshGeometry(scene, policy) {
         vec3.transformMat4(tmpPosition, tmpPosition, world);
         positions.push(tmpPosition[0], tmpPosition[1], tmpPosition[2]);
       }
-
-      let primitiveIndices;
-      if (Number.isInteger(primitive.indices)) {
-        // eslint-disable-next-line no-await-in-loop
-        const indexAccessor = await readAccessor(scene, primitive.indices, policy, bufferCache);
-        if (
-          indexAccessor.itemSize !== 1 ||
-          ![5121, 5123, 5125].includes(indexAccessor.componentType) ||
-          indexAccessor.count % 3 !== 0
-        ) {
-          throw new Error("navmesh_index_accessor_invalid");
-        }
-        primitiveIndices = indexAccessor.values;
-      } else {
-        if (positionAccessor.count % 3 !== 0) throw new Error("navmesh_nonindexed_triangle_count_invalid");
-        primitiveIndices = Array.from({ length: positionAccessor.count }, (_value, index) => index);
-      }
-
-      triangleCount += primitiveIndices.length / 3;
-      if (triangleCount > policy.maxNavmeshTriangles) throw new Error("navmesh_too_many_triangles");
 
       for (let index = 0; index < primitiveIndices.length; index++) {
         const localIndex = Number(primitiveIndices[index]);
@@ -1197,6 +1307,193 @@ function normalizeBotsConfig(bots) {
   };
 }
 
+function managedRunnerConfigFingerprint(bots) {
+  const normalized = normalizeBotsConfig(bots);
+  return JSON.stringify({
+    enabled: normalized.enabled,
+    count: normalized.count,
+    mobility: normalized.mobility
+  });
+}
+
+function validManagedConfigRevision(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function validRunnerProcessGeneration(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function finalizeManagedConfigApplication({
+  fingerprint,
+  revision,
+  processGeneration,
+  isCurrent = () => true,
+  reconcile,
+  applyFingerprint,
+  acknowledge,
+  publishStatus
+}) {
+  const changed = reconcile();
+  if (
+    !fingerprint ||
+    !validManagedConfigRevision(revision) ||
+    !validRunnerProcessGeneration(processGeneration) ||
+    !isCurrent(fingerprint, revision, processGeneration)
+  ) {
+    return changed;
+  }
+
+  applyFingerprint(fingerprint, revision, processGeneration);
+  acknowledge(fingerprint, revision, processGeneration);
+  publishStatus(true);
+  return changed;
+}
+
+function createSpawnCleanupController({
+  removeNetworkId = () => {},
+  requestControlledRestart = () => {},
+  onUncertain = () => {}
+} = {}) {
+  const removalAttempts = new Set();
+  let uncertain = false;
+  let restartRequested = false;
+
+  const enterUncertainState = pending => {
+    const networkId = pending && pending.record && pending.record.networkId;
+    if (typeof networkId === "string" && networkId && !removalAttempts.has(networkId)) {
+      removalAttempts.add(networkId);
+      try {
+        removeNetworkId(networkId);
+      } catch (_error) {}
+    }
+
+    if (!uncertain) {
+      uncertain = true;
+      onUncertain();
+    }
+    if (!restartRequested) {
+      restartRequested = true;
+      try {
+        requestControlledRestart();
+      } catch (_error) {}
+    }
+    return true;
+  };
+
+  return {
+    cancelPending: enterUncertainState,
+    observeAmbiguousSettlement: enterUncertainState,
+    canSpawn: () => !uncertain,
+    isUncertain: () => uncertain,
+    reason: () => (uncertain ? "spawn_cleanup_uncertain" : null),
+    removalAttemptCount: () => removalAttempts.size,
+    restartRequested: () => restartRequested
+  };
+}
+
+function cancelPendingSpawnsForTransition({ pendingSpawns, cleanup, botIds = null }) {
+  const ids = Array.isArray(botIds) ? botIds : Array.from(pendingSpawns.keys());
+  let cancelled = false;
+  ids.forEach(botId => {
+    const pending = pendingSpawns.get(botId);
+    if (!pending) return;
+    pendingSpawns.delete(botId);
+    cleanup.cancelPending(pending);
+    cancelled = true;
+  });
+  return cancelled;
+}
+
+function parseManagedConfigMessage(message) {
+  if (
+    !message ||
+    message.type !== "bots-config" ||
+    typeof message.fingerprint !== "string" ||
+    !validManagedConfigRevision(message.revision) ||
+    !validRunnerProcessGeneration(message.processGeneration)
+  ) {
+    return null;
+  }
+  const bots = normalizeBotsConfig(message.bots);
+  const fingerprint = managedRunnerConfigFingerprint(bots);
+  if (!fingerprint || message.fingerprint !== fingerprint) return null;
+  return {
+    bots,
+    fingerprint,
+    revision: message.revision,
+    processGeneration: message.processGeneration
+  };
+}
+
+function shouldApplyHubRefreshConfig(managedConfigReceived) {
+  return managedConfigReceived !== true;
+}
+
+function emptyWaypointData() {
+  return {
+    spawnPoints: [],
+    patrolPoints: [],
+    allWaypoints: [],
+    colliders: [],
+    navPlanner: null
+  };
+}
+
+function resolveHubSceneState(hub, baseUrl, policy, { requireSceneField = false } = {}) {
+  if (!hub || typeof hub !== "object") return { observed: false, url: "", rejected: false };
+  if (requireSceneField && !Object.prototype.hasOwnProperty.call(hub, "scene")) {
+    return { observed: false, url: "", rejected: false };
+  }
+  const rawSceneUrl = hub.scene && hub.scene.model_url
+    ? resolveUrl(baseUrl, hub.scene.model_url)
+    : "";
+  if (!rawSceneUrl) return { observed: true, url: "", rejected: false };
+  try {
+    return { observed: true, url: validateSceneUrl(rawSceneUrl, policy).toString(), rejected: false };
+  } catch (_error) {
+    return { observed: true, url: "", rejected: true };
+  }
+}
+
+function applyHubRefreshSceneChange({
+  payload,
+  currentSceneUrl,
+  currentSceneRejected = false,
+  baseUrl,
+  policy,
+  invalidateNavigation,
+  reconcile,
+  publishStatus,
+  requestRestart
+}) {
+  const refreshedHub = payload && Array.isArray(payload.hubs) ? payload.hubs[0] : null;
+  const markedStale = !!(
+    payload &&
+    Array.isArray(payload.stale_fields) &&
+    payload.stale_fields.includes("scene")
+  );
+  let next = resolveHubSceneState(refreshedHub, baseUrl, policy, { requireSceneField: true });
+  if (markedStale && !next.observed) {
+    next = { observed: true, url: currentSceneUrl, rejected: currentSceneRejected };
+  }
+  if (
+    !next.observed ||
+    (!markedStale && next.url === currentSceneUrl && next.rejected === currentSceneRejected)
+  ) {
+    return { changed: false, ...next };
+  }
+
+  // Invalidate before reconciliation so no spawn, route or status can reuse
+  // geometry from the superseded scene, even while the clean restart is pending.
+  invalidateNavigation(next);
+  reconcile();
+  publishStatus();
+  requestRestart(next);
+  return { changed: true, ...next };
+}
+
 function navigationReady({ navigationMode, requireNavmesh, waypointData }) {
   if (navigationMode !== "navmesh_preferred" || !requireNavmesh) return true;
   if (!waypointData || !waypointData.navPlanner) return false;
@@ -1214,13 +1511,15 @@ function deriveBotRuntimeStatus({
   navigationIsReady,
   authenticated,
   pending = 0,
-  spawnRejected = false
+  spawnRejected = false,
+  cleanupUncertain = false
 }) {
   const boundedDesired = enabled ? clamp(Number(desired) || 0, 0, 10) : 0;
   const boundedActive = clamp(Number(active) || 0, 0, 10);
   const boundedPending = clamp(Number(pending) || 0, 0, 10);
   let reason = "ready";
-  if (!enabled || boundedDesired === 0) reason = "disabled";
+  if (cleanupUncertain) reason = "spawn_cleanup_uncertain";
+  else if (!enabled || boundedDesired === 0) reason = "disabled";
   else if (authenticated !== true) reason = "unauthenticated";
   else if (!navigationIsReady) reason = "navmesh_unavailable";
   else if (boundedActive === boundedDesired) reason = "ready";
@@ -1600,9 +1899,12 @@ function sendNaf(channel, payload) {
   channel.push("naf", payload);
 }
 
-function requestBotSpawn(channel, payload, timeoutMs = 5000) {
+function requestBotSpawn(channel, payload, expectedAuthorityEpoch, timeoutMs = 5000) {
   const expectedNetworkId = payload && payload.data && payload.data.networkId;
   if (!expectedNetworkId) return Promise.reject(new Error("bot_spawn_invalid_network_id"));
+  if (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch <= 0) {
+    return Promise.reject(new Error("bot_spawn_invalid_authority_epoch"));
+  }
 
   return new Promise((resolve, reject) => {
     try {
@@ -1612,16 +1914,21 @@ function requestBotSpawn(channel, payload, timeoutMs = 5000) {
           if (
             !response ||
             response.bot_spawn_accepted !== true ||
-            response.network_id !== expectedNetworkId
+            response.network_id !== expectedNetworkId ||
+            response.bot_runner_authority_epoch !== expectedAuthorityEpoch
           ) {
             reject(new Error("bot_spawn_invalid_ack"));
             return;
           }
           resolve(response);
         })
-        .receive("error", response =>
-          reject(new Error((response && response.reason) || "bot_spawn_rejected"))
-        )
+        .receive("error", response => {
+          const error = new Error((response && response.reason) || "bot_spawn_rejected");
+          // A Phoenix error reply is authoritative: Reticulum rejected the
+          // first sync, so this namespace was not created and may be retried.
+          error.authoritativeRejection = true;
+          reject(error);
+        })
         .receive("timeout", () => reject(new Error("bot_spawn_ack_timeout")));
     } catch (error) {
       reject(error);
@@ -1629,15 +1936,66 @@ function requestBotSpawn(channel, payload, timeoutMs = 5000) {
   });
 }
 
-function presenceHasAuthenticatedBotRunner(presence, sessionId) {
-  if (!presence || !sessionId || !presence.state || typeof presence.state !== "object") return false;
-  const entry = presence.state[sessionId];
-  const metas = entry && Array.isArray(entry.metas) ? entry.metas : [];
-  return metas.some(meta => meta && meta.context && meta.context.bot_runner === true);
+function authoritativeBotRunnerLease(presence) {
+  if (!presence || !presence.state || typeof presence.state !== "object") return null;
+  const candidates = [];
+  for (const [sessionId, entry] of Object.entries(presence.state)) {
+    const metas = entry && Array.isArray(entry.metas) ? entry.metas : [];
+    for (const meta of metas) {
+      const leaseId = meta && meta.bot_runner_lease_id;
+      const authorityEpoch = meta && meta.bot_runner_authority_epoch;
+      if (
+        meta &&
+        meta.context &&
+        meta.context.bot_runner === true &&
+        meta.bot_runner_authoritative === true &&
+        typeof leaseId === "string" &&
+        leaseId &&
+        Number.isSafeInteger(authorityEpoch) &&
+        authorityEpoch > 0
+      ) {
+        candidates.push([authorityEpoch, String(sessionId), leaseId]);
+      }
+    }
+  }
+  candidates.sort((left, right) => {
+    if (left[0] !== right[0]) return right[0] - left[0];
+    const sessionOrder = left[1].localeCompare(right[1]);
+    return sessionOrder || left[2].localeCompare(right[2]);
+  });
+  return candidates.length
+    ? { authorityEpoch: candidates[0][0], leaseId: candidates[0][2] }
+    : null;
 }
 
-function waitForAuthenticatedRunnerPresence(presence, sessionId, timeoutMs = 5000) {
-  if (presenceHasAuthenticatedBotRunner(presence, sessionId)) return Promise.resolve();
+function authoritativeBotRunnerLeaseId(presence) {
+  const authority = authoritativeBotRunnerLease(presence);
+  return authority ? authority.leaseId : "";
+}
+
+function presenceHasAuthenticatedBotRunner(presence, sessionId, leaseId) {
+  if (!sessionId || typeof leaseId !== "string" || !leaseId) return false;
+  const entry = presence && presence.state && presence.state[sessionId];
+  const metas = entry && Array.isArray(entry.metas) ? entry.metas : [];
+  const ownsLease = metas.some(
+    meta =>
+      meta &&
+      meta.context &&
+      meta.context.bot_runner === true &&
+      meta.bot_runner_lease_id === leaseId
+  );
+  return ownsLease && authoritativeBotRunnerLeaseId(presence) === leaseId;
+}
+
+function authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId) {
+  if (!presenceHasAuthenticatedBotRunner(presence, sessionId, leaseId)) return 0;
+  const authority = authoritativeBotRunnerLease(presence);
+  return authority && authority.leaseId === leaseId ? authority.authorityEpoch : 0;
+}
+
+function waitForAuthenticatedRunnerPresence(presence, sessionId, leaseId, timeoutMs = 5000) {
+  const initialEpoch = authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId);
+  if (initialEpoch) return Promise.resolve(initialEpoch);
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1648,10 +2006,11 @@ function waitForAuthenticatedRunnerPresence(presence, sessionId, timeoutMs = 500
     }, timeoutMs);
 
     presence.onSync(() => {
-      if (settled || !presenceHasAuthenticatedBotRunner(presence, sessionId)) return;
+      const authorityEpoch = authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId);
+      if (settled || !authorityEpoch) return;
       settled = true;
       clearTimeout(timer);
-      resolve();
+      resolve(authorityEpoch);
     });
   });
 }
@@ -1708,7 +2067,12 @@ async function main() {
     process.exit(1);
   }
 
-  const botAccessKey = process.env.BOT_ACCESS_KEY || "";
+  const runnerProcessGeneration = process.env.RUNNER_PROCESS_GENERATION || "";
+  if (!validRunnerProcessGeneration(runnerProcessGeneration)) {
+    throw new Error("runner_process_generation_missing");
+  }
+
+  const botAccessKey = process.env.BOT_RUNNER_ACCESS_KEY || "";
   const raycastMode = (process.env.GHOST_RAYCAST_MODE || "spoke_colliders").trim().toLowerCase();
   const navigationMode =
     (process.env.GHOST_NAVIGATION_MODE || "navmesh_preferred").trim().toLowerCase() === "colliders"
@@ -1728,23 +2092,27 @@ async function main() {
   let botsConfig = null;
   let botsConfigDirty = false;
   let pendingManagedConfigFingerprint = "";
+  let pendingManagedConfigRevision = 0;
   let appliedManagedConfigFingerprint = "";
+  let appliedManagedConfigRevision = 0;
+  let managedConfigReceived = false;
 
   const handleManagedConfig = message => {
     if (!message || message.type !== "bots-config") return;
-    botsConfig = normalizeBotsConfig(message.bots);
-    botsConfigDirty = true;
-    pendingManagedConfigFingerprint = typeof message.fingerprint === "string" ? message.fingerprint : "";
-    if (process.connected && typeof process.send === "function") {
-      try {
-        process.send({
-          type: "bots-config-applied",
-          fingerprint: typeof message.fingerprint === "string" ? message.fingerprint : ""
-        });
-      } catch (error) {
-        log("Failed to acknowledge managed bot config:", error.message);
-      }
+    const managed = parseManagedConfigMessage(message);
+    if (!managed) {
+      log("Rejected managed bot config because its fingerprint did not match the normalized payload.");
+      return;
     }
+    if (managed.processGeneration !== runnerProcessGeneration) {
+      log("Rejected managed bot config for a different runner process generation.");
+      return;
+    }
+    botsConfig = managed.bots;
+    botsConfigDirty = true;
+    pendingManagedConfigFingerprint = managed.fingerprint;
+    pendingManagedConfigRevision = managed.revision;
+    managedConfigReceived = true;
   };
   process.on("message", handleManagedConfig);
 
@@ -1815,8 +2183,9 @@ async function main() {
   const hubs = Array.isArray(joinData && joinData.hubs) ? joinData.hubs : [];
   const hub = hubs[0] || null;
   const sessionId = (joinData && joinData.session_id) || "";
-  if (!hub || !sessionId) {
-    log("Join succeeded but did not return hub/session_id; exiting.");
+  const runnerLeaseId = (joinData && joinData.bot_runner_lease_id) || "";
+  if (!hub || !sessionId || !runnerLeaseId) {
+    log("Join succeeded but did not return hub/session_id/bot_runner_lease_id; exiting.");
     process.exit(1);
   }
   if (joinData.bot_runner !== true) {
@@ -1825,15 +2194,25 @@ async function main() {
   }
 
   const presence = new Presence(channel);
+  let runnerAuthorityEpoch;
   try {
-    await waitForAuthenticatedRunnerPresence(presence, sessionId, 5000);
+    runnerAuthorityEpoch = await waitForAuthenticatedRunnerPresence(
+      presence,
+      sessionId,
+      runnerLeaseId,
+      5000
+    );
   } catch (error) {
     socket.disconnect();
     throw error;
   }
   if (process.connected && typeof process.send === "function") {
     try {
-      process.send({ type: "ghost-auth-status", authenticated: true });
+      process.send({
+        type: "ghost-auth-status",
+        authenticated: true,
+        processGeneration: runnerProcessGeneration
+      });
     } catch (_error) {
       socket.disconnect();
       throw new Error("ghost_auth_status_ipc_failed");
@@ -1847,13 +2226,10 @@ async function main() {
   }
 
   // Keep these cached and refresh periodically.
-  let waypointData = {
-    spawnPoints: [],
-    patrolPoints: [],
-    allWaypoints: [],
-    colliders: [],
-    navPlanner: null
-  };
+  let waypointData = emptyWaypointData();
+  let sceneGeneration = 0;
+  let sceneRestartScheduled = false;
+  let activeSceneState = resolveHubSceneState(hub, baseUrl, sceneFetchPolicy);
   let avatarRefs = [];
   let fullbodyRefs = [];
   let avatarRotationOffset = Math.floor(Math.random() * 1000);
@@ -1865,21 +2241,39 @@ async function main() {
   const reservedTargets = new Map();
   const knownOccupants = new Set();
   const fullSyncTimers = new Set();
+  const spawnRecoveryTimers = new Map();
   let lastRuntimeStatusFingerprint = "";
   let lastRuntimeStatusSentAt = 0;
+  let publishRuntimeStatus = () => {};
 
-  const publishRuntimeStatus = (force = false) => {
+  const spawnCleanup = createSpawnCleanupController({
+    removeNetworkId: networkId => sendNaf(channel, removeEntityPayload(networkId)),
+    onUncertain: () => publishRuntimeStatus(true),
+    requestControlledRestart: () => {
+      const timer = setTimeout(() => {
+        fullSyncTimers.delete(timer);
+        log("Spawn cleanup could not be confirmed; restarting ghost runner for a clean namespace.");
+        process.exit(1);
+      }, 250);
+      fullSyncTimers.add(timer);
+    }
+  });
+
+  publishRuntimeStatus = (force = false) => {
     const status = {
       ...deriveBotRuntimeStatus({
         enabled: !!botsConfig.enabled,
         desired: botsConfig.count,
         active: bots.size,
         pending: pendingSpawns.size,
-        authenticated: presenceHasAuthenticatedBotRunner(presence, sessionId),
+        authenticated: presenceHasAuthenticatedBotRunner(presence, sessionId, runnerLeaseId),
         spawnRejected: Array.from(spawnAttempts.values()).some(attempts => attempts >= 3),
+        cleanupUncertain: spawnCleanup.isUncertain(),
         navigationIsReady: navigationReady({ navigationMode, requireNavmesh, waypointData })
       }),
-      configFingerprint: appliedManagedConfigFingerprint
+      configFingerprint: appliedManagedConfigFingerprint,
+      configRevision: appliedManagedConfigRevision,
+      processGeneration: runnerProcessGeneration
     };
     const fingerprint = JSON.stringify(status);
     const now = Date.now();
@@ -1902,11 +2296,57 @@ async function main() {
     return timer;
   };
 
+  const clearSpawnRecovery = botId => {
+    const timer = spawnRecoveryTimers.get(botId);
+    if (!timer) return;
+    clearTimeout(timer);
+    fullSyncTimers.delete(timer);
+    spawnRecoveryTimers.delete(botId);
+  };
+
+  const clearAllSpawnRecoveries = () => {
+    Array.from(spawnRecoveryTimers.keys()).forEach(clearSpawnRecovery);
+  };
+
+  const scheduleSpawnRecovery = (botId, botNumber, attempts) => {
+    if (spawnRecoveryTimers.has(botId)) return;
+    const timer = scheduleSpawnRecoveryRestart({
+      attempts,
+      delayMs: process.env.GHOST_SPAWN_RECOVERY_RESTART_MS || 5_000,
+      scheduleFn: scheduleTimeout,
+      shouldRestart: () => {
+        spawnRecoveryTimers.delete(botId);
+        return (
+          botsConfig.enabled &&
+          botsConfig.count >= botNumber &&
+          (spawnAttempts.get(botId) || 0) >= 3
+        );
+      },
+      exitFn: code => {
+        log("Authoritative spawn retries were exhausted; restarting ghost runner for a clean retry.");
+        process.exit(code);
+      }
+    });
+    if (timer) spawnRecoveryTimers.set(botId, timer);
+  };
+
+  const cancelPendingSpawn = botId => {
+    return cancelPendingSpawnsForTransition({
+      pendingSpawns,
+      cleanup: spawnCleanup,
+      botIds: [botId]
+    });
+  };
+
+  const cancelAllPendingSpawns = () =>
+    cancelPendingSpawnsForTransition({ pendingSpawns, cleanup: spawnCleanup });
+
   const reconcileBots = nowMs => {
     let changed = false;
 
     if (!botsConfig.enabled || botsConfig.count <= 0) {
-      pendingSpawns.clear();
+      clearAllSpawnRecoveries();
+      changed = cancelAllPendingSpawns() || changed;
       spawnAttempts.clear();
       spawnRetryAt.clear();
       if (bots.size > 0) {
@@ -1922,7 +2362,8 @@ async function main() {
     }
 
     if (!navigationReady({ navigationMode, requireNavmesh, waypointData })) {
-      pendingSpawns.clear();
+      clearAllSpawnRecoveries();
+      changed = cancelAllPendingSpawns() || changed;
       spawnAttempts.clear();
       spawnRetryAt.clear();
       if (bots.size > 0) {
@@ -1940,7 +2381,8 @@ async function main() {
     // Remove extra bots.
     for (let i = desired + 1; i <= 10; i++) {
       const botId = `bot-${i}`;
-      pendingSpawns.delete(botId);
+      clearSpawnRecovery(botId);
+      changed = cancelPendingSpawn(botId) || changed;
       spawnAttempts.delete(botId);
       spawnRetryAt.delete(botId);
       const record = bots.get(botId);
@@ -1949,6 +2391,14 @@ async function main() {
       sendNaf(channel, removeEntityPayload(record.networkId));
       bots.delete(botId);
       changed = true;
+    }
+
+    // Once an accepted spawn may have outlived our bookkeeping, no namespace
+    // can be reused safely in this process. The controlled exit will establish
+    // a fresh authenticated session before reconciliation resumes.
+    if (!spawnCleanup.canSpawn()) {
+      publishRuntimeStatus(true);
+      return changed;
     }
 
     // Add missing bots.
@@ -2011,10 +2461,10 @@ async function main() {
       spawnAttempts.set(botId, attempt);
       pendingSpawns.set(botId, pending);
 
-      requestBotSpawn(channel, payload)
+      requestBotSpawn(channel, payload, runnerAuthorityEpoch)
         .then(() => {
           if (pendingSpawns.get(botId) !== pending) {
-            sendNaf(channel, removeEntityPayload(networkId));
+            spawnCleanup.observeAmbiguousSettlement(pending);
             return;
           }
           pendingSpawns.delete(botId);
@@ -2024,30 +2474,40 @@ async function main() {
             botsConfig.count >= i &&
             navigationReady({ navigationMode, requireNavmesh, waypointData });
           if (!stillDesired) {
-            sendNaf(channel, removeEntityPayload(networkId));
-            publishRuntimeStatus();
+            spawnCleanup.observeAmbiguousSettlement(pending);
+            publishRuntimeStatus(true);
             return;
           }
 
           spawnAttempts.delete(botId);
           spawnRetryAt.delete(botId);
+          clearSpawnRecovery(botId);
           record.mobility = botsConfig.mobility;
           record.stateEndsAt = timekeeper.nowMs() + initialIdleDurationMs(record.mobility);
           bots.set(botId, record);
           publishRuntimeStatus();
         })
         .catch(error => {
-          if (pendingSpawns.get(botId) !== pending) return;
-          pendingSpawns.delete(botId);
-          // A timeout or malformed ACK is ambiguous: Ret may have accepted the
-          // first sync even though we cannot count it. Remove that network id
-          // best-effort before a bounded retry so no untracked bot remains.
-          sendNaf(channel, removeEntityPayload(networkId));
-          if (attempt < 3) {
-            spawnRetryAt.set(botId, Date.now() + Math.min(1000 * 2 ** (attempt - 1), 4000));
+          const isCurrent = pendingSpawns.get(botId) === pending;
+          if (isCurrent) pendingSpawns.delete(botId);
+          if (isCurrent && error && error.authoritativeRejection === true && spawnCleanup.canSpawn()) {
+            if (attempt < 3) {
+              spawnRetryAt.set(botId, Date.now() + Math.min(1000 * 2 ** (attempt - 1), 4000));
+            } else {
+              scheduleSpawnRecovery(botId, i, attempt);
+            }
+            log(`[ghost] Spawn was rejected for ${botId} (attempt ${attempt}/3):`, errorCodeForLog(error));
+            publishRuntimeStatus(true);
+            return;
           }
-          log(`[ghost] Spawn ACK rejected for ${botId} (attempt ${attempt}/3):`, error.message);
-          publishRuntimeStatus();
+          // A rejected, malformed or missing reply can race an accepted first
+          // sync when this promise was cancelled or the reply was ambiguous.
+          // Without an authoritative removal ACK, retrying this
+          // deterministic network id in the same session would create an ABA
+          // ambiguity. Tear down the whole runner generation instead.
+          spawnCleanup.observeAmbiguousSettlement(pending);
+          log(`[ghost] Spawn ACK rejected for ${botId} (attempt ${attempt}/3):`, errorCodeForLog(error));
+          publishRuntimeStatus(true);
         });
 
       changed = true;
@@ -2076,20 +2536,41 @@ async function main() {
   const reconcileManagedConfig = nowMs => {
     botsConfigDirty = false;
     const configFingerprint = pendingManagedConfigFingerprint;
-    const changed = reconcileBots(nowMs);
-
-    if (configFingerprint) {
-      appliedManagedConfigFingerprint = configFingerprint;
-      if (pendingManagedConfigFingerprint === configFingerprint) {
+    const configRevision = pendingManagedConfigRevision;
+    return finalizeManagedConfigApplication({
+      fingerprint: configFingerprint,
+      revision: configRevision,
+      processGeneration: runnerProcessGeneration,
+      isCurrent: (fingerprint, revision, processGeneration) =>
+        processGeneration === runnerProcessGeneration &&
+        pendingManagedConfigFingerprint === fingerprint &&
+        pendingManagedConfigRevision === revision,
+      reconcile: () => reconcileBots(nowMs),
+      applyFingerprint: (fingerprint, revision) => {
+        appliedManagedConfigFingerprint = fingerprint;
+        appliedManagedConfigRevision = revision;
         pendingManagedConfigFingerprint = "";
-      }
-      // The status emitted inside reconcileBots still carried the previously
-      // applied fingerprint. Force a post-application status so the parent can
-      // distinguish this configuration from an in-flight or stale heartbeat.
-      publishRuntimeStatus(true);
-    }
-
-    return changed;
+        pendingManagedConfigRevision = 0;
+      },
+      acknowledge: (fingerprint, revision, processGeneration) => {
+        if (process.connected && typeof process.send === "function") {
+          try {
+            process.send({
+              type: "bots-config-applied",
+              fingerprint,
+              revision,
+              processGeneration
+            });
+          } catch (_error) {
+            log("Failed to acknowledge applied managed bot config.");
+          }
+        }
+      },
+      // The status emitted inside reconcileBots carried the previous applied
+      // fingerprint. ACK first so the parent can accept this forced status as
+      // proof of the exact configuration that was just reconciled.
+      publishStatus: force => publishRuntimeStatus(force)
+    });
   };
 
   const updateRecordPositionFromPath = (record, nowMs) => {
@@ -2372,17 +2853,44 @@ async function main() {
   // Update config on hub refresh (room settings).
   channel.on("hub_refresh", payload => {
     const refreshedHub = payload && Array.isArray(payload.hubs) ? payload.hubs[0] : null;
+    const sceneChange = applyHubRefreshSceneChange({
+      payload,
+      currentSceneUrl: activeSceneState.url,
+      currentSceneRejected: activeSceneState.rejected,
+      baseUrl,
+      policy: sceneFetchPolicy,
+      invalidateNavigation(next) {
+        sceneGeneration += 1;
+        activeSceneState = next;
+        waypointData = emptyWaypointData();
+        botsConfigDirty = true;
+      },
+      reconcile: () => reconcileBots(timekeeper.nowMs()),
+      publishStatus: () => publishRuntimeStatus(true),
+      requestRestart() {
+        if (sceneRestartScheduled) return;
+        sceneRestartScheduled = true;
+        scheduleTimeout(() => {
+          log("Published scene changed; restarting ghost runner before loading new navigation geometry.");
+          process.exit(1);
+        }, 250);
+      }
+    });
+    if (sceneChange.changed) {
+      log("Published scene changed; invalidated the cached navigation geometry.");
+    }
+
+    if (!shouldApplyHubRefreshConfig(managedConfigReceived)) return;
     const userData = refreshedHub && refreshedHub.user_data;
     if (!userData || typeof userData !== "object" || !Object.prototype.hasOwnProperty.call(userData, "bots")) return;
-    const nextConfig = normalizeBotsConfig(userData.bots || {});
-    botsConfig = nextConfig;
+    botsConfig = normalizeBotsConfig(userData.bots || {});
     botsConfigDirty = true;
   });
 
   // Presence / late joiners. Losing the authenticated self-presence is fatal:
   // the orchestrator will restart and reauthenticate before another spawn.
   presence.onSync(() => {
-    if (!presenceHasAuthenticatedBotRunner(presence, sessionId)) {
+    if (!presenceHasAuthenticatedBotRunner(presence, sessionId, runnerLeaseId)) {
       log("Authenticated bot-runner presence was lost; exiting.");
       process.exit(1);
       return;
@@ -2410,21 +2918,15 @@ async function main() {
   });
 
   // Fetch scene waypoints/colliders and featured avatars.
-  const rawSceneUrl = hub && hub.scene && hub.scene.model_url ? resolveUrl(baseUrl, hub.scene.model_url) : "";
-  let sceneUrl = "";
-  let sceneUrlRejected = false;
-  if (rawSceneUrl) {
-    try {
-      sceneUrl = validateSceneUrl(rawSceneUrl, sceneFetchPolicy).toString();
-    } catch (err) {
-      sceneUrlRejected = true;
-      log(
-        requireNavmesh
-          ? "Rejected scene model_url. Navmesh-required bots will remain blocked."
-          : "Rejected scene model_url. Bots will use origin fallback.",
-        err.message
-      );
-    }
+  const sceneUrl = activeSceneState.url;
+  const sceneUrlRejected = activeSceneState.rejected;
+  const initialSceneGeneration = sceneGeneration;
+  if (sceneUrlRejected) {
+    log(
+      requireNavmesh
+        ? "Rejected scene model_url. Navmesh-required bots will remain blocked."
+        : "Rejected scene model_url. Bots will use origin fallback."
+    );
   }
   if (!sceneUrl && !sceneUrlRejected) {
     log(
@@ -2433,7 +2935,7 @@ async function main() {
         : "No scene model_url found in hub payload. Bots will use origin fallback."
     );
   } else {
-    log("Scene URL:", sceneUrl);
+    log("Scene URL:", redactUrlForLog(sceneUrl));
   }
 
   const initScenePromise = sceneUrl
@@ -2453,7 +2955,7 @@ async function main() {
                 requireNavmesh
                   ? "Navmesh rejected. Navmesh-required bots will remain blocked."
                   : "Navmesh rejected. Falling back to collider/direct waypoint movement.",
-                error.message
+                errorCodeForLog(error)
               );
             }
           }
@@ -2465,12 +2967,16 @@ async function main() {
             navigable = extracted;
           }
           const points = pickSpawnAndPatrolPoints(navigable);
-          waypointData = {
+          const nextWaypointData = {
             ...points,
             allWaypoints: navigable.allWaypoints,
             colliders: extracted.colliders,
             navPlanner
           };
+          if (initialSceneGeneration !== sceneGeneration) {
+            throw new Error("scene_refresh_superseded");
+          }
+          waypointData = nextWaypointData;
           if (
             !navPlanner &&
             raycastMode === "spoke_colliders" &&
@@ -2504,7 +3010,10 @@ async function main() {
           baseDelayMs: 500,
           maxDelayMs: 2000,
           onRetry: (error, attempt, delayMs) =>
-            log(`Scene/navmesh attempt ${attempt}/3 failed; retrying in ${delayMs}ms:`, error.message)
+            log(
+              `Scene/navmesh attempt ${attempt}/3 failed; retrying in ${delayMs}ms:`,
+              errorCodeForLog(error)
+            )
         }
       )
         .catch(err => {
@@ -2512,7 +3021,7 @@ async function main() {
             requireNavmesh
               ? "Failed to load/parse scene glTF. Navmesh-required bots will remain blocked."
               : "Failed to load/parse scene glTF. Bots will use origin fallback.",
-            err.message
+            errorCodeForLog(err)
           );
         })
     : Promise.resolve();
@@ -2525,7 +3034,7 @@ async function main() {
       log(`Featured avatars: total=${avatarRefs.length} fullbody=${fullbodyRefs.length}`);
     })
     .catch(err => {
-      log("Failed to fetch featured avatars:", err.message);
+      log("Failed to fetch featured avatars:", errorCodeForLog(err));
     });
 
   await Promise.all([initScenePromise, initAvatarsPromise]);
@@ -2546,6 +3055,7 @@ async function main() {
     try {
       process.send({
         type: "ghost-navigation-status",
+        processGeneration: runnerProcessGeneration,
         ready: navigationReady({ navigationMode, requireNavmesh, waypointData }),
         required: requireNavmesh,
         mode: navigationMode
@@ -2610,6 +3120,9 @@ async function main() {
     fullSyncTimers.forEach(timer => clearTimeout(timer));
     fullSyncTimers.clear();
     try {
+      pendingSpawns.forEach(pending => {
+        sendNaf(channel, removeEntityPayload(pending.record.networkId));
+      });
       bots.forEach(record => {
         sendNaf(channel, removeEntityPayload(record.networkId));
       });
@@ -2629,7 +3142,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch(err => {
-    log("Ghost runner failed:", err && err.message ? err.message : "unknown_error");
+    log("Ghost runner failed:", errorCodeForLog(err));
     process.exitCode = 1;
   });
 }
@@ -2637,27 +3150,40 @@ if (require.main === module) {
 module.exports = {
   main,
   internals: {
+    authoritativeBotRunnerLeaseId,
+    applyHubRefreshSceneChange,
+    cancelPendingSpawnsForTransition,
     computeWorldNodeMatrices,
+    createSpawnCleanupController,
     createNavMeshPlanner,
     createSceneFetchPolicy,
     deriveBotRuntimeStatus,
+    emptyWaypointData,
     extractNavMeshGeometry,
     extractWaypointsAndColliders,
     fetchFeaturedAvatarRefs,
     fetchGltfJson,
     fetchGltfScene,
+    finalizeManagedConfigApplication,
     findCommandedWaypointPlan,
     findSeparatedNavmeshPosition,
+    errorCodeForLog,
+    managedRunnerConfigFingerprint,
     navigationReady,
     normalizeBotsConfig,
+    parseManagedConfigMessage,
     parseGlbJson,
     presenceHasAuthenticatedBotRunner,
     projectWaypointsToNavmesh,
     readAccessor,
     requestBotSpawn,
+    resolveHubSceneState,
+    redactUrlForLog,
     retryWithBackoff,
     routeMaintainsSeparation,
     scheduleNavigationRecoveryRestart,
+    scheduleSpawnRecoveryRestart,
+    shouldApplyHubRefreshConfig,
     validateGltfShape,
     validateSceneUrl
   }

@@ -22,6 +22,9 @@ SKETCHFAB_API_KEY: ""
 TENOR_API_KEY: ""
 
 BOT_ACCESS_KEY: ci-not-a-real-bot-access-key-00000000
+BOT_RUNNER_ACCESS_KEY: ci-not-a-real-runner-access-key-000000
+BOT_ORCHESTRATOR_ACCESS_KEY: ci-not-a-real-orchestrator-key-00000000
+DASHBOARD_ACCESS_KEY: ci-not-a-real-dashboard-access-key-0000
 OPENAI_API_KEY: ci-not-a-real-openai-key
 OPENAI_MODEL: gpt-5-nano
 OPENAI_TOTAL_BUDGET_MS: "4000"
@@ -30,6 +33,7 @@ Container_Dockerhub_Username: registry.invalid/yenhubs
 Container_Tag: ci
 
 GENERATE_PERSISTENT_VOLUMES: true
+ALLOW_MANUAL_HOSTPATH_STORAGE: false
 PERSISTENT_VOLUME_SIZE: 10Gi
 PERSISTENT_VOLUME_STORAGE_CLASS: do-block-storage
 

@@ -55,9 +55,21 @@ function normalizePemPrivateKey(value) {
 function generatePersistentVolumes(processedConfig, replacedContent) {
   const yamlDocuments = YAML.parseAllDocuments(replacedContent);
   let outputIdx = 2;
-  processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS ||= 'manual';
+  const storageClass =
+    typeof processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS === "string"
+      ? processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS.trim()
+      : "";
+  if (!storageClass) {
+    throw new Error("PERSISTENT_VOLUME_STORAGE_CLASS must be configured explicitly");
+  }
+  processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS = storageClass;
+  if (storageClass === "manual" && processedConfig.ALLOW_MANUAL_HOSTPATH_STORAGE !== true) {
+    throw new Error(
+      "manual hostPath storage requires ALLOW_MANUAL_HOSTPATH_STORAGE: true and is not for production"
+    );
+  }
 
-  if ('manual' === processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+  if ('manual' === storageClass) {
     // Add in the persistent volume configs to the hcce.yaml file
     const persistent_volumes_template = utils.readTemplate("/generate_script", "persistent_volumes.yam");
     const replacedPersistentVolumesContent = utils.replacePlaceholders(persistent_volumes_template, processedConfig);
@@ -71,10 +83,10 @@ function generatePersistentVolumes(processedConfig, replacedContent) {
 
   // Adds in the persistent volume claims to the hcce.yaml file
   YAML.parseAllDocuments(replacedPersistentVolumeClaimsContent).forEach(doc => {
-    if ('default' !== processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+    if ('default' !== storageClass) {
       doc = doc.toJS();
-      doc.spec.storageClassName = processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS;
-      if ('manual' === processedConfig.PERSISTENT_VOLUME_STORAGE_CLASS) {
+      doc.spec.storageClassName = storageClass;
+      if ('manual' === storageClass) {
         // ReadWriteOncePod is only supported for CSI volumes
         doc.spec.accessModes = ["ReadWriteOnce"];
       }
@@ -190,11 +202,9 @@ function handleImageOverrides(processedConfig, replacedContent) {
 function main() {
   try {
     const { inputPath, outputPath } = generationOverrides();
-    const config = utils.readConfig(inputPath);
-    const processedConfig = YAML.parse(
-      utils.replacePlaceholders(YAML.stringify(config), config),
-      {"schema": "yaml-1.1"} // required to load yes/no as boolean values
-    );
+    // Values are already parsed YAML scalars. Do not reinterpret user-provided
+    // strings as templates: a secret containing `$NAME` must remain literal.
+    const processedConfig = utils.readConfig(inputPath);
 
     // Backward compatibility for older local files that still use OPENAI.
     if (!processedConfig.OPENAI_API_KEY && processedConfig.OPENAI) {
@@ -207,10 +217,31 @@ function main() {
       throw new Error("BOT_ACCESS_KEY must contain at least 32 characters");
     }
     processedConfig.BOT_ACCESS_KEY = String(processedConfig.BOT_ACCESS_KEY);
-    processedConfig.BOT_ACCESS_KEY_CHECKSUM = crypto
-      .createHash("sha256")
-      .update(String(processedConfig.BOT_ACCESS_KEY))
-      .digest("hex");
+    for (const keyName of [
+      "BOT_RUNNER_ACCESS_KEY",
+      "BOT_ORCHESTRATOR_ACCESS_KEY",
+      "DASHBOARD_ACCESS_KEY"
+    ]) {
+      if (!processedConfig[keyName] || String(processedConfig[keyName]).length < 32) {
+        throw new Error(`${keyName} must be configured independently with at least 32 characters`);
+      }
+      processedConfig[keyName] = String(processedConfig[keyName]);
+    }
+    const separatedAccessKeys = [
+      "BOT_ACCESS_KEY",
+      "BOT_RUNNER_ACCESS_KEY",
+      "BOT_ORCHESTRATOR_ACCESS_KEY",
+      "DASHBOARD_ACCESS_KEY"
+    ];
+    if (new Set(separatedAccessKeys.map(name => processedConfig[name])).size !== separatedAccessKeys.length) {
+      throw new Error("Bot integration, runner, orchestrator and dashboard access keys must all be distinct");
+    }
+    for (const keyName of separatedAccessKeys) {
+      processedConfig[`${keyName}_CHECKSUM`] = crypto
+        .createHash("sha256")
+        .update(processedConfig[keyName])
+        .digest("hex");
+    }
     processedConfig.DB_CREDENTIAL_CHECKSUM = crypto
       .createHash("sha256")
       .update(
@@ -294,9 +325,12 @@ function main() {
     const template = utils.readTemplate("/generate_script", "hcce.yam");
     var replacedContent = utils.replacePlaceholders(template, processedConfig);
 
-    if (processedConfig.GENERATE_PERSISTENT_VOLUMES) {
-      replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
+    if (processedConfig.GENERATE_PERSISTENT_VOLUMES !== true) {
+      throw new Error(
+        "GENERATE_PERSISTENT_VOLUMES must be true; untracked /tmp hostPath storage is not a supported deployment"
+      );
     }
+    replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
 

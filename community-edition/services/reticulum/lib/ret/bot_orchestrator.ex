@@ -25,9 +25,13 @@ defmodule Ret.BotOrchestrator do
 
   defp do_post_json(path, payload, access_key) do
     url = "#{endpoint()}#{path}"
-    headers = [{"Content-Type", "application/json"}, {"x-ret-bot-access-key", access_key}]
 
-    case HTTPoison.post(url, Poison.encode!(payload), headers,
+    headers = [
+      {"Content-Type", "application/json"},
+      {"x-ret-bot-orchestrator-access-key", access_key}
+    ]
+
+    case http_client().request(:post, url, Poison.encode!(payload), headers,
            timeout: @request_timeout_ms,
            recv_timeout: @request_timeout_ms
          ) do
@@ -61,8 +65,11 @@ defmodule Ret.BotOrchestrator do
     |> String.trim_trailing("/")
   end
 
+  defp http_client do
+    Application.get_env(:ret, __MODULE__)[:http_client] || HTTPoison
+  end
+
   defp access_key do
-    Application.get_env(:ret, __MODULE__)[:access_key] ||
-      Application.get_env(:ret, :bot_access_key) || ""
+    Application.get_env(:ret, __MODULE__)[:access_key] || ""
   end
 end

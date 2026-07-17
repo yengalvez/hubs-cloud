@@ -3,7 +3,17 @@ defmodule RetWeb.HubChannelTest do
   import Ret.TestHelpers
 
   alias RetWeb.{Presence, SessionSocket}
-  alias Ret.{AppConfig, Account, Repo, Hub, HubInvite}
+
+  alias Ret.{
+    AppConfig,
+    Account,
+    BotChatPresence,
+    BotConfigAdmission,
+    BotRunnerLease,
+    Repo,
+    Hub,
+    HubInvite
+  }
 
   @default_join_params %{"profile" => %{}, "context" => %{}}
 
@@ -12,6 +22,28 @@ defmodule RetWeb.HubChannelTest do
   setup do
     {:ok, socket} = connect(SessionSocket, %{})
     {:ok, socket: socket}
+  end
+
+  setup do
+    original_orchestrator_config = Application.get_env(:ret, Ret.BotOrchestrator)
+    original_test_receiver = Application.get_env(:ret, Ret.BotOrchestratorTestHttpClient)
+
+    Application.put_env(
+      :ret,
+      Ret.BotOrchestrator,
+      endpoint: "http://bot-orchestrator.test",
+      access_key: String.duplicate("k", 32),
+      http_client: Ret.BotOrchestratorTestHttpClient
+    )
+
+    Application.put_env(:ret, Ret.BotOrchestratorTestHttpClient, self())
+
+    on_exit(fn ->
+      restore_application_env(:ret, Ret.BotOrchestrator, original_orchestrator_config)
+      restore_application_env(:ret, Ret.BotOrchestratorTestHttpClient, original_test_receiver)
+    end)
+
+    :ok
   end
 
   describe "authorization" do
@@ -37,6 +69,99 @@ defmodule RetWeb.HubChannelTest do
           "hub:#{hub.hub_sid}",
           join_params_for_account(disabled_account)
         )
+    end
+
+    test "a room owner cannot activate bots through update_hub", %{
+      socket: socket,
+      account: account,
+      scene: scene
+    } do
+      {:ok, owned_hub} =
+        %Hub{}
+        |> Hub.changeset(scene, %{name: "Owned bot room"})
+        |> Hub.add_account_to_changeset(account)
+        |> Repo.insert()
+
+      {:ok, _response, socket} =
+        subscribe_and_join(
+          socket,
+          "hub:#{owned_hub.hub_sid}",
+          join_params_for_account(account)
+        )
+
+      payload = %{
+        "name" => owned_hub.name,
+        "description" => owned_hub.description,
+        "room_size" => owned_hub.room_size,
+        "member_permissions" => Hub.member_permissions_for_hub(owned_hub),
+        "allow_promotion" => owned_hub.allow_promotion,
+        "entry_mode" => nil,
+        "user_data" => %{
+          "bots" => %{
+            "enabled" => true,
+            "count" => 1,
+            "mobility" => "static",
+            "chat_enabled" => true,
+            "prompt" => ""
+          }
+        }
+      }
+
+      assert_reply push(socket, "update_hub", payload), :error, %{
+        reason: "bot_config_rejected"
+      }
+
+      refute Repo.get!(Hub, owned_hub.hub_id).user_data["bots"]["enabled"]
+    end
+
+    test "closing a room disables its approved bots in the same update", %{
+      socket: socket,
+      account: account,
+      scene: scene
+    } do
+      admin = create_account("channel-close-bot-admin", true)
+
+      {:ok, owned_hub} =
+        %Hub{}
+        |> Hub.changeset(scene, %{name: "Close bot room"})
+        |> Hub.add_account_to_changeset(account)
+        |> Repo.insert()
+
+      {:ok, active_hub} =
+        owned_hub
+        |> Hub.add_attrs_to_changeset(%{
+          user_data: %{
+            "bots" => %{
+              "enabled" => true,
+              "count" => 1,
+              "mobility" => "static",
+              "chat_enabled" => true,
+              "prompt" => ""
+            }
+          }
+        })
+        |> BotConfigAdmission.update(admin)
+
+      {:ok, _response, socket} =
+        subscribe_and_join(
+          socket,
+          "hub:#{active_hub.hub_sid}",
+          join_params_for_account(account)
+        )
+
+      push(socket, "close_hub", %{})
+      :sys.get_state(socket.channel_pid)
+
+      closed = Repo.get!(Hub, active_hub.hub_id)
+      assert closed.entry_mode == :deny
+      refute closed.user_data["bots"]["enabled"]
+      assert closed.user_data["bots"]["count"] == 1
+
+      assert_receive {:bot_orchestrator_request, :post,
+                      "http://bot-orchestrator.test/internal/bots/room-stop", body, _headers,
+                      _options}
+
+      assert Poison.decode!(body) == %{"hub_sid" => active_hub.hub_sid}
     end
   end
 
@@ -65,20 +190,120 @@ defmodule RetWeb.HubChannelTest do
       meta = presence[session_id][:metas] |> Enum.at(0)
       assert meta[:profile]["identityName"] === "Test User"
     end
+
+    test "authenticated chat authority starts only after the channel enters the room", %{
+      socket: socket,
+      hub: hub,
+      account: account
+    } do
+      {:ok, response, socket} =
+        subscribe_and_join(socket, "hub:#{hub.hub_sid}", join_params_for_account(account))
+
+      assert response.bot_chat_capability =~ ~r/\A[A-Za-z0-9_-]{32}\z/
+
+      refute BotChatPresence.present?(
+               hub.hub_sid,
+               account.account_id,
+               response.bot_chat_capability
+             )
+
+      push(socket, "events:entered", %{})
+      :sys.get_state(socket.channel_pid)
+
+      assert BotChatPresence.present?(
+               hub.hub_sid,
+               account.account_id,
+               response.bot_chat_capability
+             )
+    end
+
+    test "sign_out revokes chat authority immediately", %{
+      socket: socket,
+      hub: hub,
+      account: account
+    } do
+      {:ok, response, socket} =
+        subscribe_and_join(socket, "hub:#{hub.hub_sid}", join_params_for_account(account))
+
+      push(socket, "events:entered", %{})
+      :sys.get_state(socket.channel_pid)
+
+      assert BotChatPresence.present?(
+               hub.hub_sid,
+               account.account_id,
+               response.bot_chat_capability
+             )
+
+      assert_reply push(socket, "sign_out", %{}), :ok, %{bot_chat_capability: nil}
+
+      refute BotChatPresence.present?(
+               hub.hub_sid,
+               account.account_id,
+               response.bot_chat_capability
+             )
+    end
+
+    test "sign_in after anonymous entry creates and tracks a private capability", %{
+      socket: socket,
+      hub: hub,
+      account: account
+    } do
+      {:ok, %{bot_chat_capability: nil}, socket} =
+        subscribe_and_join(socket, "hub:#{hub.hub_sid}", @default_join_params)
+
+      push(socket, "events:entered", %{})
+      :sys.get_state(socket.channel_pid)
+      {:ok, token, _claims} = Ret.Guardian.encode_and_sign(account)
+
+      assert_reply push(socket, "sign_in", %{"token" => token}), :ok, %{
+        bot_chat_capability: capability
+      }
+
+      assert capability =~ ~r/\A[A-Za-z0-9_-]{32}\z/
+      assert BotChatPresence.present?(hub.hub_sid, account.account_id, capability)
+    end
+
+    test "switching accounts rotates authority without retaining the previous account", %{
+      socket: socket,
+      hub: hub,
+      account: account,
+      account2: account2
+    } do
+      {:ok, first, socket} =
+        subscribe_and_join(socket, "hub:#{hub.hub_sid}", join_params_for_account(account))
+
+      push(socket, "events:entered", %{})
+      :sys.get_state(socket.channel_pid)
+      {:ok, token, _claims} = Ret.Guardian.encode_and_sign(account2)
+
+      assert_reply push(socket, "sign_in", %{"token" => token}), :ok, %{
+        bot_chat_capability: second_capability
+      }
+
+      refute second_capability == first.bot_chat_capability
+
+      refute BotChatPresence.present?(
+               hub.hub_sid,
+               account.account_id,
+               first.bot_chat_capability
+             )
+
+      assert BotChatPresence.present?(hub.hub_sid, account2.account_id, second_capability)
+    end
   end
 
   describe "bot runner presence context" do
     setup do
-      original_bot_access_key = Application.get_env(:ret, :bot_access_key)
+      original_bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
       bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
 
-      Application.put_env(:ret, :bot_access_key, bot_access_key)
+      Application.put_env(:ret, :bot_runner_access_key, bot_access_key)
 
       on_exit(fn ->
         if is_nil(original_bot_access_key) do
-          Application.delete_env(:ret, :bot_access_key)
+          Application.delete_env(:ret, :bot_runner_access_key)
         else
-          Application.put_env(:ret, :bot_access_key, original_bot_access_key)
+          Application.put_env(:ret, :bot_runner_access_key, original_bot_access_key)
         end
       end)
 
@@ -106,6 +331,123 @@ defmodule RetWeb.HubChannelTest do
         bot_spawn_accepted: true,
         network_id: ^network_id
       }
+    end
+
+    test "keeps the first registered lease authoritative during runner overlap", %{
+      socket: first_transport,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, first_join, first_socket} = join_hub(first_transport, hub, params)
+      assert is_binary(first_join.bot_runner_lease_id)
+      assert first_join.bot_runner_authoritative
+      assert is_integer(first_join.bot_runner_authority_epoch)
+      assert presence_context(first_socket, first_join.session_id)["bot_runner"] === true
+
+      {:ok, second_transport} = connect(SessionSocket, %{})
+      {:ok, second_join, second_socket} = join_hub(second_transport, hub, params)
+      assert is_binary(second_join.bot_runner_lease_id)
+      refute second_join.bot_runner_lease_id == first_join.bot_runner_lease_id
+      refute second_join.bot_runner_authoritative
+      assert second_join.bot_runner_authority_epoch == first_join.bot_runner_authority_epoch
+      assert presence_context(second_socket, second_join.session_id)["bot_runner"] === true
+
+      assert RetWeb.HubChannel.authoritative_bot_runner_lease_id(Presence.list(second_socket)) ==
+               first_join.bot_runner_lease_id
+
+      network_id = bot_network_id(hub, 1)
+
+      assert_reply push(second_socket, "naf", bot_spawn_payload(network_id)), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      assert_reply push(second_socket, "naf", bot_update_payload(network_id)), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      remove = %{"dataType" => "r", "data" => %{"networkId" => network_id}}
+
+      assert_reply push(second_socket, "naf", remove), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      assert_reply push(first_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
+        bot_spawn_accepted: true,
+        network_id: ^network_id
+      }
+
+      Process.unlink(first_socket.channel_pid)
+      Process.exit(first_socket.channel_pid, :kill)
+      assert wait_for_runner_lease(second_socket, second_join.bot_runner_lease_id)
+
+      promoted_epoch =
+        BotRunnerLease.snapshot(hub.hub_sid)
+        |> Map.fetch!(:authority_epoch)
+
+      assert promoted_epoch > first_join.bot_runner_authority_epoch
+
+      refute BotRunnerLease.authorized?(
+               hub.hub_sid,
+               second_join.bot_runner_lease_id,
+               first_join.bot_runner_authority_epoch
+             )
+
+      assert_reply push(second_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
+        bot_spawn_accepted: true,
+        network_id: ^network_id,
+        bot_runner_authority_epoch: ^promoted_epoch
+      }
+
+      :ok = Presence.untrack(second_socket, second_join.session_id)
+
+      assert_reply push(second_socket, "naf", bot_update_payload(network_id)), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+    end
+
+    test "selects the Presence leader deterministically regardless of map/meta order" do
+      older = %{
+        context: %{"bot_runner" => true},
+        bot_runner_lease_id: "older-lease",
+        bot_runner_join_order: 10,
+        bot_runner_authority_epoch: 7,
+        bot_runner_authoritative: true
+      }
+
+      newer = %{
+        context: %{"bot_runner" => true},
+        bot_runner_lease_id: "newer-lease",
+        bot_runner_join_order: 11,
+        bot_runner_authority_epoch: 7,
+        bot_runner_authoritative: false
+      }
+
+      assert RetWeb.HubChannel.authoritative_bot_runner_lease_id(%{
+               "new-session" => %{metas: [newer]},
+               "old-session" => %{metas: [older]}
+             }) == "older-lease"
+
+      assert RetWeb.HubChannel.authoritative_bot_runner_lease_id(%{
+               "old-session" => %{metas: [older]},
+               "new-session" => %{metas: [newer]}
+             }) == "older-lease"
+
+      promoted = %{
+        newer
+        | bot_runner_authority_epoch: 8,
+          bot_runner_authoritative: true
+      }
+
+      assert RetWeb.HubChannel.authoritative_bot_runner_lease_id(%{
+               "old-session" => %{metas: [older]},
+               "new-session" => %{metas: [promoted]}
+             }) == "newer-lease"
     end
 
     test "rejects bot_runner=true when the access key is omitted", %{
@@ -541,6 +883,18 @@ defmodule RetWeb.HubChannelTest do
     |> Map.fetch!(:context)
   end
 
+  defp wait_for_runner_lease(socket, expected, attempts \\ 25)
+  defp wait_for_runner_lease(_socket, _expected, 0), do: false
+
+  defp wait_for_runner_lease(socket, expected, attempts) do
+    if RetWeb.HubChannel.authoritative_bot_runner_lease_id(Presence.list(socket)) == expected do
+      true
+    else
+      :timer.sleep(20)
+      wait_for_runner_lease(socket, expected, attempts - 1)
+    end
+  end
+
   defp bot_spawn_payload(network_id) do
     %{
       "dataType" => "u",
@@ -579,4 +933,7 @@ defmodule RetWeb.HubChannelTest do
 
     %{hub: hub, hub_invite: hub_invite}
   end
+
+  defp restore_application_env(app, key, nil), do: Application.delete_env(app, key)
+  defp restore_application_env(app, key, value), do: Application.put_env(app, key, value)
 end

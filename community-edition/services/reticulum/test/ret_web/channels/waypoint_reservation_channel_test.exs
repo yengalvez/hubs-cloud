@@ -21,10 +21,11 @@ defmodule RetWeb.WaypointReservationChannelTest do
       subscribe_and_join(socket, "hub:#{hub.hub_sid}", join_params())
 
     assert response.waypoint_reservation == %{
-             protocol: 1,
+             protocol: 2,
              supported: false,
              lease_ms: 15_000,
              request_timeout_ms: 3_000,
+             snapshot_state_version: nil,
              active: [],
              current: nil,
              request_seq: 0
@@ -37,6 +38,23 @@ defmodule RetWeb.WaypointReservationChannelTest do
     assert reply["operation_id"] == payload["operation_id"]
     assert reply["request_seq"] == 1
     refute Map.has_key?(reply, "session_id")
+    assert Repo.aggregate(WaypointReservation, :count, :waypoint_reservation_id) == 0
+  end
+
+  test "protocol one clients fail closed against the protocol two server", %{
+    socket: socket,
+    hub: hub
+  } do
+    legacy_params =
+      join_params(SecureRandom.uuid())
+      |> put_in(["waypoint_reservation", "protocol"], 1)
+
+    {:ok, response, _socket} =
+      subscribe_and_join(socket, "hub:#{hub.hub_sid}", legacy_params)
+
+    assert response.waypoint_reservation.protocol == 2
+    refute response.waypoint_reservation.supported
+    assert response.waypoint_reservation.snapshot_state_version == nil
     assert Repo.aggregate(WaypointReservation, :count, :waypoint_reservation_id) == 0
   end
 
@@ -57,6 +75,7 @@ defmodule RetWeb.WaypointReservationChannelTest do
     assert response.waypoint_reservation.active == []
     assert response.waypoint_reservation.current == nil
     assert response.waypoint_reservation.request_seq == 0
+    assert response.waypoint_reservation.snapshot_state_version in 1..9_007_199_254_740_991
 
     first = request(1, "reserve", "seat-a")
     assert_reply push(socket, "waypoint_reservation:request", first), :error, denied
@@ -71,13 +90,18 @@ defmodule RetWeb.WaypointReservationChannelTest do
     assert_reply push(socket, "waypoint_reservation:request", reserve), :ok, accepted
     assert accepted["occupied"] == true
     assert accepted["expires_at"] != nil
+    assert accepted["action"] == "reserve"
+    assert accepted["state_version"] in 1..9_007_199_254_740_991
 
     assert_broadcast "waypoint_reservation:state", state
     assert state["waypoint_id"] == "seat-a"
     assert state["occupied"] == true
+    assert state["state_version"] == accepted["state_version"]
 
     assert Map.keys(state) |> Enum.sort() ==
-             ~w(expires_at occupied protocol waypoint_id) |> Enum.sort()
+             ~w(expires_at occupied protocol state_version waypoint_id) |> Enum.sort()
+
+    refute Map.has_key?(state, "reservation_id")
 
     {:ok, observer_socket} = connect(SessionSocket, %{})
 
@@ -88,10 +112,12 @@ defmodule RetWeb.WaypointReservationChannelTest do
         join_params(SecureRandom.uuid())
       )
 
-    assert [%{waypoint_id: "seat-a", expires_at: expires_at}] =
+    assert [%{waypoint_id: "seat-a", expires_at: expires_at, state_version: state_version}] =
              observer_response.waypoint_reservation.active
 
     assert is_binary(expires_at)
+    assert state_version == accepted["state_version"]
+    assert observer_response.waypoint_reservation.snapshot_state_version > state_version
     assert observer_response.waypoint_reservation.current == nil
     assert observer_response.waypoint_reservation.request_seq == 0
   end
@@ -111,8 +137,14 @@ defmodule RetWeb.WaypointReservationChannelTest do
 
     push(first_socket, "events:entering", %{})
     initial = request(1, "reserve", "seat-a")
-    assert_reply push(first_socket, "waypoint_reservation:request", initial), :ok, _reply
-    assert_broadcast "waypoint_reservation:state", %{"occupied" => true}
+    assert_reply push(first_socket, "waypoint_reservation:request", initial), :ok, initial_reply
+
+    assert_broadcast "waypoint_reservation:state", %{
+      "occupied" => true,
+      "state_version" => initial_state_version
+    }
+
+    assert initial_reply["state_version"] == initial_state_version
 
     {:ok, reloaded_socket} =
       connect(SessionSocket, %{"session_token" => first_join.session_token})
@@ -129,6 +161,9 @@ defmodule RetWeb.WaypointReservationChannelTest do
     assert reload_join.waypoint_reservation.current.waypoint_id == "seat-a"
     assert reload_join.waypoint_reservation.current.operation_id == initial["operation_id"]
     assert reload_join.waypoint_reservation.current.reservation_id == initial["reservation_id"]
+    assert reload_join.waypoint_reservation.current.state_version == initial_state_version
+
+    assert reload_join.waypoint_reservation.snapshot_state_version > initial_state_version
 
     stale_renew =
       request(2, "renew", "seat-a", reservation_id: initial["reservation_id"])
@@ -146,13 +181,13 @@ defmodule RetWeb.WaypointReservationChannelTest do
     hub: hub
   } do
     bot_key = String.duplicate("test-bot-key-", 3)
-    old_key = Application.get_env(:ret, :bot_access_key)
-    Application.put_env(:ret, :bot_access_key, bot_key)
+    old_key = Application.get_env(:ret, :bot_runner_access_key)
+    Application.put_env(:ret, :bot_runner_access_key, bot_key)
 
     on_exit(fn ->
       if old_key == nil,
-        do: Application.delete_env(:ret, :bot_access_key),
-        else: Application.put_env(:ret, :bot_access_key, old_key)
+        do: Application.delete_env(:ret, :bot_runner_access_key),
+        else: Application.put_env(:ret, :bot_runner_access_key, old_key)
     end)
 
     params =
@@ -231,11 +266,15 @@ defmodule RetWeb.WaypointReservationChannelTest do
     assert_broadcast "waypoint_reservation:state", state
 
     assert state == %{
-             "protocol" => 1,
+             "protocol" => 2,
              "waypoint_id" => "seat-a",
              "occupied" => false,
-             "expires_at" => nil
+             "expires_at" => nil,
+             "state_version" => state["state_version"]
            }
+
+    assert state["state_version"] in 1..9_007_199_254_740_991
+    refute Map.has_key?(state, "reservation_id")
 
     row = Repo.one!(WaypointReservation)
     assert row.waypoint_id == nil
@@ -247,7 +286,7 @@ defmodule RetWeb.WaypointReservationChannelTest do
 
     if client_instance_id do
       Map.put(base, "waypoint_reservation", %{
-        "protocol" => 1,
+        "protocol" => 2,
         "client_instance_id" => client_instance_id
       })
     else
@@ -257,7 +296,7 @@ defmodule RetWeb.WaypointReservationChannelTest do
 
   defp request(sequence, action, waypoint_id, opts \\ []) do
     %{
-      "protocol" => 1,
+      "protocol" => 2,
       "action" => action,
       "waypoint_id" => waypoint_id,
       "operation_id" => Keyword.get(opts, :operation_id, SecureRandom.uuid()),

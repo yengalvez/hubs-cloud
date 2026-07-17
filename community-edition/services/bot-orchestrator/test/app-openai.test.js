@@ -1,7 +1,8 @@
 const assert = require("node:assert/strict");
 const { after, before, beforeEach, test } = require("node:test");
 
-process.env.BOT_ACCESS_KEY = "test-access-key-that-is-at-least-32-characters";
+process.env.BOT_ORCHESTRATOR_ACCESS_KEY = "test-orchestrator-access-key-at-least-32";
+process.env.BOT_RUNNER_ACCESS_KEY = "test-runner-access-key-that-is-at-least-32";
 process.env.OPENAI_API_KEY = "test-openai-key";
 process.env.OPENAI_ENDPOINT = "https://provider.test/v1/responses";
 process.env.OPENAI_MODERATION_ENDPOINT = "https://provider.test/v1/moderations";
@@ -11,7 +12,7 @@ process.env.CHAT_RATE_LIMIT_MAX_REQUESTS = "20";
 process.env.OPENAI_TOTAL_BUDGET_MS = "200";
 
 const nativeFetch = global.fetch;
-const { startServer } = require("../app");
+const { startServer, internals } = require("../app");
 
 const moderationResults = [];
 const modelPayloads = [];
@@ -73,6 +74,7 @@ before(async () => {
 });
 
 beforeEach(() => {
+  internals.resetRuntimeStateForTests();
   moderationResults.length = 0;
   modelPayloads.length = 0;
   providerCalls.length = 0;
@@ -89,18 +91,20 @@ async function post(path, body) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-ret-bot-access-key": process.env.BOT_ACCESS_KEY
+      "x-ret-bot-orchestrator-access-key": process.env.BOT_ORCHESTRATOR_ACCESS_KEY
     },
     body: JSON.stringify(body)
   });
 }
 
 async function configureRoom(hubSid, mobility = "medium") {
+  const bots = { enabled: true, count: 1, mobility, chat_enabled: true };
   const response = await post("/internal/bots/room-config", {
     hub_sid: hubSid,
-    bots: { enabled: true, count: 1, mobility, chat_enabled: true }
+    bots
   });
   assert.equal(response.status, 200);
+  assert.equal(internals.seedReadyRoomForTests(hubSid, bots), true);
 }
 
 function completedModelReply(reply, action) {
@@ -109,6 +113,25 @@ function completedModelReply(reply, action) {
     output_text: JSON.stringify({ reply, ...(action === undefined ? {} : { action }) })
   };
 }
+
+test("never calls the provider while authoritative bot readiness is pending", async () => {
+  const configured = await post("/internal/bots/room-config", {
+    hub_sid: "room-provider-pending",
+    bots: { enabled: true, count: 1, mobility: "medium", chat_enabled: true }
+  });
+  assert.equal(configured.status, 200);
+
+  const response = await post("/internal/bots/chat", {
+    hub_sid: "room-provider-pending",
+    bot_id: "bot-1",
+    requester_id: "account-provider-pending",
+    message: "hola"
+  });
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "bot service unavailable" });
+  assert.deepEqual(providerCalls, []);
+});
 
 test("returns a generic 2xx response without echo when input moderation blocks", async () => {
   const secret = "private-input-secret-8472";

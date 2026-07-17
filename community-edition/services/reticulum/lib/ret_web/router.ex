@@ -76,6 +76,10 @@ defmodule RetWeb.Router do
     plug RetWeb.Plugs.BotHeaderAuthorization
   end
 
+  pipeline :bot_runner_header_auth do
+    plug RetWeb.Plugs.BotRunnerHeaderAuthorization
+  end
+
   pipeline :dashboard_header_auth do
     plug RetWeb.Plugs.DashboardHeaderAuthorization
   end
@@ -91,6 +95,7 @@ defmodule RetWeb.Router do
 
   scope "/health", RetWeb do
     get "/", HealthController, :index
+    get "/capabilities", HealthController, :capabilities
   end
 
   scope "/api/postgrest" do
@@ -203,14 +208,22 @@ defmodule RetWeb.Router do
   end
 
   scope "/api-internal", RetWeb do
+    pipe_through [:bot_runner_header_auth, :secure_headers, :parsed_body, :api] ++
+                   if(secure?, do: [:ssl_only], else: [])
+
+    scope "/v1", as: :api_internal_v1_bot_runner do
+      get "/hubs/active_with_bots", ApiInternal.V1.BotsController, :active_with_bots
+      get "/hubs/configured_with_bots", ApiInternal.V1.BotsController, :configured_with_bots
+    end
+  end
+
+  scope "/api-internal", RetWeb do
     pipe_through [:dashboard_header_auth, :secure_headers, :parsed_body, :api] ++
                    if(secure?, do: [:ssl_only], else: [])
 
     scope "/v1", as: :api_internal_v1 do
       get "/presence", ApiInternal.V1.PresenceController, :show
       get "/presence/range_max", ApiInternal.V1.PresenceController, :range_max
-      get "/hubs/active_with_bots", ApiInternal.V1.BotsController, :active_with_bots
-      get "/hubs/configured_with_bots", ApiInternal.V1.BotsController, :configured_with_bots
       get "/storage", ApiInternal.V1.StorageController, :show
       post "/rewrite_assets", ApiInternal.V1.RewriteAssetsController, :post
       put "/change_email_for_login", ApiInternal.V1.LoginEmailController, :update

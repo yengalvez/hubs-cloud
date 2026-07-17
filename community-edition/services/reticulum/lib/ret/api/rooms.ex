@@ -1,7 +1,7 @@
 defmodule Ret.Api.Rooms do
   @moduledoc "Functions for accessing rooms in an authenticated way"
 
-  alias Ret.{Account, Hub, Repo}
+  alias Ret.{Account, BotConfigAdmission, Hub, Repo}
   alias RetWeb.Api.V1.HubView
   alias Ret.Api.{Credentials}
 
@@ -41,7 +41,7 @@ defmodule Ret.Api.Rooms do
 
   def authed_create_room(%Credentials{} = credentials, params) do
     if can?(credentials, create_room(nil)) do
-      Hub.create_room(params, credentials.account)
+      Hub.create_room(params, actor_for(credentials))
     else
       {:error, :invalid_credentials}
     end
@@ -81,7 +81,7 @@ defmodule Ret.Api.Rooms do
   defp try_do_update_room(changeset, %Credentials{} = c) do
     subject = subject_for(c)
 
-    case changeset |> Repo.update() do
+    case BotConfigAdmission.update(changeset, actor_for(c)) do
       {:error, changeset} ->
         {:error, changeset}
 
@@ -98,6 +98,10 @@ defmodule Ret.Api.Rooms do
         end
     end
   end
+
+  defp actor_for(%Credentials{subject_type: :app}), do: nil
+  defp actor_for(%Credentials{subject_type: :account, account: %Account{} = account}), do: account
+  defp actor_for(%Credentials{}), do: nil
 
   defp broadcast_hub_refresh(hub, subject, stale_fields) do
     payload =

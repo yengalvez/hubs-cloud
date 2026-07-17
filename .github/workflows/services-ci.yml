@@ -52,6 +52,7 @@ jobs:
         run: |
           npm ci
           npm audit --omit=dev --audit-level=high
+          npm run test:generator
           fixture_dir="$(mktemp -d)"
           trap 'find "$fixture_dir" -type f -delete; rmdir "$fixture_dir"' EXIT
           HCCE_INPUT_VALUES_PATH="$PWD/input-values.ci.yaml" \
