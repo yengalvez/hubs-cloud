@@ -11,7 +11,10 @@ const {
   MANAGED_BY_LABEL,
   ROOM_KEY_LABEL
 } = require("../kubernetes-runner-manager");
-const { createRunnerGenerationToken } = require("../runner-generation-token");
+const {
+  createRunnerGenerationToken,
+  verifyRunnerGenerationToken
+} = require("../runner-generation-token");
 
 const key = "test-orchestrator-generation-key-at-least-32";
 const generation = "11111111-1111-4111-8111-111111111111";
@@ -123,6 +126,29 @@ test("creates one hardened, bounded, room-hashed runner Pod without parent secre
   }
   assert.equal(handle.podUid, "33333333-3333-4333-8333-333333333333");
   assert.equal(handle.podReady, true);
+});
+
+test("a same-room replacement embeds a fresh exact generation credential", () => {
+  const podManager = manager();
+  const replacementGeneration = "44444444-4444-4444-8444-444444444444";
+  const first = podManager.identity("replacement-generation-room", generation);
+  const replacement = podManager.identity(
+    "replacement-generation-room",
+    replacementGeneration
+  );
+
+  assert.notEqual(replacement.name, first.name);
+  assert.notEqual(replacement.token, first.token);
+
+  const replacementClaims = verifyRunnerGenerationToken(replacement.token, key, {
+    hubSid: "replacement-generation-room",
+    processGeneration: replacementGeneration,
+    holderId: ownerUid,
+    nowSeconds: Math.floor(2_000_000_000_000 / 1000)
+  });
+
+  assert.equal(replacementClaims.process_generation, replacementGeneration);
+  assert.equal(replacementClaims.holder_id, ownerUid);
 });
 
 test("accepts only the exact immutable Pod contract", async () => {

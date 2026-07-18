@@ -2988,6 +2988,7 @@ module.exports = {
     invalidateAuthoritativeSnapshot,
     maxActiveForBackend,
     normalizeConfig,
+    nextRunnerProcessGeneration,
     nextRunnerRestartDelay,
     parseRoomSnapshot,
     parseOpenAIResponsePayload,

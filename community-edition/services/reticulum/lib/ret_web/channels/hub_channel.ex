@@ -79,13 +79,11 @@ defmodule RetWeb.HubChannel do
   end
 
   defp perform_join(socket, hub, context, params) do
-    bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
+    runner_generation_claims =
+      verified_bot_runner_generation_claims(params["bot_access_key"], hub.hub_sid)
 
-    has_valid_bot_access_key =
-      valid_bot_runner_credential?(params["bot_access_key"], bot_access_key, hub.hub_sid)
-
-    with {:ok, context, authenticated_bot_runner} <-
-           authenticate_bot_runner_context(context, has_valid_bot_access_key) do
+    with {:ok, context, authenticated_runner_claims} <-
+           authenticate_bot_runner_context(context, runner_generation_claims) do
       account =
         case Ret.Guardian.resource_from_token(params["auth_token"]) do
           {:ok, %Account{} = account, _claims} -> account
@@ -130,7 +128,8 @@ defmodule RetWeb.HubChannel do
         |> Map.merge(%{
           has_active_invite: has_active_invite,
           hub_requires_oauth: hub_requires_oauth,
-          has_valid_bot_access_key: authenticated_bot_runner,
+          has_valid_bot_access_key: is_map(authenticated_runner_claims),
+          bot_runner_generation_claims: authenticated_runner_claims,
           account_has_provider_for_hub: account_has_provider_for_hub,
           account_can_join: account_can_join,
           account_can_update: account_can_update,
@@ -1298,36 +1297,32 @@ defmodule RetWeb.HubChannel do
     end
   end
 
-  defp secure_compare(value, expected)
-       when is_binary(value) and is_binary(expected) and byte_size(expected) >= 32 do
-    byte_size(value) == byte_size(expected) and Plug.Crypto.secure_compare(value, expected)
+  defp verified_bot_runner_generation_claims(provided, hub_sid) do
+    case Ret.BotRunnerGenerationToken.verify(provided, hub_sid) do
+      {:ok, claims} -> claims
+      :error -> nil
+    end
   end
 
-  defp secure_compare(_, _), do: false
-
-  defp valid_bot_runner_credential?(provided, legacy_key, hub_sid) do
-    secure_compare(provided, legacy_key) or
-      match?({:ok, _claims}, Ret.BotRunnerGenerationToken.verify(provided, hub_sid))
-  end
-
-  defp authenticate_bot_runner_context(context, has_valid_bot_access_key) when is_map(context) do
+  defp authenticate_bot_runner_context(context, runner_generation_claims) when is_map(context) do
     case Map.get(context, "bot_runner") do
-      true when has_valid_bot_access_key ->
-        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", true), true}
+      true when is_map(runner_generation_claims) ->
+        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", true),
+         runner_generation_claims}
 
       true ->
         {:error, %{message: "Bot runner authentication failed", reason: "invalid_bot_access_key"}}
 
       value when value in [nil, false] ->
-        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", false), false}
+        {:ok, context |> Map.delete(:bot_runner) |> Map.put("bot_runner", false), nil}
 
       _ ->
         {:error, %{message: "Invalid bot runner request", reason: "invalid_bot_runner_request"}}
     end
   end
 
-  defp authenticate_bot_runner_context(_context, _has_valid_bot_access_key) do
-    {:ok, %{"bot_runner" => false}, false}
+  defp authenticate_bot_runner_context(_context, _runner_generation_claims) do
+    {:ok, %{"bot_runner" => false}, nil}
   end
 
   defp authenticated_bot_runner?(socket) do
@@ -1884,7 +1879,7 @@ defmodule RetWeb.HubChannel do
            |> assign(:oauth_account_id, params[:oauth_account_id])
            |> assign(:oauth_source, params[:oauth_source])
            |> assign(:has_valid_bot_access_key, params[:has_valid_bot_access_key])
-           |> assign_bot_runner_lease(params[:has_valid_bot_access_key], hub),
+           |> assign_bot_runner_lease(params[:bot_runner_generation_claims], hub),
          {socket, waypoint_capability, waypoint_states} <-
            configure_waypoint_reservation(socket, hub, context, params),
          response <-
@@ -1941,8 +1936,12 @@ defmodule RetWeb.HubChannel do
     end
   end
 
-  defp assign_bot_runner_lease(socket, true, %Hub{} = hub) do
-    case BotConfigApproval.register_runtime_lease(hub.hub_sid, socket.assigns.session_id) do
+  defp assign_bot_runner_lease(socket, %{} = generation_claims, %Hub{} = hub) do
+    case BotConfigApproval.register_runtime_lease(
+           hub.hub_sid,
+           socket.assigns.session_id,
+           generation_claims
+         ) do
       {:ok, lease} ->
         {:ok, assign_registered_bot_runner_lease(socket, lease)}
 
@@ -1958,6 +1957,13 @@ defmodule RetWeb.HubChannel do
          %{
            message: "Bot runner authority is unavailable",
            reason: "bot_runner_lease_unavailable"
+         }}
+
+      {:error, :runner_generation_replayed} ->
+        {:error,
+         %{
+           message: "Bot runner generation was already consumed",
+           reason: "bot_runner_generation_replayed"
          }}
 
       {:error, _reason} ->

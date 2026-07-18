@@ -3,11 +3,12 @@ defmodule Ret.BotRunnerLease do
   Process-bound bot-runner authority backed by a PostgreSQL fencing lease.
 
   PostgreSQL is the only authority shared by Reticulum replicas. The GenServer
-  binds a durable lease to its channel process, applies a conservative local
-  monotonic deadline and mirrors loss of authority into Presence. Database
-  work runs in callers or renewal tasks, never while blocking this coordinator;
-  this is important when registration already holds the bot-config admission
-  advisory lock.
+  passes the exact verified generation claims into the durable one-time
+  acquisition, binds the resulting lease to its channel process, applies a
+  conservative local monotonic deadline and mirrors loss of authority into
+  Presence. Database work runs in callers or renewal tasks, never while
+  blocking this coordinator; this is important when registration already holds
+  the bot-config admission advisory lock.
 
   Runtime side effects must use `with_authority/5`. It locks and validates the
   exact database row, then executes the side effect before releasing that lock,
@@ -30,22 +31,24 @@ defmodule Ret.BotRunnerLease do
     end
   end
 
-  def register(hub_sid), do: register(@name, hub_sid)
+  def register(hub_sid, generation_claims), do: register(@name, hub_sid, generation_claims)
 
   @doc false
-  def register(server, hub_sid) when is_binary(hub_sid) and byte_size(hub_sid) > 0 do
-    register_for_session(server, hub_sid, SecureRandom.uuid())
+  def register(server, hub_sid, generation_claims)
+      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_map(generation_claims) do
+    register_for_session(server, hub_sid, SecureRandom.uuid(), generation_claims)
   end
 
-  def register(_server, _hub_sid), do: {:error, :lease_unavailable}
+  def register(_server, _hub_sid, _generation_claims), do: {:error, :lease_unavailable}
 
-  def register_for_session(hub_sid, session_id),
-    do: register_for_session(@name, hub_sid, session_id)
+  def register_for_session(hub_sid, session_id, generation_claims),
+    do: register_for_session(@name, hub_sid, session_id, generation_claims)
 
   @doc false
-  def register_for_session(server, hub_sid, session_id)
-      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_binary(session_id) do
-    case GenServer.call(server, {:prepare_registration, hub_sid, session_id}) do
+  def register_for_session(server, hub_sid, session_id, generation_claims)
+      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_binary(session_id) and
+             is_map(generation_claims) do
+    case GenServer.call(server, {:prepare_registration, hub_sid, session_id, generation_claims}) do
       {:ok, context} ->
         result =
           context.store.acquire(
@@ -54,6 +57,7 @@ defmodule Ret.BotRunnerLease do
             context.lease_id,
             context.holder_id,
             context.session_id,
+            context.generation_claims,
             context.ttl_seconds
           )
 
@@ -86,7 +90,7 @@ defmodule Ret.BotRunnerLease do
     :exit, _reason -> {:error, :lease_database_unavailable}
   end
 
-  def register_for_session(_server, _hub_sid, _session_id),
+  def register_for_session(_server, _hub_sid, _session_id, _generation_claims),
     do: {:error, :lease_unavailable}
 
   def authorized?(hub_sid, lease_id, authority_epoch),
@@ -317,40 +321,15 @@ defmodule Ret.BotRunnerLease do
   end
 
   @impl true
-  def handle_call({:prepare_registration, hub_sid, session_id}, {owner_pid, _tag}, state) do
-    if Map.has_key?(state.leases, hub_sid) or MapSet.member?(state.pending_hubs, hub_sid) do
+  def handle_call(
+        {:prepare_registration, hub_sid, session_id, generation_claims},
+        {owner_pid, _tag},
+        state
+      ) do
+    if not Ret.BotRunnerGenerationToken.valid_claims?(generation_claims, hub_sid) do
       {:reply, {:error, :lease_unavailable}, state}
     else
-      registration_id = SecureRandom.uuid()
-      monitor_ref = Process.monitor(owner_pid)
-
-      pending = %{
-        hub_sid: hub_sid,
-        lease_id: SecureRandom.uuid(),
-        local_started_at_ms: monotonic_ms(),
-        monitor_ref: monitor_ref,
-        owner_pid: owner_pid,
-        session_id: session_id
-      }
-
-      context = %{
-        holder_id: state.holder_id,
-        lease_id: pending.lease_id,
-        registration_id: registration_id,
-        repo: state.repo,
-        session_id: session_id,
-        store: state.store,
-        ttl_seconds: state.ttl_seconds
-      }
-
-      next_state = %{
-        state
-        | pending: Map.put(state.pending, registration_id, pending),
-          pending_hubs: MapSet.put(state.pending_hubs, hub_sid),
-          monitor_refs: Map.put(state.monitor_refs, monitor_ref, {:pending, registration_id})
-      }
-
-      {:reply, {:ok, context}, next_state}
+      prepare_registration(hub_sid, session_id, generation_claims, owner_pid, state)
     end
   end
 
@@ -400,6 +379,14 @@ defmodule Ret.BotRunnerLease do
 
           {:error, :database_unavailable} ->
             {:reply, {:error, :lease_database_unavailable},
+             remove_pending(state, registration_id, pending)}
+
+          {:error, :generation_replayed} ->
+            {:reply, {:error, :runner_generation_replayed},
+             remove_pending(state, registration_id, pending)}
+
+          {:error, :invalid_generation_claims} ->
+            {:reply, {:error, :lease_unavailable},
              remove_pending(state, registration_id, pending)}
         end
 
@@ -511,6 +498,44 @@ defmodule Ret.BotRunnerLease do
   end
 
   def handle_call(:holder_id, _from, state), do: {:reply, state.holder_id, state}
+
+  defp prepare_registration(hub_sid, session_id, generation_claims, owner_pid, state) do
+    if Map.has_key?(state.leases, hub_sid) or MapSet.member?(state.pending_hubs, hub_sid) do
+      {:reply, {:error, :lease_unavailable}, state}
+    else
+      registration_id = SecureRandom.uuid()
+      monitor_ref = Process.monitor(owner_pid)
+
+      pending = %{
+        hub_sid: hub_sid,
+        lease_id: SecureRandom.uuid(),
+        local_started_at_ms: monotonic_ms(),
+        monitor_ref: monitor_ref,
+        owner_pid: owner_pid,
+        session_id: session_id
+      }
+
+      context = %{
+        generation_claims: generation_claims,
+        holder_id: state.holder_id,
+        lease_id: pending.lease_id,
+        registration_id: registration_id,
+        repo: state.repo,
+        session_id: session_id,
+        store: state.store,
+        ttl_seconds: state.ttl_seconds
+      }
+
+      next_state = %{
+        state
+        | pending: Map.put(state.pending, registration_id, pending),
+          pending_hubs: MapSet.put(state.pending_hubs, hub_sid),
+          monitor_refs: Map.put(state.monitor_refs, monitor_ref, {:pending, registration_id})
+      }
+
+      {:reply, {:ok, context}, next_state}
+    end
+  end
 
   @impl true
   def handle_cast(

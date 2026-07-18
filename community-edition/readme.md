@@ -139,9 +139,14 @@ dedicated inbound/signing key plus `OPENAI_API_KEY`; it never receives
 `BOT_RUNNER_ACCESS_KEY`. Bot snapshots use the parent orchestrator credential.
 Each ghost Pod receives only a short-lived HMAC credential scoped to its exact
 room, process generation, orchestrator-Pod holder and expiry. Reticulum accepts
-that credential only for the matching room join; the credential is sent in the
-Phoenix join payload and authenticated control headers, never in a URL or
-client-visible state. It contains no lease or fencing claims. After join,
+that credential only once for the matching room join; the credential is sent
+in the Phoenix join payload and authenticated control headers, never in a URL
+or client-visible state. A durable PostgreSQL generation ledger is consumed in
+the same locked transaction before lease epoch allocation, rejects replay even
+after release, revoke, expiry or restart, and does not consume a replacement
+generation while another lease is active. The master runner key cannot acquire
+Phoenix bot-runner authority. The generation credential contains no lease or
+fencing claims. After join,
 Reticulum assigns the mandatory shared-database lease UUID and authority epoch;
 Presence, ACKs, commands and parent readiness must all agree on that exact
 fence. `BOT_RUNNER_ACCESS_KEY` remains only in Reticulum for the legacy runner
@@ -172,11 +177,12 @@ with UID preconditions, enforces the existing room ceiling, and rotates a Pod
 when its one-hour credential/active deadline expires. This source separation is
 implemented and tested but is not operationally complete until both bot images
 are built, digest-pinned, generated into a staging manifest and accepted live.
-Roll out Reticulum first because it alone provides the compatible legacy-plus-v1
-authentication window; verify it before the new parent/runners. Rollback is the
-reverse: restore legacy parent/runners before old Reticulum. A new runner against
-old Reticulum is an expected fail-closed incompatibility, never a reason to
-bypass authentication.
+There is intentionally no mixed legacy/generation authority window: old
+process-local runners cannot authenticate to this Reticulum, and new runners
+cannot authenticate to older Reticulum. Rollout and rollback therefore require
+an explicit stopped-runner maintenance boundary and verification of zero runner
+authority before changing either side. A mixed version is an expected
+fail-closed incompatibility, never a reason to bypass authentication.
 
 Authenticated bot chat is private to the requesting browser and requires an
 exact random capability for that Phoenix channel and account in the same room.

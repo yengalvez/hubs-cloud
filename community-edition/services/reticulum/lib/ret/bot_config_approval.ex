@@ -15,7 +15,16 @@ defmodule Ret.BotConfigApproval do
   import Ecto.Changeset
   import Ecto.Query
 
-  alias Ret.{Account, BotConfig, BotConfigApproval, BotRunnerLease, Hub, Locking, Repo}
+  alias Ret.{
+    Account,
+    BotConfig,
+    BotConfigApproval,
+    BotRunnerGenerationToken,
+    BotRunnerLease,
+    Hub,
+    Locking,
+    Repo
+  }
 
   @schema_prefix "ret0"
   @primary_key {:hub_id, :id, autogenerate: false}
@@ -98,17 +107,29 @@ defmodule Ret.BotConfigApproval do
   admission transaction connection; the local coordinator never opens a
   second database wait while the caller holds the global lock.
   """
-  def register_runtime_lease(hub_sid),
-    do: register_runtime_lease(hub_sid, SecureRandom.uuid())
+  def register_runtime_lease(hub_sid, generation_claims),
+    do: register_runtime_lease(hub_sid, SecureRandom.uuid(), generation_claims)
 
-  def register_runtime_lease(hub_sid, session_id)
-      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_binary(session_id) do
+  def register_runtime_lease(hub_sid, session_id, generation_claims)
+      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_binary(session_id) and
+             is_map(generation_claims) do
+    if BotRunnerGenerationToken.valid_claims?(generation_claims, hub_sid) do
+      register_verified_runtime_lease(hub_sid, session_id, generation_claims)
+    else
+      {:error, :bot_config_unapproved}
+    end
+  end
+
+  def register_runtime_lease(_hub_sid, _session_id, _generation_claims),
+    do: {:error, :bot_config_unapproved}
+
+  defp register_verified_runtime_lease(hub_sid, session_id, generation_claims) do
     result =
       Locking.exec_after_lock(@admission_lock, fn ->
         with %Hub{} = hub <- hub_for_update(hub_sid),
              %BotConfigApproval{} = approval <- approval_for_update(hub.hub_id),
              true <- hub.entry_mode != :deny and runtime_approved?(hub, approval) do
-          BotRunnerLease.register_for_session(hub_sid, session_id)
+          BotRunnerLease.register_for_session(hub_sid, session_id, generation_claims)
         else
           _ -> {:error, :bot_config_unapproved}
         end
@@ -123,8 +144,6 @@ defmodule Ret.BotConfigApproval do
   catch
     :exit, _reason -> fail_registration_closed(hub_sid)
   end
-
-  def register_runtime_lease(_hub_sid, _session_id), do: {:error, :bot_config_unapproved}
 
   @doc """
   Executes a bounded runtime side effect only if the exact approval decision is

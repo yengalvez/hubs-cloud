@@ -35,6 +35,15 @@ defmodule Ret.BotRunnerGenerationToken do
 
   def verify(_, _, _), do: :error
 
+  @doc false
+  def valid_claims?(claims, hub_sid, now_seconds \\ System.system_time(:second))
+
+  def valid_claims?(claims, hub_sid, now_seconds)
+      when is_map(claims) and is_binary(hub_sid) and is_integer(now_seconds),
+      do: valid_payload?(claims, hub_sid, now_seconds)
+
+  def valid_claims?(_, _, _), do: false
+
   defp sign(encoded_payload, key) do
     :crypto.mac(:hmac, :sha256, key, "#{@version}.#{encoded_payload}")
     |> Base.url_encode64(padding: false)

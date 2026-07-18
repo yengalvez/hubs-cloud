@@ -136,6 +136,15 @@ test("does not require or retain the master runner access key in the parent", ()
   assert.equal(result.status, 0);
 });
 
+test("every replacement allocation uses a fresh process generation", () => {
+  const first = internals.nextRunnerProcessGeneration();
+  const replacement = internals.nextRunnerProcessGeneration();
+
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.match(replacement, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.notEqual(replacement, first);
+});
+
 test("refuses to mount the master runner key into an autostart parent", () => {
   const result = spawnSync(process.execPath, ["-e", "require('./app').startServer(0)"], {
     cwd: require("node:path").join(__dirname, ".."),

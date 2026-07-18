@@ -355,11 +355,16 @@ defmodule Ret.BotConfigApprovalTest do
                incumbent_lease_id,
                incumbent_holder_id,
                incumbent_session_id,
+               generation_claims(hub.hub_sid),
                15
              )
 
     assert {:error, :lease_unavailable} =
-             BotConfigApproval.register_runtime_lease(hub.hub_sid, Ecto.UUID.generate())
+             BotConfigApproval.register_runtime_lease(
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               generation_claims(hub.hub_sid)
+             )
 
     assert {:ok, :incumbent_still_authoritative} =
              PostgresStore.with_authority(
@@ -444,7 +449,11 @@ defmodule Ret.BotConfigApprovalTest do
           with_unboxed_connection(fn ->
             database_pid = postgres_backend_pid()
             send(parent, {:registration_started, self(), database_pid})
-            BotConfigApproval.register_runtime_lease(hub.hub_sid)
+
+            BotConfigApproval.register_runtime_lease(
+              hub.hub_sid,
+              generation_claims(hub.hub_sid)
+            )
           end)
         end)
 
@@ -524,6 +533,17 @@ defmodule Ret.BotConfigApprovalTest do
   end
 
   defp active_user_data, do: %{"bots" => active_bots()}
+
+  defp generation_claims(hub_sid) do
+    %{
+      "v" => 1,
+      "aud" => "yenhubs-bot-runner",
+      "hub_sid" => hub_sid,
+      "process_generation" => Ecto.UUID.generate(),
+      "holder_id" => Ecto.UUID.generate(),
+      "exp" => System.system_time(:second) + 300
+    }
+  end
 
   defp active_bots do
     %{
