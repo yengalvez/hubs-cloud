@@ -1,0 +1,12 @@
+*
+!package.json
+!package-lock.json
+!package.parent.json
+!package.runner.json
+!Dockerfile
+!Dockerfile.runner
+!app.js
+!kubernetes-runner-manager.js
+!runner-generation-token.js
+!run-ghost-runner.js
+!runner-control-client.js

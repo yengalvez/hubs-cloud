@@ -2,7 +2,6 @@ const assert = require("node:assert/strict");
 const { after, before, beforeEach, test } = require("node:test");
 
 process.env.BOT_ORCHESTRATOR_ACCESS_KEY = "test-orchestrator-access-key-at-least-32";
-process.env.BOT_RUNNER_ACCESS_KEY = "test-runner-access-key-that-is-at-least-32";
 process.env.OPENAI_API_KEY = "test-openai-key";
 process.env.OPENAI_ENDPOINT = "https://provider.test/v1/responses";
 process.env.OPENAI_MODERATION_ENDPOINT = "https://provider.test/v1/moderations";

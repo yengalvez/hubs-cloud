@@ -12,6 +12,9 @@ const {
   verifyBotOrchestratorRuntimeEnv,
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
+  verifyBotImagePullSecret,
+  verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerNetworkPolicy,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,
@@ -34,13 +37,13 @@ function isDigestPinnedImage(image) {
   return typeof image === "string" && /@sha256:[a-f0-9]{64}$/i.test(image);
 }
 
-function verifyIngressPolicy(resources, namespace, name, targetApp, allowedApps, port) {
+function verifyIngressPolicy(resources, namespace, name, targetApp, allowedApps, port, allowedPeers = null) {
   const policy = findExactResource(resources, "networking.k8s.io", "NetworkPolicy", namespace, name);
   if (!policy) {
     fail(`missing NetworkPolicy/${name}`);
     return;
   }
-  verifyExactIngressPolicy(policy, { name, targetApp, allowedApps, port }).forEach(fail);
+  verifyExactIngressPolicy(policy, { name, targetApp, allowedApps, allowedPeers, port }).forEach(fail);
 }
 
 function verifyPhotomnemonicEgressPolicy(resources, namespace) {
@@ -249,6 +252,7 @@ if (!fs.existsSync(manifestPath)) {
     '[ret."Elixir.RetWeb.Plugs.HeaderAuthorization"]\theader_value\tDASHBOARD_ACCESS_KEY',
     '[ret]\tbot_access_key\tBOT_ACCESS_KEY',
     '[ret]\tbot_runner_access_key\tBOT_RUNNER_ACCESS_KEY',
+    '[ret]\tbot_orchestrator_access_key\tBOT_ORCHESTRATOR_ACCESS_KEY',
     '[ret."Elixir.Ret.BotOrchestrator"]\taccess_key\tBOT_ORCHESTRATOR_ACCESS_KEY'
   ];
   if (
@@ -303,7 +307,6 @@ if (!fs.existsSync(manifestPath)) {
   }
 
   const tokenlessDeployments = [
-    "bot-orchestrator",
     "reticulum",
     "pgsql",
     "pgbouncer",
@@ -380,6 +383,14 @@ if (!fs.existsSync(manifestPath)) {
     manifestNamespace,
     "bot-orchestrator"
   );
+  if (
+    botOrchestrator?.spec?.template?.spec?.serviceAccountName !== "bot-orchestrator" ||
+    botOrchestrator?.spec?.template?.spec?.automountServiceAccountToken !== true ||
+    JSON.stringify(botOrchestrator?.spec?.template?.spec?.imagePullSecrets) !==
+      JSON.stringify([{ name: "bot-images-pull" }])
+  ) {
+    fail("Deployment/bot-orchestrator must use its dedicated service account and image-pull Secret");
+  }
   verifyBotOrchestratorContainers(botOrchestrator).forEach(fail);
   verifyBotOrchestratorDeploymentContract(botOrchestrator).forEach(fail);
   verifyBotOrchestratorIsolationContract(botOrchestrator).forEach(fail);
@@ -404,11 +415,11 @@ if (!fs.existsSync(manifestPath)) {
   if (reticulumBotKeyChecksum !== expectedBotKeyChecksum) {
     fail("Deployment/reticulum bot access key checksum must match Secret/configs");
   }
-  if (
-    reticulumRunnerKeyChecksum !== checksumFor("BOT_RUNNER_ACCESS_KEY") ||
-    botOrchestratorRunnerKeyChecksum !== reticulumRunnerKeyChecksum
-  ) {
-    fail("Reticulum and bot-orchestrator runner key checksums must match Secret/configs");
+  if (reticulumRunnerKeyChecksum !== checksumFor("BOT_RUNNER_ACCESS_KEY")) {
+    fail("Deployment/reticulum runner key checksum must match Secret/configs");
+  }
+  if (botOrchestratorRunnerKeyChecksum) {
+    fail("bot-orchestrator must not receive the master runner key checksum");
   }
   if (
     reticulumOrchestratorKeyChecksum !== checksumFor("BOT_ORCHESTRATOR_ACCESS_KEY") ||
@@ -421,6 +432,7 @@ if (!fs.existsSync(manifestPath)) {
   }
   if (
     botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"] ||
+    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"] ||
     botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"]
   ) {
     fail("bot-orchestrator must not receive legacy integration or dashboard key checksums");
@@ -473,6 +485,9 @@ if (!fs.existsSync(manifestPath)) {
     const botEnv = Object.fromEntries(
       (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
     );
+    if (!isDigestPinnedImage(botEnv.BOT_RUNNER_IMAGE)) {
+      fail("bot-orchestrator BOT_RUNNER_IMAGE must pin the dedicated runner image by digest");
+    }
     if (botEnv.RUNNER_BACKEND !== "ghost" || botEnv.RUNNER_AUTOSTART !== "true") {
       fail("bot-orchestrator production runtime must autostart the authenticated ghost backend");
     }
@@ -503,8 +518,8 @@ if (!fs.existsSync(manifestPath)) {
     }
     const botReadinessPath = botContainer.readinessProbe?.httpGet?.path;
     const botLivenessPath = botContainer.livenessProbe?.httpGet?.path;
-    if (botReadinessPath !== "/ready" || botLivenessPath !== "/health") {
-      fail("bot-orchestrator must separate authoritative readiness from liveness");
+    if (botReadinessPath !== "/transport-ready" || botLivenessPath !== "/health") {
+      fail("bot-orchestrator must expose transport readiness separately from authoritative /ready");
     }
     if (
       Number(botEnv.GHOST_NAVMESH_MAX_TRIANGLES) !== 50000 ||
@@ -524,7 +539,7 @@ if (!fs.existsSync(manifestPath)) {
       Number(botEnv.RET_SYNC_TIMEOUT_MS) !== 5000 ||
       Number(botEnv.RET_SNAPSHOT_TTL_MS) !== 120000 ||
       Number(botEnv.RUNNER_CONFIG_ACK_TIMEOUT_MS) !== 15000 ||
-      Number(botEnv.RUNNER_STARTUP_GRACE_MS) !== 60000 ||
+      Number(botEnv.RUNNER_STARTUP_GRACE_MS) !== 180000 ||
       Number(botEnv.RUNNER_STALE_RESTART_MS) !== 30000 ||
       Number(botEnv.RUNNER_TERMINAL_RECOVERY_GRACE_MS) !== 15000 ||
       Number(botEnv.RUNNER_WATCHDOG_INTERVAL_MS) !== 5000 ||
@@ -532,7 +547,9 @@ if (!fs.existsSync(manifestPath)) {
       Number(botEnv.RUNNER_RESTART_MAX_MS) !== 60000 ||
       Number(botEnv.RUNNER_STABLE_RESET_MS) !== 30000 ||
       Number(botEnv.RUNNER_TERMINATION_GRACE_MS) !== 10000 ||
-      Number(botEnv.RUNNER_KILL_GRACE_MS) !== 5000
+      Number(botEnv.RUNNER_KILL_GRACE_MS) !== 5000 ||
+      Number(botEnv.RUNNER_POD_RECONCILE_INTERVAL_MS) !== 5000 ||
+      Number(botEnv.RUNNER_TOKEN_TTL_SECONDS) !== 3600
     ) {
       fail("bot-orchestrator desired-state and runner recovery bounds do not match the audited baseline");
     }
@@ -654,7 +671,36 @@ if (!fs.existsSync(manifestPath)) {
   );
   verifyHaproxyClusterRole(haproxyRole).forEach(fail);
 
-  verifyIngressPolicy(resources, manifestNamespace, "bot-orchestrator-ingress", "bot-orchestrator", ["reticulum"], 5001);
+  verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
+  verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
+  const botRunnerNetworkPolicy = findExactResource(
+    resources,
+    "networking.k8s.io",
+    "NetworkPolicy",
+    manifestNamespace,
+    "bot-runner-isolation"
+  );
+  verifyBotRunnerNetworkPolicy(botRunnerNetworkPolicy).forEach(fail);
+
+  verifyIngressPolicy(
+    resources,
+    manifestNamespace,
+    "bot-orchestrator-ingress",
+    "bot-orchestrator",
+    [],
+    5001,
+    [
+      { podSelector: { matchLabels: { app: "reticulum" } } },
+      {
+        podSelector: {
+          matchLabels: {
+            app: "bot-runner",
+            "yenhubs.org/managed-by": "bot-orchestrator"
+          }
+        }
+      }
+    ]
+  );
   verifyIngressPolicy(resources, manifestNamespace, "pgsql-ingress", "pgsql", ["pgbouncer", "pgbouncer-t"], 5432);
   verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
   verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);

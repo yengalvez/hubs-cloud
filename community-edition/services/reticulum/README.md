@@ -69,9 +69,23 @@ singleton deployment boundary merely because database fencing is present.
 
 Bot credentials are separated by authority. `bot_access_key` remains for the
 legacy `BotHeaderAuthorization` integration route and never reaches a runner.
-`bot_runner_access_key` alone authenticates bot snapshot reads and the Phoenix
-bot-runner join. `Ret.BotOrchestrator` uses an independent access key when it
-calls the parent bot-orchestrator service. Dashboard authorization has its own
+The parent bot-orchestrator uses `bot_orchestrator_access_key` for bot snapshot
+reads and as the signing key for short-lived runner generation credentials. It
+also authenticates Reticulum when Reticulum calls the parent through
+`Ret.BotOrchestrator`; it is never placed in a runner Pod. Each Pod receives
+only a signed credential scoped to exact room, generation, holder and expiry;
+`Ret.BotRunnerGenerationToken` validates that scope before the Phoenix join.
+The v1 payload has no lease or fencing claims: after the join, Reticulum
+acquires the shared PostgreSQL lease and returns its mandatory exact UUID and
+positive JavaScript-safe authority epoch through the join and Presence. Spawn
+ACKs and commands carry the same fence, the runner rejects missing or stale
+values, and the parent requires the runner to report that exact UUID and epoch
+before authentication or readiness. Protected Reticulum side effects lock and
+revalidate the database row, so this post-join fence is authoritative without
+rotating the generation token.
+`bot_runner_access_key` remains accepted only as the legacy runner credential
+during this transition and no longer authenticates bot snapshot reads.
+Dashboard authorization has its own
 minimum-32-character key and fails closed when it is absent; it never falls
 back to either bot key. The legacy `x-ret-admin-access-key` header for
 RetNotice, SupportSubscription and Hub deletion is an alias of this same

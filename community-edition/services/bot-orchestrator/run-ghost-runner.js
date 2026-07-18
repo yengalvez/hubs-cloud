@@ -10,9 +10,11 @@ Options:
 `;
 
 const docopt = require("docopt").docopt;
+const fs = require("node:fs");
 const { mat4, vec3, quat } = require("gl-matrix");
 const THREE = require("three");
 const { Pathfinding } = require("three-pathfinding");
+const { createRunnerControlClient } = require("./runner-control-client");
 
 // Node 20+ has fetch globally, but keep this as a sanity check.
 if (typeof fetch !== "function") {
@@ -1427,6 +1429,26 @@ function parseManagedConfigMessage(message) {
   };
 }
 
+function managedConfigDeliveryDecision(state, managed) {
+  if (!managed || !validManagedConfigRevision(managed.revision) || typeof managed.fingerprint !== "string") {
+    return "invalid";
+  }
+  const known = [
+    [state?.appliedRevision, state?.appliedFingerprint],
+    [state?.pendingRevision, state?.pendingFingerprint]
+  ].filter(([revision]) => validManagedConfigRevision(revision));
+  if (known.length === 0) return "accept";
+  const latestRevision = Math.max(...known.map(([revision]) => revision));
+  if (managed.revision < latestRevision) return "stale";
+  if (managed.revision > latestRevision) return "accept";
+  const latestFingerprints = known
+    .filter(([revision]) => revision === latestRevision)
+    .map(([_revision, fingerprint]) => fingerprint);
+  return latestFingerprints.every(fingerprint => fingerprint === managed.fingerprint)
+    ? "duplicate"
+    : "conflict";
+}
+
 function shouldApplyHubRefreshConfig(managedConfigReceived) {
   return managedConfigReceived !== true;
 }
@@ -2109,7 +2131,23 @@ async function main() {
     throw new Error("runner_process_generation_missing");
   }
 
-  const botAccessKey = process.env.BOT_RUNNER_ACCESS_KEY || "";
+  const runnerGenerationToken = process.env.BOT_RUNNER_GENERATION_TOKEN || "";
+  const runnerControlUrl = process.env.RUNNER_CONTROL_URL || "";
+  const runnerPodUid = process.env.RUNNER_POD_UID || "";
+  const runnerLeaseHolderId = process.env.RUNNER_LEASE_HOLDER_ID || "";
+  const managedByPod = !!runnerControlUrl;
+  const runnerControl = managedByPod
+    ? createRunnerControlClient({
+        controlUrl: runnerControlUrl,
+        token: runnerGenerationToken,
+        podUid: runnerPodUid,
+        processGeneration: runnerProcessGeneration
+      })
+    : null;
+  if (managedByPod && !runnerLeaseHolderId) {
+    throw new Error("runner_lease_holder_missing");
+  }
+  const botAccessKey = managedByPod ? runnerGenerationToken : "";
   const raycastMode = (process.env.GHOST_RAYCAST_MODE || "spoke_colliders").trim().toLowerCase();
   const navigationMode =
     (process.env.GHOST_NAVIGATION_MODE || "navmesh_preferred").trim().toLowerCase() === "colliders"
@@ -2133,6 +2171,44 @@ async function main() {
   let appliedManagedConfigFingerprint = "";
   let appliedManagedConfigRevision = 0;
   let managedConfigReceived = false;
+  let runnerControlConfigFailures = 0;
+  let runnerControlStatusFailures = 0;
+  let runnerControlStatusQueue = Promise.resolve();
+  let runnerControlPollTimer = null;
+
+  const updateRunnerReadinessFile = ready => {
+    try {
+      if (ready) fs.writeFileSync("/tmp/runner-ready", "ready\n", { mode: 0o600 });
+      else fs.rmSync("/tmp/runner-ready", { force: true });
+    } catch (_error) {
+      if (ready) throw new Error("runner_readiness_file_failed");
+    }
+  };
+
+  const publishManagedMessage = message => {
+    if (process.connected && typeof process.send === "function") {
+      try {
+        process.send(message);
+        return true;
+      } catch (_error) {
+        return false;
+      }
+    }
+    if (!runnerControl) return false;
+    runnerControlStatusQueue = runnerControlStatusQueue
+      .then(() => runnerControl.publishStatus(message))
+      .then(() => {
+        runnerControlStatusFailures = 0;
+      })
+      .catch(() => {
+        runnerControlStatusFailures += 1;
+        if (runnerControlStatusFailures >= 3) {
+          log("Authenticated runner control channel failed closed; exiting.");
+          process.exit(1);
+        }
+      });
+    return true;
+  };
 
   const handleManagedConfig = message => {
     if (!message || message.type !== "bots-config") return;
@@ -2145,6 +2221,39 @@ async function main() {
       log("Rejected managed bot config for a different runner process generation.");
       return;
     }
+    const deliveryDecision = managedConfigDeliveryDecision(
+      {
+        appliedFingerprint: appliedManagedConfigFingerprint,
+        appliedRevision: appliedManagedConfigRevision,
+        pendingFingerprint: pendingManagedConfigFingerprint,
+        pendingRevision: pendingManagedConfigRevision
+      },
+      managed
+    );
+    if (deliveryDecision === "stale") {
+      log("Ignored a stale managed bot config revision.");
+      return;
+    }
+    if (deliveryDecision === "conflict" || deliveryDecision === "invalid") {
+      log("Managed bot config revision conflict; exiting fail closed.");
+      process.exit(1);
+      return;
+    }
+    if (deliveryDecision === "duplicate") {
+      managedConfigReceived = true;
+      if (
+        appliedManagedConfigRevision === managed.revision &&
+        appliedManagedConfigFingerprint === managed.fingerprint
+      ) {
+        publishManagedMessage({
+          type: "bots-config-applied",
+          fingerprint: managed.fingerprint,
+          revision: managed.revision,
+          processGeneration: runnerProcessGeneration
+        });
+      }
+      return;
+    }
     botsConfig = managed.bots;
     botsConfigDirty = true;
     pendingManagedConfigFingerprint = managed.fingerprint;
@@ -2152,6 +2261,40 @@ async function main() {
     managedConfigReceived = true;
   };
   process.on("message", handleManagedConfig);
+
+  if (runnerControl) {
+    const initialMessage = await retryWithBackoff(
+      async () => {
+        const message = await runnerControl.fetchConfig();
+        if (!message) throw new Error("runner_control_config_pending");
+        return message;
+      },
+      { maxAttempts: 5, baseDelayMs: 500, maxDelayMs: 2000 }
+    );
+    handleManagedConfig(initialMessage);
+    if (!managedConfigReceived) throw new Error("runner_control_initial_config_rejected");
+
+    let pollInFlight = false;
+    runnerControlPollTimer = setInterval(() => {
+      if (pollInFlight) return;
+      pollInFlight = true;
+      runnerControl.fetchConfig()
+        .then(message => {
+          runnerControlConfigFailures = 0;
+          if (message) handleManagedConfig(message);
+        })
+        .catch(() => {
+          runnerControlConfigFailures += 1;
+          if (runnerControlConfigFailures >= 3) {
+            log("Authenticated runner config channel failed closed; exiting.");
+            process.exit(1);
+          }
+        })
+        .finally(() => {
+          pollInFlight = false;
+        });
+    }, 1000);
+  }
 
   const wsPkg = require("ws");
   global.WebSocket = wsPkg; // required for phoenix in Node
@@ -2244,17 +2387,15 @@ async function main() {
     socket.disconnect();
     throw error;
   }
-  if (process.connected && typeof process.send === "function") {
-    try {
-      process.send({
-        type: "ghost-auth-status",
-        authenticated: true,
-        processGeneration: runnerProcessGeneration
-      });
-    } catch (_error) {
-      socket.disconnect();
-      throw new Error("ghost_auth_status_ipc_failed");
-    }
+  if (!publishManagedMessage({
+    type: "ghost-auth-status",
+    authenticated: true,
+    processGeneration: runnerProcessGeneration,
+    runnerLeaseId,
+    runnerAuthorityEpoch
+  })) {
+    socket.disconnect();
+    throw new Error("ghost_auth_status_control_failed");
   }
 
   log("Joined hub as authenticated bot runner:", hubSid, "session:", sessionId);
@@ -2318,11 +2459,8 @@ async function main() {
     if (!force && fingerprint === lastRuntimeStatusFingerprint && now - lastRuntimeStatusSentAt < 5000) return;
     lastRuntimeStatusFingerprint = fingerprint;
     lastRuntimeStatusSentAt = now;
-    if (process.connected && typeof process.send === "function") {
-      try {
-        process.send({ type: "ghost-runtime-status", ...status });
-      } catch (_err) {}
-    }
+    updateRunnerReadinessFile(status.ready === true);
+    publishManagedMessage({ type: "ghost-runtime-status", ...status });
   };
 
   const scheduleTimeout = (fn, delayMs) => {
@@ -2591,17 +2729,13 @@ async function main() {
         pendingManagedConfigRevision = 0;
       },
       acknowledge: (fingerprint, revision, processGeneration) => {
-        if (process.connected && typeof process.send === "function") {
-          try {
-            process.send({
-              type: "bots-config-applied",
-              fingerprint,
-              revision,
-              processGeneration
-            });
-          } catch (_error) {
-            log("Failed to acknowledge applied managed bot config.");
-          }
+        if (!publishManagedMessage({
+          type: "bots-config-applied",
+          fingerprint,
+          revision,
+          processGeneration
+        })) {
+          log("Failed to acknowledge applied managed bot config.");
         }
       },
       // The status emitted inside reconcileBots carried the previous applied
@@ -3091,17 +3225,13 @@ async function main() {
     });
   }
 
-  if (process.connected && typeof process.send === "function") {
-    try {
-      process.send({
-        type: "ghost-navigation-status",
-        processGeneration: runnerProcessGeneration,
-        ready: navigationReady({ navigationMode, requireNavmesh, waypointData }),
-        required: requireNavmesh,
-        mode: navigationMode
-      });
-    } catch (_err) {}
-  }
+  publishManagedMessage({
+    type: "ghost-navigation-status",
+    processGeneration: runnerProcessGeneration,
+    ready: navigationReady({ navigationMode, requireNavmesh, waypointData }),
+    required: requireNavmesh,
+    mode: navigationMode
+  });
 
   // Main loop.
   let lastConfigRefreshAt = 0;
@@ -3156,6 +3286,8 @@ async function main() {
 
   const shutdown = signal => {
     log(`Received ${signal}, shutting down ghost runner.`);
+    updateRunnerReadinessFile(false);
+    if (runnerControlPollTimer) clearInterval(runnerControlPollTimer);
     clearInterval(interval);
     fullSyncTimers.forEach(timer => clearTimeout(timer));
     fullSyncTimers.clear();
@@ -3211,6 +3343,7 @@ module.exports = {
     findSeparatedNavmeshPosition,
     errorCodeForLog,
     managedRunnerConfigFingerprint,
+    managedConfigDeliveryDecision,
     navigationReady,
     normalizeBotsConfig,
     parseManagedConfigMessage,

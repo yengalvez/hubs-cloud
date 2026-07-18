@@ -3,16 +3,21 @@ const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { EventEmitter } = require("node:events");
+const http = require("node:http");
 const { after, before, test } = require("node:test");
 
 process.env.BOT_ORCHESTRATOR_ACCESS_KEY = "test-orchestrator-access-key-at-least-32";
-process.env.BOT_RUNNER_ACCESS_KEY = "test-runner-access-key-that-is-at-least-32";
 process.env.OPENAI_API_KEY = "";
 process.env.RUNNER_AUTOSTART = "false";
 process.env.CHAT_RATE_LIMIT_MS = "1";
 process.env.CHAT_RATE_LIMIT_MAX_REQUESTS = "3";
+process.env.POD_NAMESPACE = "hcce";
+process.env.ORCHESTRATOR_POD_NAME = "bot-orchestrator-test";
+process.env.ORCHESTRATOR_POD_UID = "22222222-2222-4222-8222-222222222222";
+process.env.BOT_RUNNER_IMAGE = `registry.invalid/bot-runner@sha256:${"a".repeat(64)}`;
 
 const { startServer, internals } = require("../app");
+const { createRunnerGenerationToken } = require("../runner-generation-token");
 
 let server;
 let baseUrl;
@@ -75,6 +80,26 @@ async function post(path, body, accessKey = process.env.BOT_ORCHESTRATOR_ACCESS_
   });
 }
 
+function rawStatus(pathname, headers) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port: server.address().port,
+        path: pathname,
+        method: "GET",
+        headers
+      },
+      response => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      }
+    );
+    request.on("error", reject);
+    request.end();
+  });
+}
+
 async function configureReadyRoom(hubSid, bots) {
   const normalized = internals.normalizeConfig(bots);
   const response = await post("/internal/bots/room-config", {
@@ -97,29 +122,33 @@ test("refuses to start without a strong orchestrator access key", () => {
   assert.match(result.stderr, /BOT_ORCHESTRATOR_ACCESS_KEY/);
 });
 
-test("refuses to start without a strong runner access key", () => {
-  const result = spawnSync(process.execPath, ["-e", "require('./app').startServer(0)"], {
+test("does not require or retain the master runner access key in the parent", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["-e", "require('./app').internals.validateRuntimeConfiguration()"],
+    {
     cwd: require("node:path").join(__dirname, ".."),
     env: { ...process.env, BOT_RUNNER_ACCESS_KEY: "" },
     encoding: "utf8"
-  });
+    }
+  );
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /BOT_RUNNER_ACCESS_KEY/);
+  assert.equal(result.status, 0);
 });
 
-test("refuses reused bot trust-domain keys", () => {
+test("refuses to mount the master runner key into an autostart parent", () => {
   const result = spawnSync(process.execPath, ["-e", "require('./app').startServer(0)"], {
     cwd: require("node:path").join(__dirname, ".."),
     env: {
       ...process.env,
-      BOT_RUNNER_ACCESS_KEY: process.env.BOT_ORCHESTRATOR_ACCESS_KEY
+      RUNNER_AUTOSTART: "true",
+      BOT_RUNNER_ACCESS_KEY: "forbidden-master-runner-key-at-least-32"
     },
     encoding: "utf8"
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /must be distinct/);
+  assert.match(result.stderr, /must never receive the master runner access key/);
 });
 
 test("refuses production endpoint or credential-header redirection", () => {
@@ -167,35 +196,44 @@ test("refuses a redirected ghost runner script when autostart is enabled", () =>
   assert.match(result.stderr, /script path must match the audited production contract/);
 });
 
-test("builds managed ghost children with process.execPath and an exact environment allowlist", () => {
-  const processGeneration = randomUUID();
+test("builds a runner Pod environment allowlist without any parent or master credential", () => {
   const sourceEnvironment = Object.fromEntries(
     internals.GHOST_RUNNER_ENV_KEYS.map(key => [key, `allowed-${key}`])
   );
+  sourceEnvironment.BOT_RUNNER_GENERATION_TOKEN = "must-be-generated-per-pod";
+  sourceEnvironment.RUNNER_CONTROL_URL = "must-be-generated-per-pod";
+  sourceEnvironment.RUNNER_LEASE_HOLDER_ID = "must-be-generated-per-pod";
+  sourceEnvironment.RUNNER_POD_UID = "must-be-generated-per-pod";
+  sourceEnvironment.RUNNER_PROCESS_GENERATION = "must-be-generated-per-pod";
   sourceEnvironment.OPENAI_API_KEY = "must-not-reach-child";
+  sourceEnvironment.BOT_ORCHESTRATOR_ACCESS_KEY = "must-not-reach-child";
+  sourceEnvironment.BOT_RUNNER_ACCESS_KEY = "must-not-reach-child";
   sourceEnvironment.RET_INTERNAL_ENDPOINT = "must-not-reach-child";
   sourceEnvironment.NODE_OPTIONS = "must-not-reach-child";
   sourceEnvironment.AUDIT_SENTINEL = "must-not-reach-child";
 
-  const spec = internals.managedGhostSpawnSpec("managed-room", processGeneration, sourceEnvironment);
+  const environment = internals.ghostRunnerPodEnvironment(sourceEnvironment);
 
-  assert.equal(spec.command, process.execPath);
-  assert.deepEqual(spec.args, [
-    "/app/run-ghost-runner.js",
-    "--url",
-    "https://meta-hubs.org",
-    "--room",
-    "managed-room",
-    "--runner"
-  ]);
-  assert.deepEqual(spec.options.stdio, ["ignore", "inherit", "inherit", "ipc"]);
-  assert.deepEqual(Object.keys(spec.options.env).sort(), [...internals.GHOST_RUNNER_ENV_KEYS].sort());
-  assert.equal(spec.options.env.RUNNER_PROCESS_GENERATION, processGeneration);
-  assert.equal(spec.options.env.BOT_RUNNER_ACCESS_KEY, "allowed-BOT_RUNNER_ACCESS_KEY");
-  assert.equal(Object.hasOwn(spec.options.env, "OPENAI_API_KEY"), false);
-  assert.equal(Object.hasOwn(spec.options.env, "RET_INTERNAL_ENDPOINT"), false);
-  assert.equal(Object.hasOwn(spec.options.env, "NODE_OPTIONS"), false);
-  assert.equal(Object.hasOwn(spec.options.env, "AUDIT_SENTINEL"), false);
+  for (const generated of [
+    "BOT_RUNNER_GENERATION_TOKEN",
+    "RUNNER_CONTROL_URL",
+    "RUNNER_LEASE_HOLDER_ID",
+    "RUNNER_POD_UID",
+    "RUNNER_PROCESS_GENERATION"
+  ]) {
+    assert.equal(Object.hasOwn(environment, generated), false);
+  }
+  for (const forbidden of [
+    "OPENAI_API_KEY",
+    "BOT_ORCHESTRATOR_ACCESS_KEY",
+    "BOT_RUNNER_ACCESS_KEY",
+    "RET_INTERNAL_ENDPOINT",
+    "NODE_OPTIONS",
+    "AUDIT_SENTINEL"
+  ]) {
+    assert.equal(Object.hasOwn(environment, forbidden), false);
+  }
+  assert.equal(environment.GHOST_NAVIGATION_MODE, "allowed-GHOST_NAVIGATION_MODE");
 });
 
 test("keeps the ghost allowlist synchronized with every environment value the child consumes", () => {
@@ -212,7 +250,9 @@ test("keeps Chromium as a manual diagnostic without runner authority or secret a
   assert.doesNotMatch(source, /--runner|bot_runner/);
   assert.match(source, /delete process\.env\.BOT_ORCHESTRATOR_ACCESS_KEY/);
   assert.match(source, /delete process\.env\.BOT_RUNNER_ACCESS_KEY/);
+  assert.match(source, /delete process\.env\.BOT_RUNNER_GENERATION_TOKEN/);
   assert.match(source, /delete process\.env\.OPENAI_API_KEY/);
+  assert.match(source, /delete process\.env\.RUNNER_CONTROL_URL/);
   assert.equal(internals.ghostRunnerProcessStateReason(validRunningGhostProcessState()), null);
   assert.equal(internals.ghostRunnerProcessStateReason(chromiumState), "runner_backend_invalid");
 });
@@ -238,6 +278,131 @@ test("protects internal endpoints and does not expose Express", async () => {
   const healthBody = await health.json();
   assert.equal(healthBody.runner_backend_default, "ghost");
   assert.equal(healthBody.ghost_navigation_require_navmesh, true);
+});
+
+test("runner control is bearer-authenticated, Pod-UID-bound, and generation-scoped", async () => {
+  internals.resetRuntimeStateForTests();
+  const hubSid = "runner-control-room";
+  const processGeneration = randomUUID();
+  const podUid = "33333333-3333-4333-8333-333333333333";
+  const token = createRunnerGenerationToken({
+    key: process.env.BOT_ORCHESTRATOR_ACCESS_KEY,
+    hubSid,
+    processGeneration,
+    holderId: process.env.ORCHESTRATOR_POD_UID,
+    expiresAtSeconds: Math.floor(Date.now() / 1000) + 300
+  });
+  const message = {
+    type: "bots-config",
+    bots: { enabled: true, count: 1, mobility: "static" },
+    fingerprint: JSON.stringify({ enabled: true, count: 1, mobility: "static" }),
+    processGeneration,
+    revision: 1
+  };
+  const info = {
+    isolation: "kubernetes_pod",
+    leaseHolderId: process.env.ORCHESTRATOR_POD_UID,
+    backend: "ghost",
+    lifecycle: "starting",
+    processGeneration,
+    ipcConnected: true,
+    process: {
+      pid: 1,
+      connected: true,
+      podUid,
+      podReady: false,
+      token,
+      pendingMessage: message,
+      kill: () => true
+    }
+  };
+  assert.equal(internals.setRunnerStateForTests(hubSid, info), true);
+
+  const unauthorized = await fetch(`${baseUrl}/internal/runner/v1/config`);
+  assert.equal(unauthorized.status, 401);
+
+  const headers = {
+    authorization: `Bearer ${token}`,
+    "x-yenhubs-runner-pod-uid": podUid
+  };
+  const configResponse = await fetch(`${baseUrl}/internal/runner/v1/config`, { headers });
+  assert.equal(configResponse.status, 200);
+  assert.equal(configResponse.headers.get("cache-control"), "no-store");
+  assert.deepEqual((await configResponse.json()).message, message);
+
+  assert.equal(
+    await rawStatus("/internal/runner/v1/config", {
+      authorization: [`Bearer ${token}`, `Bearer ${token}`],
+      "x-yenhubs-runner-pod-uid": podUid
+    }),
+    401
+  );
+  assert.equal(
+    await rawStatus("/internal/runner/v1/config", {
+      authorization: `Bearer ${token}`,
+      "x-yenhubs-runner-pod-uid": [podUid, podUid]
+    }),
+    401
+  );
+
+  const statusResponse = await fetch(`${baseUrl}/internal/runner/v1/status`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      message: {
+        type: "ghost-navigation-status",
+        processGeneration,
+        ready: false
+      }
+    })
+  });
+  assert.equal(statusResponse.status, 204);
+  assert.equal(info.navigationStatus, "blocked");
+
+  internals.deleteRunnerStateForTests(hubSid);
+});
+
+test("isolated runner authentication carries the real Reticulum lease shape and fence epoch", () => {
+  const processGeneration = randomUUID();
+  const info = {
+    isolation: "kubernetes_pod",
+    lifecycle: "starting",
+    processGeneration,
+    authenticated: false
+  };
+
+  assert.equal(
+    internals.applyGhostAuthStatus(info, {
+      authenticated: true,
+      processGeneration
+    }),
+    false
+  );
+  assert.equal(info.authenticated, false);
+
+  assert.equal(
+    internals.applyGhostAuthStatus(info, {
+      authenticated: true,
+      processGeneration,
+      runnerLeaseId: `${randomUUID()}:17`,
+      runnerAuthorityEpoch: 17
+    }),
+    false
+  );
+  assert.equal(info.authenticated, false);
+
+  const runnerLeaseId = randomUUID();
+  assert.equal(
+    internals.applyGhostAuthStatus(info, {
+      authenticated: true,
+      processGeneration,
+      runnerLeaseId,
+      runnerAuthorityEpoch: 17
+    }),
+    true
+  );
+  assert.equal(info.runnerLeaseId, runnerLeaseId);
+  assert.equal(info.runnerAuthorityEpoch, 17);
 });
 
 test("sends only movement-relevant config changes to an active ghost runner", () => {
@@ -334,6 +499,15 @@ test("rejects stale A-B-A acknowledgements, statuses and previous child generati
     true
   );
   assert.equal(
+    internals.acknowledgeRunnerConfig(
+      info,
+      currentA.fingerprint,
+      currentA.revision,
+      currentA.processGeneration
+    ),
+    true
+  );
+  assert.equal(
     internals.applyGhostAuthStatus(info, {
       authenticated: true,
       processGeneration: currentA.processGeneration
@@ -420,7 +594,7 @@ test("a failed managed-config send remains pending until watchdog recovery", () 
   let callback;
   const info = {
     ...validRunningGhostProcessState(),
-    lifecycle: "starting",
+    lifecycle: "running",
     startedAt: Date.now() - 10,
     configFingerprint: null,
     pendingConfigFingerprint: null,
@@ -887,6 +1061,7 @@ test("readiness preserves exact hub keys without object-prototype collisions", (
 test("the real readiness endpoint exposes the fail-closed production contract", async () => {
   internals.resetRuntimeStateForTests();
   const hubSid = "ready-contract-room";
+  const publicHubSid = internals.publicHubIdentifier(hubSid);
   const bots = {
     enabled: true,
     count: 1,
@@ -975,13 +1150,13 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
     assert.ok(body.runner_health_ttl_ms > 0);
     assert.ok(body.authoritative_snapshot_ttl_ms >= body.runner_health_ttl_ms);
     assert.ok(body.snapshot_age_ms <= body.authoritative_snapshot_ttl_ms);
-    assert.deepEqual(body.expected_hubs, [hubSid]);
-    assert.deepEqual(body.process_hubs, [hubSid]);
-    assert.deepEqual(body.active_hubs, [hubSid]);
+    assert.deepEqual(body.expected_hubs, [publicHubSid]);
+    assert.deepEqual(body.process_hubs, [publicHubSid]);
+    assert.deepEqual(body.active_hubs, [publicHubSid]);
     assert.deepEqual(body.extra_process_hubs, []);
     assert.deepEqual(body.stopping_hubs, []);
     assert.deepEqual(Object.keys(body.runner_bots), body.expected_hubs);
-    assert.deepEqual(body.runner_bots[hubSid], {
+    assert.deepEqual(body.runner_bots[publicHubSid], {
       desired: 1,
       active: 1,
       authenticated: true,
@@ -1005,9 +1180,9 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
       const blockedBody = await blocked.json();
       assert.equal(blocked.status, 503);
       assert.equal(blockedBody.ok, false);
-      assert.deepEqual(blockedBody.unready_hubs, [hubSid]);
+      assert.deepEqual(blockedBody.unready_hubs, [publicHubSid]);
       assert.deepEqual(blockedBody.active_hubs, []);
-      const observed = blockedBody.runner_bots[hubSid];
+      const observed = blockedBody.runner_bots[publicHubSid];
       assert.equal(typeof observed.navigation_ready, "boolean");
       assert.equal(typeof observed.config_applied, "boolean");
       assert.equal(observed.ready, false);
@@ -1022,11 +1197,11 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
     let blockedBody = await blocked.json();
     assert.equal(blocked.status, 503);
     assert.deepEqual(blockedBody.process_hubs, []);
-    assert.deepEqual(Object.keys(blockedBody.runner_bots), [hubSid]);
-    assert.equal(blockedBody.runner_bots[hubSid].lifecycle, "missing");
-    assert.equal(blockedBody.runner_bots[hubSid].reason, "runner_missing");
-    assert.equal(blockedBody.runner_bots[hubSid].navigation_ready, false);
-    assert.equal(blockedBody.runner_bots[hubSid].config_applied, false);
+    assert.deepEqual(Object.keys(blockedBody.runner_bots), [publicHubSid]);
+    assert.equal(blockedBody.runner_bots[publicHubSid].lifecycle, "missing");
+    assert.equal(blockedBody.runner_bots[publicHubSid].reason, "runner_missing");
+    assert.equal(blockedBody.runner_bots[publicHubSid].navigation_ready, false);
+    assert.equal(blockedBody.runner_bots[publicHubSid].config_applied, false);
 
     const withoutPid = runnerVariant();
     delete withoutPid.process.pid;
@@ -1138,7 +1313,7 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
     const uncached = await fetch(`${baseUrl}/ready`);
     const uncachedBody = await uncached.json();
     assert.equal(uncached.status, 200);
-    assert.equal(uncachedBody.runner_bots[hubSid].ready, true);
+    assert.equal(uncachedBody.runner_bots[publicHubSid].ready, true);
 
     const configMutationRunner = runnerVariant();
     assert.equal(internals.setRunnerStateForTests(hubSid, configMutationRunner), true);
@@ -1177,10 +1352,13 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
     blocked = await fetch(`${baseUrl}/ready`);
     blockedBody = await blocked.json();
     assert.equal(blocked.status, 503);
-    assert.deepEqual(blockedBody.process_hubs, [hubSid, "ready-contract-extra"].sort());
-    assert.deepEqual(blockedBody.extra_process_hubs, ["ready-contract-extra"]);
-    assert.deepEqual(blockedBody.stopping_hubs, ["ready-contract-extra"]);
-    assert.deepEqual(Object.keys(blockedBody.runner_bots), [hubSid]);
+    const publicExtraHubSid = internals.publicHubIdentifier("ready-contract-extra");
+    assert.deepEqual(blockedBody.process_hubs, [publicHubSid, publicExtraHubSid].sort());
+    assert.deepEqual(blockedBody.extra_process_hubs, [publicExtraHubSid]);
+    assert.deepEqual(blockedBody.stopping_hubs, [publicExtraHubSid]);
+    assert.deepEqual(Object.keys(blockedBody.runner_bots), [publicHubSid]);
+    assert.equal(JSON.stringify(blockedBody).includes(hubSid), false);
+    assert.equal(JSON.stringify(blockedBody).includes("ready-contract-extra"), false);
   } finally {
     internals.resetRuntimeStateForTests();
   }
@@ -1201,6 +1379,17 @@ test("runner watchdog bounds config, startup, stale-status and terminal spawn fa
       starting({
         pendingConfigFingerprint: "pending",
         pendingConfigSentAt: now - 101,
+      }),
+      now,
+      { configAckTimeoutMs: 100, startupGraceMs: 10_000 }
+    ),
+    null
+  );
+  assert.equal(
+    internals.runnerRecoveryReason(
+      starting({
+        pendingConfigFingerprint: "pending",
+        pendingConfigSentAt: now - 10_001,
       }),
       now,
       { configAckTimeoutMs: 100, startupGraceMs: 10_000 }
@@ -2383,7 +2572,8 @@ test("full snapshots validate atomically and malformed payloads preserve prior s
   const readiness = await (await fetch(`${baseUrl}/ready`)).json();
   assert.equal(health.rooms, 1);
   assert.equal(health.authoritative_snapshot_valid, false);
-  assert.deepEqual(readiness.expected_hubs, ["room-existing"]);
+  assert.deepEqual(readiness.expected_hubs, [internals.publicHubIdentifier("room-existing")]);
+  assert.equal(JSON.stringify(readiness).includes("room-existing"), false);
   assert.equal(readiness.authoritative_snapshot_ready, false);
   assert.equal(readiness.snapshot_reason, "authoritative_snapshot_invalid");
 });
@@ -2429,12 +2619,13 @@ test("configured-room snapshots are byte-bounded and reject more than ten rooms 
     }
   });
   const readiness = await (await fetch(`${baseUrl}/ready`)).json();
-  assert.deepEqual(readiness.expected_hubs, ["bounded-room-existing"]);
+  assert.deepEqual(readiness.expected_hubs, [internals.publicHubIdentifier("bounded-room-existing")]);
+  assert.equal(JSON.stringify(readiness).includes("bounded-room-existing"), false);
   assert.equal(readiness.authoritative_snapshot_ready, false);
   assert.equal(readiness.snapshot_reason, "configured_room_limit_exceeded");
 });
 
-test("room synchronization uses only the runner-scoped Reticulum credential", async () => {
+test("room synchronization uses only the parent orchestrator credential", async () => {
   internals.resetRuntimeStateForTests();
   let observedRequest;
 
@@ -2447,7 +2638,7 @@ test("room synchronization uses only the runner-scoped Reticulum credential", as
 
   assert.equal(observedRequest.url, "http://ret:4001/api-internal/v1/hubs/configured_with_bots");
   assert.deepEqual(observedRequest.headers, {
-    "x-ret-bot-runner-access-key": process.env.BOT_RUNNER_ACCESS_KEY
+    "x-ret-bot-orchestrator-access-key": process.env.BOT_ORCHESTRATOR_ACCESS_KEY
   });
 });
 
@@ -2504,7 +2695,12 @@ test("a newer POST supersedes an in-flight snapshot and coalesces one trailing f
   assert.equal(health.authoritative_snapshot_valid, true);
   assert.equal(readinessResponse.status, 503);
   assert.equal(readiness.authoritative_snapshot_ready, true);
-  assert.deepEqual(readiness.expected_hubs, ["room-new-a", "room-new-b"]);
+  assert.deepEqual(
+    readiness.expected_hubs,
+    [internals.publicHubIdentifier("room-new-a"), internals.publicHubIdentifier("room-new-b")]
+  );
+  assert.equal(JSON.stringify(readiness).includes("room-new-a"), false);
+  assert.equal(JSON.stringify(readiness).includes("room-new-b"), false);
 });
 
 test("room-stop during an in-flight snapshot cannot be resurrected by the stale response", async () => {
@@ -2587,7 +2783,8 @@ test("a fallback cannot overwrite a newer POST and readiness waits for the trail
   const body = await readiness.json();
   assert.equal(readiness.status, 503);
   assert.equal(body.authoritative_snapshot_ready, true);
-  assert.deepEqual(body.expected_hubs, [room.hub_sid]);
+  assert.deepEqual(body.expected_hubs, [internals.publicHubIdentifier(room.hub_sid)]);
+  assert.equal(JSON.stringify(body).includes(room.hub_sid), false);
 });
 
 test("room prompt validation uses the same Unicode codepoint and UTF-8 byte bounds", () => {

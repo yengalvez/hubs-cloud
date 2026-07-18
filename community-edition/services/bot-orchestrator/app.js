@@ -1,6 +1,10 @@
 const express = require("express");
-const { spawn } = require("child_process");
 const crypto = require("crypto");
+const { KubernetesRunnerManager } = require("./kubernetes-runner-manager");
+const {
+  createRunnerGenerationToken,
+  verifyRunnerGenerationToken
+} = require("./runner-generation-token");
 
 const app = express();
 app.disable("x-powered-by");
@@ -8,7 +12,6 @@ app.use(express.json({ limit: "32kb" }));
 
 const PORT = Number(process.env.PORT || 5001);
 const BOT_ORCHESTRATOR_ACCESS_KEY = process.env.BOT_ORCHESTRATOR_ACCESS_KEY || "";
-const BOT_RUNNER_ACCESS_KEY = process.env.BOT_RUNNER_ACCESS_KEY || "";
 const RUNNER_AUTOSTART = process.env.RUNNER_AUTOSTART === "true";
 const RUNNER_SCRIPT = process.env.RUNNER_SCRIPT || "";
 const RUNNER_BACKEND = (process.env.RUNNER_BACKEND || "ghost").trim().toLowerCase();
@@ -28,7 +31,7 @@ const HUBS_BASE_URL = process.env.HUBS_BASE_URL || "https://meta-hubs.org";
 const RET_INTERNAL_ENDPOINT = (process.env.RET_INTERNAL_ENDPOINT || "http://ret:4001").replace(/\/+$/, "");
 const RET_INTERNAL_PATH = process.env.RET_INTERNAL_PATH || "/api-internal/v1/hubs/configured_with_bots";
 const RET_INTERNAL_ACCESS_HEADER =
-  process.env.RET_INTERNAL_ACCESS_HEADER || "x-ret-bot-runner-access-key";
+  process.env.RET_INTERNAL_ACCESS_HEADER || "x-ret-bot-orchestrator-access-key";
 const RET_SYNC_INTERVAL_MS = parsePositiveInt(process.env.RET_SYNC_INTERVAL_MS, 30_000);
 const RET_SYNC_TIMEOUT_MS = Math.min(parsePositiveInt(process.env.RET_SYNC_TIMEOUT_MS, 5_000), 15_000);
 const RET_SNAPSHOT_TTL_MS = Math.min(parsePositiveInt(process.env.RET_SNAPSHOT_TTL_MS, 120_000), 600_000);
@@ -82,6 +85,22 @@ const RUNNER_KILL_GRACE_MS = Math.min(
   parsePositiveInt(process.env.RUNNER_KILL_GRACE_MS, 5_000),
   30_000
 );
+const RUNNER_POD_RECONCILE_INTERVAL_MS = Math.min(
+  parsePositiveInt(process.env.RUNNER_POD_RECONCILE_INTERVAL_MS, 5_000),
+  30_000
+);
+const RUNNER_TOKEN_TTL_SECONDS = Math.min(
+  parsePositiveInt(process.env.RUNNER_TOKEN_TTL_SECONDS, 3_600),
+  86_400
+);
+const POD_NAMESPACE = process.env.POD_NAMESPACE || "";
+const ORCHESTRATOR_POD_NAME = process.env.ORCHESTRATOR_POD_NAME || "";
+const ORCHESTRATOR_POD_UID = process.env.ORCHESTRATOR_POD_UID || "";
+const BOT_RUNNER_IMAGE = process.env.BOT_RUNNER_IMAGE || "";
+const RUNNER_CONTROL_URL = (process.env.RUNNER_CONTROL_URL || "http://bot-orchestrator:5001").replace(
+  /\/+$/,
+  ""
+);
 // Safety: Chromium runners are extremely expensive. Keep a hard cap of 1 chromium runner.
 const MAX_CHROMIUM_ROOMS = Math.min(parsePositiveInt(process.env.MAX_CHROMIUM_ROOMS, 1), 1);
 const HARD_MAX_BOTS_PER_ROOM = 10;
@@ -104,7 +123,7 @@ const BOT_PROMPT_BOUNDARY_WHITESPACE =
 const MAX_WAYPOINTS = 64;
 const MAX_WAYPOINT_NAME_LENGTH = 64;
 const GHOST_RUNNER_ENV_KEYS = Object.freeze([
-  "BOT_RUNNER_ACCESS_KEY",
+  "BOT_RUNNER_GENERATION_TOKEN",
   "GHOST_FEATURED_FETCH_TIMEOUT_MS",
   "GHOST_FEATURED_MAX_BYTES",
   "GHOST_FEATURED_MAX_ENTRIES",
@@ -131,6 +150,9 @@ const GHOST_RUNNER_ENV_KEYS = Object.freeze([
   "MIN_ROUTE_SEGMENT_DURATION_MS",
   "MIN_WALK_DURATION_MS",
   "PATH_START_DELAY_MS",
+  "RUNNER_CONTROL_URL",
+  "RUNNER_LEASE_HOLDER_ID",
+  "RUNNER_POD_UID",
   "RUNNER_PROCESS_GENERATION"
 ]);
 
@@ -149,6 +171,8 @@ let authoritativeSnapshotFailureReason = "authoritative_snapshot_pending";
 let activeRoomSyncPromise = null;
 let desiredStateEpoch = 0;
 let authoritativeResyncRequested = false;
+let runnerPodManager = null;
+let runnerPodManagerReady = !RUNNER_AUTOSTART;
 
 function parsePositiveInt(raw, fallback) {
   const parsed = Number(raw);
@@ -214,18 +238,36 @@ function safetyIdentifierFor(requesterId) {
   return crypto.createHmac("sha256", BOT_ORCHESTRATOR_ACCESS_KEY).update(normalized).digest("hex");
 }
 
+function publicHubIdentifier(hubSid) {
+  if (!validHubSid(hubSid) || !BOT_ORCHESTRATOR_ACCESS_KEY) return "room-invalid";
+  return `room-${crypto
+    .createHmac("sha256", BOT_ORCHESTRATOR_ACCESS_KEY)
+    .update(`probe:${hubSid}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function publicHubList(hubSids) {
+  return (Array.isArray(hubSids) ? hubSids : []).map(publicHubIdentifier);
+}
+
+function publicHubRecord(record) {
+  const result = Object.create(null);
+  for (const [hubSid, value] of Object.entries(record || {})) {
+    result[publicHubIdentifier(hubSid)] = value;
+  }
+  return result;
+}
+
 function validateRuntimeConfiguration() {
   if (BOT_ORCHESTRATOR_ACCESS_KEY.length < 32) {
     throw new Error("BOT_ORCHESTRATOR_ACCESS_KEY must be configured with at least 32 characters");
   }
-  if (BOT_RUNNER_ACCESS_KEY.length < 32) {
-    throw new Error("BOT_RUNNER_ACCESS_KEY must be configured with at least 32 characters");
-  }
-  if (safeEqual(BOT_ORCHESTRATOR_ACCESS_KEY, BOT_RUNNER_ACCESS_KEY)) {
-    throw new Error("Bot orchestrator and runner access keys must be distinct");
-  }
   if (RUNNER_AUTOSTART && normalizedBackend(RUNNER_BACKEND) !== "ghost") {
     throw new Error("Autostart supports only the authenticated ghost runner; Chromium is diagnostic-only");
+  }
+  if (RUNNER_AUTOSTART && process.env.BOT_RUNNER_ACCESS_KEY) {
+    throw new Error("The bot orchestrator must never receive the master runner access key");
   }
   if (RUNNER_AUTOSTART && GHOST_RUNNER_SCRIPT && GHOST_RUNNER_SCRIPT !== "/app/run-ghost-runner.js") {
     throw new Error("Ghost runner script path must match the audited production contract");
@@ -234,9 +276,23 @@ function validateRuntimeConfiguration() {
     RUNNER_AUTOSTART &&
     (RET_INTERNAL_ENDPOINT !== "http://ret:4001" ||
       RET_INTERNAL_PATH !== "/api-internal/v1/hubs/configured_with_bots" ||
-      RET_INTERNAL_ACCESS_HEADER !== "x-ret-bot-runner-access-key")
+      RET_INTERNAL_ACCESS_HEADER !== "x-ret-bot-orchestrator-access-key")
   ) {
     throw new Error("Reticulum sync endpoint, path and runner header must match the audited production contract");
+  }
+  if (
+    RUNNER_AUTOSTART &&
+    (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(POD_NAMESPACE) ||
+      !/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(ORCHESTRATOR_POD_NAME) ||
+      !/^[A-Za-z0-9_.:-]{1,128}$/.test(ORCHESTRATOR_POD_UID))
+  ) {
+    throw new Error("Kubernetes namespace and orchestrator Pod identity must be provided by the Downward API");
+  }
+  if (RUNNER_AUTOSTART && !/^.+@sha256:[0-9a-f]{64}$/.test(BOT_RUNNER_IMAGE)) {
+    throw new Error("BOT_RUNNER_IMAGE must be a dedicated immutable digest reference");
+  }
+  if (RUNNER_AUTOSTART && RUNNER_CONTROL_URL !== "http://bot-orchestrator:5001") {
+    throw new Error("Runner control URL must match the audited in-cluster service contract");
   }
   if (
     RUNNER_AUTOSTART &&
@@ -256,39 +312,50 @@ function normalizedBackend(value) {
   return v === "chromium" ? "chromium" : "ghost";
 }
 
-function ghostRunnerEnvironment(processGeneration, sourceEnvironment = process.env) {
+const GENERATED_RUNNER_ENV_KEYS = new Set([
+  "BOT_RUNNER_GENERATION_TOKEN",
+  "RUNNER_CONTROL_URL",
+  "RUNNER_LEASE_HOLDER_ID",
+  "RUNNER_POD_UID",
+  "RUNNER_PROCESS_GENERATION"
+]);
+
+function ghostRunnerPodEnvironment(sourceEnvironment = process.env) {
   const environment = {};
 
   for (const key of GHOST_RUNNER_ENV_KEYS) {
     if (
-      key !== "RUNNER_PROCESS_GENERATION" &&
+      !GENERATED_RUNNER_ENV_KEYS.has(key) &&
       Object.prototype.hasOwnProperty.call(sourceEnvironment, key) &&
       typeof sourceEnvironment[key] === "string"
     ) {
       environment[key] = sourceEnvironment[key];
     }
   }
-
-  environment.RUNNER_PROCESS_GENERATION = String(processGeneration);
   return environment;
 }
 
-function managedGhostSpawnSpec(hubSid, processGeneration, sourceEnvironment = process.env) {
-  return {
-    command: process.execPath,
-    args: [
-      GHOST_RUNNER_SCRIPT || "/app/run-ghost-runner.js",
-      "--url",
-      HUBS_BASE_URL,
-      "--room",
-      hubSid,
-      "--runner"
-    ],
-    options: {
-      stdio: ["ignore", "inherit", "inherit", "ipc"],
-      env: ghostRunnerEnvironment(processGeneration, sourceEnvironment)
-    }
-  };
+function createRunnerPodManager({ api } = {}) {
+  return new KubernetesRunnerManager({
+    ...(api ? { api } : {}),
+    namespace: POD_NAMESPACE,
+    ownerPodName: ORCHESTRATOR_POD_NAME,
+    ownerPodUid: ORCHESTRATOR_POD_UID,
+    runnerImage: BOT_RUNNER_IMAGE,
+    hubsBaseUrl: HUBS_BASE_URL,
+    controlUrl: RUNNER_CONTROL_URL,
+    credentialKey: BOT_ORCHESTRATOR_ACCESS_KEY,
+    runnerEnvironment: ghostRunnerPodEnvironment(),
+    tokenTtlSeconds: RUNNER_TOKEN_TTL_SECONDS,
+    maxActiveRooms: MAX_ACTIVE_ROOMS,
+    tokenFactory: claims =>
+      createRunnerGenerationToken({ key: BOT_ORCHESTRATOR_ACCESS_KEY, ...claims })
+  });
+}
+
+function getRunnerPodManager() {
+  if (!runnerPodManager) runnerPodManager = createRunnerPodManager();
+  return runnerPodManager;
 }
 
 function backendForHub(hubSid) {
@@ -641,6 +708,13 @@ function validRunnerProcessGeneration(value) {
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function validRunnerLeaseId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value
+    );
+}
+
 function nextRunnerProcessGeneration() {
   return crypto.randomUUID();
 }
@@ -671,9 +745,13 @@ function sendRunnerConfigToProcess(info, input) {
 
   const processGeneration = ensureRunnerProcessGeneration(info);
   const revision = nextRunnerConfigRevision(info);
+  const queuedAt = Date.now();
+  const deliveredImmediately = info.isolation !== "kubernetes_pod";
   info.pendingConfigFingerprint = fingerprint;
   info.pendingConfigRevision = revision;
-  info.pendingConfigSentAt = Date.now();
+  info.pendingConfigQueuedAt = queuedAt;
+  info.pendingConfigDelivered = deliveredImmediately;
+  info.pendingConfigSentAt = deliveredImmediately ? queuedAt : 0;
   info.activeBots = 0;
   info.authoritativeSpawnAcks = false;
   info.ready = false;
@@ -713,17 +791,35 @@ function acknowledgeRunnerConfig(info, fingerprint, revision, processGeneration)
     typeof fingerprint !== "string" ||
     !validRunnerConfigRevision(revision) ||
     !validRunnerProcessGeneration(processGeneration) ||
-    info.processGeneration !== processGeneration ||
-    info.pendingConfigFingerprint !== fingerprint ||
-    info.pendingConfigRevision !== revision
+    info.processGeneration !== processGeneration
   ) {
+    return false;
+  }
+  if (
+    !info.pendingConfigFingerprint &&
+    info.pendingConfigRevision == null &&
+    info.configFingerprint === fingerprint &&
+    info.configRevision === revision
+  ) {
+    return true;
+  }
+  if (info.pendingConfigFingerprint !== fingerprint || info.pendingConfigRevision !== revision) {
     return false;
   }
   info.configFingerprint = fingerprint;
   info.configRevision = revision;
   info.pendingConfigFingerprint = null;
   info.pendingConfigRevision = null;
+  info.pendingConfigQueuedAt = 0;
+  info.pendingConfigDelivered = false;
   info.pendingConfigSentAt = 0;
+  if (
+    info.process?.pendingMessage?.fingerprint === fingerprint &&
+    info.process.pendingMessage?.revision === revision &&
+    info.process.pendingMessage?.processGeneration === processGeneration
+  ) {
+    info.process.pendingMessage = null;
+  }
   return true;
 }
 
@@ -742,6 +838,21 @@ function applyGhostAuthStatus(info, message) {
     return false;
   }
   info.authenticated = !!(message && message.authenticated === true);
+  if (info.authenticated) {
+    info.runnerLeaseId = validRunnerLeaseId(message.runnerLeaseId)
+      ? message.runnerLeaseId
+      : null;
+    info.runnerAuthorityEpoch = Number.isSafeInteger(message.runnerAuthorityEpoch) &&
+      message.runnerAuthorityEpoch > 0
+      ? message.runnerAuthorityEpoch
+      : null;
+    if (
+      info.isolation === "kubernetes_pod" &&
+      (info.runnerLeaseId === null || info.runnerAuthorityEpoch === null)
+    ) {
+      info.authenticated = false;
+    }
+  }
   if (!info.authenticated) {
     info.activeBots = 0;
     info.authoritativeSpawnAcks = false;
@@ -749,8 +860,12 @@ function applyGhostAuthStatus(info, message) {
     info.botStatusReason = "unauthenticated";
     info.readySince = 0;
     info.terminalStatusAt = 0;
+    info.runnerLeaseId = null;
+    info.runnerAuthorityEpoch = null;
   }
-  return info.authenticated;
+  return info.authenticated &&
+    (info.isolation !== "kubernetes_pod" ||
+      (info.runnerLeaseId !== null && info.runnerAuthorityEpoch !== null));
 }
 
 function applyGhostRuntimeStatus(info, message, nowMs = Date.now()) {
@@ -872,6 +987,10 @@ function ghostRunnerProcessStateReason(info) {
     child.connected !== true
   ) {
     return "config_channel_disconnected";
+  }
+  if (info.isolation === "kubernetes_pod") {
+    if (typeof child.podUid !== "string" || !child.podUid) return "runner_pod_uid_pending";
+    if (child.podReady !== true) return "runner_pod_not_ready";
   }
   return null;
 }
@@ -1308,7 +1427,9 @@ function runnerStateForHub(hubSid) {
 }
 
 function canAutostartRunners() {
-  return RUNNER_AUTOSTART && normalizedBackend(RUNNER_BACKEND) === "ghost";
+  return RUNNER_AUTOSTART &&
+    normalizedBackend(RUNNER_BACKEND) === "ghost" &&
+    runnerPodManagerReady;
 }
 
 function canStartMoreRunnersForBackend(backend) {
@@ -1737,19 +1858,33 @@ function runnerRecoveryReason(
     return "runner_start_clock_invalid";
   }
 
-  if (
-    hasOwnDataProperty(info, "pendingConfigSentAt") &&
-    invalidOptionalRunnerTimestamp(info.pendingConfigSentAt, nowMs)
-  ) {
-    return "config_ack_clock_invalid";
-  }
-
-  if (
-    info.pendingConfigFingerprint &&
-    (!hasOwnDataProperty(info, "pendingConfigSentAt") ||
-      invalidRequiredRunnerTimestamp(info.pendingConfigSentAt, nowMs))
-  ) {
-    return "config_ack_clock_invalid";
+  const isolatedConfigPending = info.isolation === "kubernetes_pod" && info.pendingConfigFingerprint;
+  const configDelivered = !isolatedConfigPending || info.pendingConfigDelivered === true;
+  if (isolatedConfigPending && !configDelivered) {
+    if (
+      !hasOwnDataProperty(info, "pendingConfigQueuedAt") ||
+      invalidRequiredRunnerTimestamp(info.pendingConfigQueuedAt, nowMs)
+    ) {
+      return "config_delivery_clock_invalid";
+    }
+    const deliveryTimeoutMs = info.lifecycle === "starting" ? startupGraceMs : configAckTimeoutMs;
+    if (nowMs - info.pendingConfigQueuedAt >= deliveryTimeoutMs) {
+      return "config_delivery_timeout";
+    }
+  } else {
+    if (
+      hasOwnDataProperty(info, "pendingConfigSentAt") &&
+      invalidOptionalRunnerTimestamp(info.pendingConfigSentAt, nowMs)
+    ) {
+      return "config_ack_clock_invalid";
+    }
+    if (
+      info.pendingConfigFingerprint &&
+      (!hasOwnDataProperty(info, "pendingConfigSentAt") ||
+        invalidRequiredRunnerTimestamp(info.pendingConfigSentAt, nowMs))
+    ) {
+      return "config_ack_clock_invalid";
+    }
   }
 
   if (
@@ -1775,11 +1910,13 @@ function runnerRecoveryReason(
     return "terminal_status_clock_invalid";
   }
 
+  const currentConfigAckTimeoutMs = info.lifecycle === "starting" ? startupGraceMs : configAckTimeoutMs;
   if (
     info.pendingConfigFingerprint &&
+    configDelivered &&
     Number.isFinite(info.pendingConfigSentAt) &&
     info.pendingConfigSentAt > 0 &&
-    nowMs - info.pendingConfigSentAt >= configAckTimeoutMs
+    nowMs - info.pendingConfigSentAt >= currentConfigAckTimeoutMs
   ) {
     return "config_ack_timeout";
   }
@@ -2047,7 +2184,10 @@ function handleRunnerExit(
   return restartTimers.has(hubSid) ? "restart_scheduled" : "stopped";
 }
 
-function startRunner(hubSid, { spawnProcess = spawn } = {}) {
+function startRunner(
+  hubSid,
+  { createPodHandle = (roomSid, processGeneration) => getRunnerPodManager().create(roomSid, processGeneration) } = {}
+) {
   if (!canAutostartRunners()) return false;
   if (roomRunners.has(hubSid)) return true;
   if (runnerRestartTimers.has(hubSid)) return false;
@@ -2055,8 +2195,8 @@ function startRunner(hubSid, { spawnProcess = spawn } = {}) {
   if (!canStartMoreRunnersForBackend("ghost")) return false;
 
   const processGeneration = nextRunnerProcessGeneration();
-  const spawnSpec = managedGhostSpawnSpec(hubSid, processGeneration);
-  const child = spawnProcess(spawnSpec.command, spawnSpec.args, spawnSpec.options);
+  const child = createPodHandle(hubSid, processGeneration);
+  if (!child) return false;
   const generation = nextRunnerGeneration(hubSid);
 
   const info = {
@@ -2065,6 +2205,10 @@ function startRunner(hubSid, { spawnProcess = spawn } = {}) {
     backend,
     generation,
     processGeneration,
+    isolation: "kubernetes_pod",
+    leaseHolderId: ORCHESTRATOR_POD_UID || null,
+    runnerLeaseId: null,
+    runnerAuthorityEpoch: null,
     nextConfigRevision: 0,
     ipcConnected: child.connected === true,
     lifecycle: "starting",
@@ -2074,6 +2218,8 @@ function startRunner(hubSid, { spawnProcess = spawn } = {}) {
     configRevision: null,
     pendingConfigFingerprint: null,
     pendingConfigRevision: null,
+    pendingConfigQueuedAt: 0,
+    pendingConfigDelivered: false,
     pendingConfigSentAt: 0,
     restartDelayMs: RUNNER_RESTART_BASE_MS,
     restartTimer: null,
@@ -2213,8 +2359,8 @@ async function performActiveRoomSync({
   sourceEpoch = desiredStateEpoch
 } = {}) {
   const headers = {};
-  if (BOT_RUNNER_ACCESS_KEY) {
-    headers[RET_INTERNAL_ACCESS_HEADER] = BOT_RUNNER_ACCESS_KEY;
+  if (BOT_ORCHESTRATOR_ACCESS_KEY) {
+    headers[RET_INTERNAL_ACCESS_HEADER] = BOT_ORCHESTRATOR_ACCESS_KEY;
   }
 
   const primaryEndpoint = `${RET_INTERNAL_ENDPOINT}${RET_INTERNAL_PATH}`;
@@ -2311,9 +2457,21 @@ function syncActiveRoomsFromReticulum(options = {}) {
   return pending;
 }
 
+function exactSingleHeader(req, headerName) {
+  if (!Array.isArray(req?.rawHeaders)) return null;
+  const normalized = headerName.toLowerCase();
+  const values = [];
+  for (let index = 0; index + 1 < req.rawHeaders.length; index += 2) {
+    if (String(req.rawHeaders[index]).toLowerCase() === normalized) {
+      values.push(String(req.rawHeaders[index + 1]));
+    }
+  }
+  return values.length === 1 ? values[0] : null;
+}
+
 function authorized(req) {
   return safeEqual(
-    req.get("x-ret-bot-orchestrator-access-key") || "",
+    exactSingleHeader(req, "x-ret-bot-orchestrator-access-key") || "",
     BOT_ORCHESTRATOR_ACCESS_KEY
   );
 }
@@ -2327,6 +2485,87 @@ function authMiddleware(req, res, next) {
   next();
 }
 
+function runnerControlAuthorization(req) {
+  const authorization = exactSingleHeader(req, "authorization") || "";
+  if (!authorization.startsWith("Bearer ")) return null;
+  const token = authorization.slice("Bearer ".length);
+  const podUid = exactSingleHeader(req, "x-yenhubs-runner-pod-uid") || "";
+  const claims = verifyRunnerGenerationToken(token, BOT_ORCHESTRATOR_ACCESS_KEY, {
+    holderId: ORCHESTRATOR_POD_UID || null
+  });
+  if (!claims) return null;
+
+  const info = roomRunners.get(claims.hub_sid);
+  if (
+    !info ||
+    info.isolation !== "kubernetes_pod" ||
+    info.lifecycle === "stopping" ||
+    info.processGeneration !== claims.process_generation ||
+    info.leaseHolderId !== claims.holder_id ||
+    !info.process ||
+    typeof info.process.podUid !== "string" ||
+    !safeEqual(podUid, info.process.podUid) ||
+    !safeEqual(token, info.process.token)
+  ) {
+    return null;
+  }
+  return { claims, info };
+}
+
+function runnerControlMiddleware(req, res, next) {
+  const authorization = runnerControlAuthorization(req);
+  if (!authorization) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  req.runnerControl = authorization;
+  next();
+}
+
+app.get("/internal/runner/v1/config", runnerControlMiddleware, (req, res) => {
+  const { info } = req.runnerControl;
+  info.ipcConnected = true;
+  info.process.connected = true;
+  if (info.process.pendingMessage && info.pendingConfigDelivered !== true) {
+    info.pendingConfigDelivered = true;
+    info.pendingConfigSentAt = Date.now();
+  }
+  res.set("cache-control", "no-store");
+  res.json({
+    ok: true,
+    process_generation: info.processGeneration,
+    message: info.process.pendingMessage ? JSON.parse(JSON.stringify(info.process.pendingMessage)) : null
+  });
+});
+
+app.post("/internal/runner/v1/status", runnerControlMiddleware, (req, res) => {
+  const { claims, info } = req.runnerControl;
+  const message = req.body?.message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    res.status(400).json({ error: "invalid_status" });
+    return;
+  }
+  if (message.processGeneration !== claims.process_generation) {
+    res.status(409).json({ error: "stale_generation" });
+    return;
+  }
+  info.ipcConnected = true;
+  info.process.connected = true;
+  if (!handleRunnerIpcMessage(claims.hub_sid, info, message)) {
+    res.status(409).json({ error: "status_rejected" });
+    return;
+  }
+  res.status(204).end();
+});
+
+// Kubernetes uses transport readiness, not full bot readiness, so the Service
+// can carry the authenticated control traffic that is itself required to make
+// /ready true. This gate opens only after startup orphan cleanup.
+app.get("/transport-ready", (_req, res) => {
+  const ready = !RUNNER_AUTOSTART || runnerPodManagerReady;
+  res.status(ready ? 200 : 503).json({ ok: ready });
+});
+
 app.get("/health", (_req, res) => {
   const { runner_backends, runner_navigation, runner_bots, active_hubs } =
     runnerHealthSnapshot(roomRunners);
@@ -2337,6 +2576,7 @@ app.get("/health", (_req, res) => {
     rooms: roomConfigs.size,
     active_rooms: active_hubs.length,
     runner_processes: roomRunners.size,
+    runner_pods: roomRunners.size,
     queued_rooms: queuedRunnerHubs.length,
     max_active_rooms: MAX_ACTIVE_ROOMS,
     runner_health_ttl_ms: RUNNER_HEALTH_TTL_MS,
@@ -2350,14 +2590,14 @@ app.get("/health", (_req, res) => {
     llm_enabled: !!OPENAI_API_KEY,
     model: OPENAI_MODEL,
     runner_backend_default: normalizedBackend(RUNNER_BACKEND),
-    runner_backend_canary_hubs: RUNNER_BACKEND_CANARY_HUBS,
+    runner_backend_canary_room_count: CANARY_HUB_SET.size,
     ghost_navigation_mode: GHOST_NAVIGATION_MODE,
     ghost_navigation_require_navmesh: GHOST_NAVIGATION_REQUIRE_NAVMESH,
-    runner_backends,
-    runner_navigation,
-    runner_bots,
-    active_hubs,
-    queued_hubs: [...queuedRunnerHubs]
+    runner_backends: publicHubRecord(runner_backends),
+    runner_navigation: publicHubRecord(runner_navigation),
+    runner_bots: publicHubRecord(runner_bots),
+    active_hubs: publicHubList(active_hubs),
+    queued_hubs: publicHubList(queuedRunnerHubs)
   });
 });
 
@@ -2371,15 +2611,15 @@ app.get("/ready", (_req, res) => {
     capacity_exceeded: readiness.capacity_exceeded,
     configured_room_count: readiness.configured_room_count,
     max_active_rooms: readiness.max_active_rooms,
-    expected_hubs: readiness.expected_hubs,
-    unready_hubs: readiness.unready_hubs,
-    process_hubs: readiness.process_hubs,
-    extra_process_hubs: readiness.extra_process_hubs,
-    stopping_hubs: readiness.stopping_hubs,
-    active_hubs: readiness.health.active_hubs,
+    expected_hubs: publicHubList(readiness.expected_hubs),
+    unready_hubs: publicHubList(readiness.unready_hubs),
+    process_hubs: publicHubList(readiness.process_hubs),
+    extra_process_hubs: publicHubList(readiness.extra_process_hubs),
+    stopping_hubs: publicHubList(readiness.stopping_hubs),
+    active_hubs: publicHubList(readiness.health.active_hubs),
     runner_health_ttl_ms: RUNNER_HEALTH_TTL_MS,
     authoritative_snapshot_ttl_ms: RET_SNAPSHOT_TTL_MS,
-    runner_bots: readiness.runner_bots
+    runner_bots: publicHubRecord(readiness.runner_bots)
   });
 });
 
@@ -2580,15 +2820,36 @@ function startServer(port = PORT) {
 
   let syncTimer = null;
   let watchdogTimer = null;
+  let podReconcileTimer = null;
+  let managerFatalHandler = null;
   let supervisorRestartScheduled = false;
+
+  const requestSupervisorRestart = () => {
+    if (supervisorRestartScheduled) return;
+    supervisorRestartScheduled = true;
+    runnerPodManagerReady = false;
+    setImmediate(() => process.exit(1));
+  };
 
   const server = app.listen(port, () => {
     console.log(`bot-orchestrator listening on :${server.address().port}`);
 
     if (RUNNER_AUTOSTART) {
-      syncActiveRoomsFromReticulum().catch(error => {
-        console.warn("Initial active room sync failed unexpectedly.", error.name || "Error");
-      });
+      const manager = getRunnerPodManager();
+      managerFatalHandler = error => {
+        console.warn("Runner Pod manager failed closed.", error?.name || "Error");
+        requestSupervisorRestart();
+      };
+      manager.on("fatal", managerFatalHandler);
+      manager.cleanupOrphans()
+        .then(() => {
+          runnerPodManagerReady = true;
+          return syncActiveRoomsFromReticulum();
+        })
+        .catch(error => {
+          console.warn("Runner Pod startup reconciliation failed closed.", error.name || "Error");
+          requestSupervisorRestart();
+        });
 
       syncTimer = setInterval(() => {
         syncActiveRoomsFromReticulum().catch(error => {
@@ -2597,14 +2858,20 @@ function startServer(port = PORT) {
       }, RET_SYNC_INTERVAL_MS);
       syncTimer.unref();
 
+      podReconcileTimer = setInterval(() => {
+        manager.reconcile()
+          .catch(error => {
+            console.warn("Runner Pod reconciliation failed closed.", error.name || "Error");
+            requestSupervisorRestart();
+          });
+      }, RUNNER_POD_RECONCILE_INTERVAL_MS);
+      podReconcileTimer.unref();
+
       watchdogTimer = setInterval(() => {
         const recoveries = superviseRunners();
         recoveries.forEach(({ hubSid, reason, action }) => {
           console.warn(`Runner recovery scheduled hub=${hubSid} reason=${reason}`);
-          if (action === "supervisor_restart_required" && !supervisorRestartScheduled) {
-            supervisorRestartScheduled = true;
-            setImmediate(() => process.exit(1));
-          }
+          if (action === "supervisor_restart_required") requestSupervisorRestart();
         });
       }, RUNNER_WATCHDOG_INTERVAL_MS);
       watchdogTimer.unref();
@@ -2614,6 +2881,11 @@ function startServer(port = PORT) {
   server.on("close", () => {
     if (syncTimer) clearInterval(syncTimer);
     if (watchdogTimer) clearInterval(watchdogTimer);
+    if (podReconcileTimer) clearInterval(podReconcileTimer);
+    if (runnerPodManager) {
+      if (managerFatalHandler) runnerPodManager.off("fatal", managerFatalHandler);
+      runnerPodManager.close();
+    }
   });
 
   return server;
@@ -2635,6 +2907,7 @@ function resetRuntimeStateForTests() {
   activeRoomSyncPromise = null;
   desiredStateEpoch = 0;
   authoritativeResyncRequested = false;
+  runnerPodManagerReady = !RUNNER_AUTOSTART;
   lastRateLimitPruneAt = 0;
 }
 
@@ -2703,21 +2976,23 @@ module.exports = {
     cancelRunnerRestart,
     detectWaypointAction,
     deleteRunnerStateForTests,
+    exactSingleHeader,
     fetchRoomSnapshot,
     ghostRunnerProcessStateReason,
     handleRunnerIpcMessage,
     handleRunnerExit,
     handleRunnerIpcDisconnect,
     handleRunnerProcessError,
-    ghostRunnerEnvironment,
+    createRunnerPodManager,
+    ghostRunnerPodEnvironment,
     invalidateAuthoritativeSnapshot,
-    managedGhostSpawnSpec,
     maxActiveForBackend,
     normalizeConfig,
     nextRunnerRestartDelay,
     parseRoomSnapshot,
     parseOpenAIResponsePayload,
     parseStructuredReply,
+    publicHubIdentifier,
     recoverUnsignalableRunner,
     registerDesiredStateMutation,
     runnerConfigFingerprint,

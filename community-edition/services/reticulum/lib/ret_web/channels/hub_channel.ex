@@ -80,7 +80,9 @@ defmodule RetWeb.HubChannel do
 
   defp perform_join(socket, hub, context, params) do
     bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
-    has_valid_bot_access_key = secure_compare(params["bot_access_key"], bot_access_key)
+
+    has_valid_bot_access_key =
+      valid_bot_runner_credential?(params["bot_access_key"], bot_access_key, hub.hub_sid)
 
     with {:ok, context, authenticated_bot_runner} <-
            authenticate_bot_runner_context(context, has_valid_bot_access_key) do
@@ -1302,6 +1304,11 @@ defmodule RetWeb.HubChannel do
   end
 
   defp secure_compare(_, _), do: false
+
+  defp valid_bot_runner_credential?(provided, legacy_key, hub_sid) do
+    secure_compare(provided, legacy_key) or
+      match?({:ok, _claims}, Ret.BotRunnerGenerationToken.verify(provided, hub_sid))
+  end
 
   defp authenticate_bot_runner_context(context, has_valid_bot_access_key) when is_map(context) do
     case Map.get(context, "bot_runner") do
