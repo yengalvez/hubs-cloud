@@ -596,7 +596,7 @@ function verifyReticulumBotRunnerAuthorityContract(deployment) {
   const spec = deployment && deployment.spec;
   if (!spec || spec.replicas !== 1) {
     errors.push(
-      "Deployment/reticulum must set replicas exactly to numeric 1 while bot-runner authority is process-local"
+      "Deployment/reticulum must set replicas exactly to numeric 1 until multi-replica readiness, endpoints, and ret-pvc RWO placement are staged"
     );
   }
 
@@ -621,7 +621,7 @@ function verifyNoReticulumHorizontalPodAutoscaler(resources) {
     const name = resource?.metadata?.name || "<unnamed>";
     return (
       `HorizontalPodAutoscaler/${name} must not target Reticulum while ` +
-      "bot-runner authority is process-local"
+      "multi-replica readiness, endpoints, and ret-pvc RWO placement are unstaged"
     );
   });
 }

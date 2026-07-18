@@ -422,7 +422,7 @@ test("keeps the tracked production template on the exact ghost runtime contract"
   assert.deepEqual(verifyBotOrchestratorIsolationContract(deployment), []);
 });
 
-test("keeps Reticulum singleton while bot-runner authority is process-local", () => {
+test("keeps Reticulum singleton until multi-replica storage and operational gates are staged", () => {
   const deployment = { spec: { replicas: 1, strategy: { type: "Recreate" } } };
   assert.deepEqual(verifyReticulumBotRunnerAuthorityContract(deployment), []);
 

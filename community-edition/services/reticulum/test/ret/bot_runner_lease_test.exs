@@ -1,300 +1,513 @@
+defmodule Ret.BotRunnerLeaseTest.ControlledStore do
+  @behaviour Ret.BotRunnerLease.Store
+
+  def acquire(agent, hub_sid, lease_id, holder_id, session_id, _ttl_seconds) do
+    Agent.get_and_update(agent, fn state ->
+      cond do
+        state.mode == :database_unavailable ->
+          {{:error, :database_unavailable}, state}
+
+        state.active ->
+          {{:error, :unavailable}, state}
+
+        true ->
+          epoch = state.epoch + 1
+
+          active = %{
+            epoch: epoch,
+            holder_instance_id: holder_id,
+            hub_sid: hub_sid,
+            lease_id: lease_id,
+            session_id: session_id
+          }
+
+          {{:ok, %{epoch: epoch}}, %{state | active: active, epoch: epoch}}
+      end
+    end)
+  end
+
+  def renew(agent, hub_sid, lease_id, holder_id, session_id, epoch, _ttl_seconds) do
+    state = Agent.get(agent, & &1)
+    gate = state.renew_gate
+
+    cond do
+      state.mode == :database_unavailable ->
+        {:error, :database_unavailable}
+
+      gate ->
+        {test_pid, reference} = gate
+        send(test_pid, {:renew_started, reference, self()})
+
+        receive do
+          {:finish_stale_renewal, ^reference} -> :ok
+        end
+
+        {:ok, %{epoch: epoch}}
+
+      true ->
+        if exact_active?(agent, hub_sid, lease_id, holder_id, session_id, epoch),
+          do: {:ok, %{epoch: epoch}},
+          else: {:error, :lost}
+    end
+  end
+
+  def with_authority(agent, hub_sid, lease_id, holder_id, session_id, epoch, fun) do
+    if exact_active?(agent, hub_sid, lease_id, holder_id, session_id, epoch),
+      do: {:ok, fun.()},
+      else: {:error, :not_authoritative}
+  end
+
+  def with_current_authority(agent, hub_sid, fun) do
+    case Agent.get(agent, & &1.active) do
+      %{hub_sid: ^hub_sid} = active -> {:ok, fun.(active)}
+      _ -> {:error, :not_authoritative}
+    end
+  end
+
+  def release(agent, hub_sid, lease_id, holder_id, session_id, epoch) do
+    Agent.get_and_update(agent, fn state ->
+      if exact?(state.active, hub_sid, lease_id, holder_id, session_id, epoch) do
+        fenced_epoch = state.epoch + 1
+        {{:ok, fenced_epoch}, %{state | active: nil, epoch: fenced_epoch}}
+      else
+        {{:ok, nil}, state}
+      end
+    end)
+  end
+
+  def revoke(agent, _hub_sid) do
+    Agent.get_and_update(agent, fn state ->
+      fenced_epoch = state.epoch + 1
+      {{:ok, fenced_epoch}, %{state | active: nil, epoch: fenced_epoch}}
+    end)
+  end
+
+  def current(agent, hub_sid) do
+    case Agent.get(agent, & &1.active) do
+      %{hub_sid: ^hub_sid} = active -> {:ok, active}
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp exact_active?(agent, hub_sid, lease_id, holder_id, session_id, epoch) do
+    agent
+    |> Agent.get(& &1.active)
+    |> exact?(hub_sid, lease_id, holder_id, session_id, epoch)
+  end
+
+  defp exact?(active, hub_sid, lease_id, holder_id, session_id, epoch) do
+    active && active.hub_sid == hub_sid && active.lease_id == lease_id &&
+      active.holder_instance_id == holder_id && active.session_id == session_id &&
+      active.epoch == epoch
+  end
+end
+
 defmodule Ret.BotRunnerLeaseTest do
-  use ExUnit.Case, async: false
+  use Ret.DataCase
 
+  import Ret.TestHelpers
+
+  alias Ecto.Adapters.SQL
   alias Ret.BotRunnerLease
-  alias RetWeb.HubChannel
+  alias Ret.BotRunnerLease.PostgresStore
 
-  test "revocation fences every lease in a room before best-effort runner shutdown" do
-    hub_sid = "lease-revoke-#{System.unique_integer([:positive])}"
-    {:ok, lease} = BotRunnerLease.register(hub_sid)
+  setup [:create_account, :create_owned_file, :create_scene, :create_hub]
 
-    assert BotRunnerLease.authorized?(hub_sid, lease.lease_id, lease.authority_epoch)
-    assert :ok = BotRunnerLease.revoke(hub_sid)
+  test "revocation consumes a global epoch and rejects the old exact fence", %{hub: hub} do
+    session_id = Ecto.UUID.generate()
+    {:ok, lease} = BotRunnerLease.register_for_session(hub.hub_sid, session_id)
+
+    assert {:ok, :executed} =
+             BotRunnerLease.with_authority(
+               hub.hub_sid,
+               lease.lease_id,
+               lease.authority_epoch,
+               fn -> :executed end
+             )
+
+    assert :ok = BotRunnerLease.revoke(hub.hub_sid)
 
     assert_receive {:bot_runner_lease_authority, lease_id, revoked_epoch, false}
     assert lease_id == lease.lease_id
     assert revoked_epoch > lease.authority_epoch
-    refute BotRunnerLease.authorized?(hub_sid, lease.lease_id, lease.authority_epoch)
-    assert BotRunnerLease.snapshot(hub_sid) == nil
-    assert :ok = BotRunnerLease.unregister(hub_sid, lease.lease_id)
+
+    assert {:error, :not_authoritative} =
+             BotRunnerLease.with_authority(
+               hub.hub_sid,
+               lease.lease_id,
+               lease.authority_epoch,
+               fn -> flunk("a revoked fence executed") end
+             )
+
+    assert BotRunnerLease.snapshot(hub.hub_sid) == nil
   end
 
-  test "a paused older registration remains authoritative before Presence publication" do
-    hub_sid = "lease-probe-#{System.unique_integer([:positive])}"
-    parent = self()
+  test "two coordinators elect one authority and expiry takeover fences stale renew and release",
+       %{
+         hub: hub
+       } do
+    first_holder = Ecto.UUID.generate()
+    second_holder = Ecto.UUID.generate()
+    first = start_coordinator(holder_id: first_holder)
+    second = start_coordinator(holder_id: second_holder)
+    first_session = Ecto.UUID.generate()
+    second_session = Ecto.UUID.generate()
 
-    older_pid =
-      spawn(fn ->
-        {:ok, lease} = BotRunnerLease.register(hub_sid)
-        send(parent, {:older_registered_before_presence, self(), lease})
+    {:ok, first_lease} =
+      BotRunnerLease.register_for_session(first, hub.hub_sid, first_session)
 
-        receive do
-          :publish_presence ->
-            send(parent, {:older_presence_published, lease})
+    assert {:error, :lease_unavailable} =
+             BotRunnerLease.register_for_session(second, hub.hub_sid, second_session)
 
-            receive do
-              :stop -> :ok
-            end
-        end
-      end)
+    force_expiry!(hub.hub_id)
 
-    assert_receive {:older_registered_before_presence, ^older_pid, older_lease}
-    {:ok, newer_lease} = BotRunnerLease.register(hub_sid)
+    {:ok, second_lease} =
+      BotRunnerLease.register_for_session(second, hub.hub_sid, second_session)
 
-    assert older_lease.authoritative
-    refute newer_lease.authoritative
-    assert newer_lease.authority_epoch == older_lease.authority_epoch
+    assert second_lease.authority_epoch > first_lease.authority_epoch
 
-    assert %{
-             authority_lease_id: authority_lease_id,
-             authority_epoch: authority_epoch,
-             leases: leases
-           } = BotRunnerLease.snapshot(hub_sid)
+    assert {:error, :not_authoritative} =
+             BotRunnerLease.with_authority(
+               first,
+               hub.hub_sid,
+               first_lease.lease_id,
+               first_lease.authority_epoch,
+               fn -> flunk("expired authority executed after takeover") end
+             )
 
-    assert authority_lease_id == older_lease.lease_id
-    assert authority_epoch == older_lease.authority_epoch
-    assert Enum.map(leases, & &1.lease_id) == [older_lease.lease_id, newer_lease.lease_id]
+    assert {:error, :lost} =
+             PostgresStore.renew(
+               Repo,
+               hub.hub_sid,
+               first_lease.lease_id,
+               first_holder,
+               first_session,
+               first_lease.authority_epoch,
+               15
+             )
 
-    refute BotRunnerLease.authorized?(
-             hub_sid,
-             newer_lease.lease_id,
-             newer_lease.authority_epoch
-           )
+    assert {:ok, nil} =
+             PostgresStore.release(
+               Repo,
+               hub.hub_sid,
+               first_lease.lease_id,
+               first_holder,
+               first_session,
+               first_lease.authority_epoch
+             )
 
-    # This mirrors the exact async gap: the newer runner has published
-    # Presence while the older registered channel is deliberately paused.
-    newer_only_presence = %{
-      "newer" => %{
-        metas: [
-          %{
-            context: %{"bot_runner" => true},
-            bot_runner_lease_id: newer_lease.lease_id,
-            bot_runner_join_order: newer_lease.join_order,
-            bot_runner_authority_epoch: newer_lease.authority_epoch,
-            bot_runner_authoritative: false
-          }
-        ]
-      }
-    }
+    assert {:ok, :current} =
+             BotRunnerLease.with_authority(
+               second,
+               hub.hub_sid,
+               second_lease.lease_id,
+               second_lease.authority_epoch,
+               fn -> :current end
+             )
 
-    assert HubChannel.authoritative_bot_runner_lease_id(newer_only_presence) == nil
-
-    send(older_pid, :publish_presence)
-    assert_receive {:older_presence_published, ^older_lease}
-    send(older_pid, :stop)
-
-    promoted = wait_for_authority(hub_sid, newer_lease.lease_id)
-    assert promoted.authority_epoch > older_lease.authority_epoch
-
-    refute BotRunnerLease.authorized?(
-             hub_sid,
-             newer_lease.lease_id,
-             older_lease.authority_epoch
-           )
-
-    assert BotRunnerLease.authorized?(
-             hub_sid,
-             newer_lease.lease_id,
-             promoted.authority_epoch
-           )
-
-    :ok = BotRunnerLease.unregister(hub_sid, newer_lease.lease_id)
+    assert :ok = BotRunnerLease.unregister(second, hub.hub_sid, second_lease.lease_id)
   end
 
-  test "simultaneous registrations yield one process-bound authority and unique tokens" do
-    hub_sid = "lease-race-#{System.unique_integer([:positive])}"
+  test "twelve simultaneous replica coordinators yield exactly one lease", %{hub: hub} do
     parent = self()
 
-    owners =
-      for index <- 1..12 do
-        spawn(fn ->
+    coordinators =
+      for _index <- 1..12 do
+        start_coordinator(holder_id: Ecto.UUID.generate())
+      end
+
+    tasks =
+      Enum.map(coordinators, fn coordinator ->
+        Task.async(fn ->
           receive do
-            :register ->
-              {:ok, lease} = BotRunnerLease.register(hub_sid)
-              send(parent, {:registered, index, self(), lease})
+            :acquire -> :ok
+          end
 
-              receive do
-                {:check_authority, epoch} ->
-                  send(
-                    parent,
-                    {:authority_result, index, self(), lease,
-                     BotRunnerLease.authorized?(hub_sid, lease.lease_id, epoch)}
-                  )
+          result =
+            BotRunnerLease.register_for_session(
+              coordinator,
+              hub.hub_sid,
+              Ecto.UUID.generate()
+            )
 
-                  receive do
-                    :stop -> :ok
-                  end
+          send(parent, {:acquisition_result, self(), coordinator, result})
+
+          receive do
+            :release ->
+              case result do
+                {:ok, lease} ->
+                  BotRunnerLease.unregister(coordinator, hub.hub_sid, lease.lease_id)
+
+                _ ->
+                  :ok
               end
           end
         end)
-      end
-
-    Enum.each(owners, &send(&1, :register))
-
-    registrations =
-      for _ <- owners do
-        assert_receive {:registered, index, owner_pid, lease}
-        {index, owner_pid, lease}
-      end
-
-    tokens = Enum.map(registrations, fn {_index, _pid, lease} -> lease.lease_id end)
-    assert MapSet.size(MapSet.new(tokens)) == length(tokens)
-
-    snapshot = BotRunnerLease.snapshot(hub_sid)
-    assert length(snapshot.leases) == length(owners)
-
-    Enum.each(registrations, fn {_index, owner_pid, _lease} ->
-      send(owner_pid, {:check_authority, snapshot.authority_epoch})
-    end)
-
-    authority_results =
-      for _ <- registrations do
-        assert_receive {:authority_result, index, owner_pid, lease, authorized}, 1_000
-        {index, owner_pid, lease, authorized}
-      end
-
-    authorized =
-      for {index, owner_pid, lease, true} <- authority_results,
-          do: {index, owner_pid, lease}
-
-    assert [{_index, leader_pid, leader_lease}] = authorized
-
-    refute BotRunnerLease.authorized?(hub_sid, leader_lease.lease_id, snapshot.authority_epoch)
-
-    send(leader_pid, :stop)
-    successor = wait_for_different_authority(hub_sid, leader_lease.lease_id)
-    assert successor.authority_epoch > snapshot.authority_epoch
-
-    Enum.each(owners -- [leader_pid], &send(&1, :stop))
-  end
-
-  test "a lease crash atomically replaces Lease, Endpoint and Presence" do
-    assert_atomic_runtime_restart(BotRunnerLease)
-  end
-
-  test "an Endpoint crash atomically replaces Lease, Endpoint and Presence" do
-    assert_atomic_runtime_restart(RetWeb.Endpoint)
-  end
-
-  test "a Presence crash atomically replaces Lease, Endpoint and Presence" do
-    assert_atomic_runtime_restart(RetWeb.Presence)
-  end
-
-  defp wait_for_authority(hub_sid, lease_id, attempts \\ 100)
-
-  defp wait_for_authority(_hub_sid, _lease_id, 0), do: flunk("lease was not promoted")
-
-  defp wait_for_authority(hub_sid, lease_id, attempts) do
-    case BotRunnerLease.snapshot(hub_sid) do
-      %{authority_lease_id: ^lease_id} = snapshot ->
-        snapshot
-
-      _ ->
-        Process.sleep(10)
-        wait_for_authority(hub_sid, lease_id, attempts - 1)
-    end
-  end
-
-  defp wait_for_different_authority(hub_sid, previous_lease_id, attempts \\ 100)
-
-  defp wait_for_different_authority(_hub_sid, _previous_lease_id, 0),
-    do: flunk("successor was not promoted")
-
-  defp wait_for_different_authority(hub_sid, previous_lease_id, attempts) do
-    case BotRunnerLease.snapshot(hub_sid) do
-      %{authority_lease_id: lease_id} = snapshot when lease_id != previous_lease_id ->
-        snapshot
-
-      _ ->
-        Process.sleep(10)
-        wait_for_different_authority(hub_sid, previous_lease_id, attempts - 1)
-    end
-  end
-
-  defp assert_atomic_runtime_restart(crashed_name) do
-    hub_sid = "runtime-supervisor-recovery-#{System.unique_integer([:positive])}"
-    presence_key = "normal-presence-#{System.unique_integer([:positive])}"
-    repo_pid = Process.whereis(Ret.Repo)
-    previous_pids = runtime_pids()
-
-    assert is_pid(repo_pid)
-    assert Enum.all?(Map.values(previous_pids), &is_pid/1)
-
-    tracker_pid =
-      spawn(fn ->
-        Process.flag(:trap_exit, true)
-
-        receive do
-          :stop -> :ok
-        end
       end)
 
-    {:ok, old_lease} = BotRunnerLease.register(hub_sid)
-    assert old_lease.authoritative
-    assert BotRunnerLease.authorized?(hub_sid, old_lease.lease_id, old_lease.authority_epoch)
+    Enum.each(tasks, &send(&1.pid, :acquire))
 
-    {:ok, _presence_ref} =
-      RetWeb.Presence.track(tracker_pid, "ret", presence_key, %{hub_id: hub_sid})
+    results =
+      for _task <- tasks do
+        assert_receive {:acquisition_result, task_pid, coordinator, result}, 2_000
+        {task_pid, coordinator, result}
+      end
 
-    assert wait_for_presence(presence_key, true)
+    assert 1 ==
+             Enum.count(results, fn {_pid, _coordinator, result} -> match?({:ok, _}, result) end)
+
+    assert 11 ==
+             Enum.count(results, fn {_pid, _coordinator, result} ->
+               result == {:error, :lease_unavailable}
+             end)
+
+    Enum.each(tasks, &send(&1.pid, :release))
+    Enum.each(tasks, &Task.await(&1, 2_000))
+  end
+
+  test "database unavailability fails registration closed without a local fallback", %{hub: hub} do
+    {:ok, agent} =
+      Agent.start_link(fn ->
+        %{active: nil, epoch: 0, mode: :database_unavailable, renew_gate: nil}
+      end)
+
+    coordinator =
+      start_coordinator(
+        holder_id: Ecto.UUID.generate(),
+        repo: agent,
+        store: Ret.BotRunnerLeaseTest.ControlledStore
+      )
+
+    assert {:error, :lease_database_unavailable} =
+             BotRunnerLease.register_for_session(
+               coordinator,
+               hub.hub_sid,
+               Ecto.UUID.generate()
+             )
+
+    assert BotRunnerLease.snapshot(coordinator, hub.hub_sid) == nil
+  end
+
+  test "database loss during renewal fences locally and tells the owner to disconnect", %{
+    hub: hub
+  } do
+    {:ok, agent} =
+      Agent.start_link(fn ->
+        %{active: nil, epoch: 0, mode: :ok, renew_gate: nil}
+      end)
+
+    coordinator =
+      start_coordinator(
+        holder_id: Ecto.UUID.generate(),
+        repo: agent,
+        store: Ret.BotRunnerLeaseTest.ControlledStore
+      )
+
+    {:ok, lease} =
+      BotRunnerLease.register_for_session(coordinator, hub.hub_sid, Ecto.UUID.generate())
+
+    Agent.update(agent, &%{&1 | mode: :database_unavailable})
+    assert :ok = BotRunnerLease.renew_now(coordinator)
+
+    assert_receive {:bot_runner_lease_database_unavailable, lease_id}
+    assert lease_id == lease.lease_id
+    assert_receive {:bot_runner_lease_authority, ^lease_id, _epoch, false}
+    assert BotRunnerLease.snapshot(coordinator, hub.hub_sid) == nil
+  end
+
+  test "a delayed successful renewal response cannot revive a replaced fence", %{hub: hub} do
+    {:ok, agent} =
+      Agent.start_link(fn ->
+        %{active: nil, epoch: 0, mode: :ok, renew_gate: nil}
+      end)
+
+    coordinator =
+      start_coordinator(
+        holder_id: Ecto.UUID.generate(),
+        repo: agent,
+        store: Ret.BotRunnerLeaseTest.ControlledStore
+      )
+
+    {:ok, lease} =
+      BotRunnerLease.register_for_session(coordinator, hub.hub_sid, Ecto.UUID.generate())
+
+    reference = make_ref()
+    test_pid = self()
+    Agent.update(agent, &%{&1 | renew_gate: {test_pid, reference}})
+    renewal = Task.async(fn -> BotRunnerLease.renew_now(coordinator) end)
+
+    assert_receive {:renew_started, ^reference, renewal_pid}
+
+    Agent.update(agent, fn state ->
+      %{state | active: nil, epoch: state.epoch + 1, renew_gate: nil}
+    end)
+
+    send(renewal_pid, {:finish_stale_renewal, reference})
+    assert :ok = Task.await(renewal)
+
+    assert {:error, :not_authoritative} =
+             BotRunnerLease.with_authority(
+               coordinator,
+               hub.hub_sid,
+               lease.lease_id,
+               lease.authority_epoch,
+               fn -> flunk("stale renewal response revived authority") end
+             )
+  end
+
+  test "revoke waits for an in-flight fenced callback and no stale callback starts after it", %{
+    hub: hub
+  } do
+    parent = self()
+
+    owner =
+      Task.async(fn ->
+        {:ok, lease} =
+          BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+
+        send(parent, {:callback_lease, self(), lease})
+
+        receive do
+          :run_callback -> :ok
+        end
+
+        result =
+          BotRunnerLease.with_authority(
+            hub.hub_sid,
+            lease.lease_id,
+            lease.authority_epoch,
+            fn ->
+              send(parent, :fenced_callback_entered)
+
+              receive do
+                :finish_callback -> :ok
+              end
+
+              send(parent, :fenced_side_effect)
+              :delivered
+            end
+          )
+
+        send(parent, {:fenced_callback_result, result})
+        :ok
+      end)
+
+    assert_receive {:callback_lease, owner_pid, lease}
+    send(owner_pid, :run_callback)
+    assert_receive :fenced_callback_entered
+
+    revoker =
+      Task.async(fn ->
+        send(parent, :revoke_started)
+        result = BotRunnerLease.revoke(hub.hub_sid)
+        send(parent, {:revoke_finished, result})
+        :ok
+      end)
+
+    assert_receive :revoke_started
+    refute_receive {:revoke_finished, _result}, 0
+
+    send(owner_pid, :finish_callback)
+    assert_receive :fenced_side_effect
+    assert_receive {:fenced_callback_result, {:ok, :delivered}}
+    assert_receive {:revoke_finished, :ok}
+
+    assert :ok = Task.await(owner)
+    assert :ok = Task.await(revoker)
+
+    assert {:error, :not_authoritative} =
+             BotRunnerLease.with_authority(
+               hub.hub_sid,
+               lease.lease_id,
+               lease.authority_epoch,
+               fn -> flunk("callback started after revoke") end
+             )
+  end
+
+  test "a lease crash replaces the runtime group and waits for durable expiry", %{hub: hub} do
+    assert_atomic_runtime_restart(BotRunnerLease, hub)
+  end
+
+  test "an Endpoint crash replaces the runtime group and waits for durable expiry", %{hub: hub} do
+    assert_atomic_runtime_restart(RetWeb.Endpoint, hub)
+  end
+
+  test "a Presence crash replaces the runtime group and waits for durable expiry", %{hub: hub} do
+    assert_atomic_runtime_restart(RetWeb.Presence, hub)
+  end
+
+  defp assert_atomic_runtime_restart(crashed_name, hub) do
+    old_holder = BotRunnerLease.holder_id()
+    previous_pids = runtime_pids()
+
+    {:ok, old_lease} =
+      BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
 
     monitors =
       Map.new(previous_pids, fn {name, pid} ->
         {name, Process.monitor(pid)}
       end)
 
-    crashed_child_pid = runtime_child_pid(crashed_name)
-    assert is_pid(crashed_child_pid)
-    GenServer.stop(crashed_child_pid, :shutdown)
+    GenServer.stop(runtime_child_pid(crashed_name), :shutdown)
 
     Enum.each(previous_pids, fn {name, pid} ->
       monitor_ref = Map.fetch!(monitors, name)
       assert_receive {:DOWN, ^monitor_ref, :process, ^pid, _reason}, 5_000
     end)
 
-    replacement_pids =
-      Map.new(previous_pids, fn {name, previous_pid} ->
-        {name, wait_for_replacement(name, previous_pid)}
-      end)
+    Enum.each(previous_pids, fn {name, previous_pid} ->
+      replacement = wait_for_replacement(name, previous_pid)
+      assert Process.alive?(replacement)
+    end)
 
-    assert Enum.all?(replacement_pids, fn {name, pid} ->
-             is_pid(pid) and pid != Map.fetch!(previous_pids, name) and Process.alive?(pid)
-           end)
+    refute BotRunnerLease.holder_id() == old_holder
 
-    assert Process.whereis(Ret.Repo) == repo_pid
-    refute BotRunnerLease.authorized?(hub_sid, old_lease.lease_id, old_lease.authority_epoch)
-    assert BotRunnerLease.snapshot(hub_sid) == nil
-
-    # Presence cannot reconstruct a surviving channel's state. Only a fresh
-    # client/channel track (the reconnect boundary) republishes the session.
-    refute wait_for_presence(presence_key, false)
-
-    {:ok, _presence_ref} =
-      RetWeb.Presence.track(tracker_pid, "ret", presence_key, %{hub_id: hub_sid})
-
-    assert wait_for_presence(presence_key, true)
-
-    {:ok, recovered_lease} = BotRunnerLease.register(hub_sid)
-    assert recovered_lease.authoritative
-    assert recovered_lease.authority_epoch > old_lease.authority_epoch
-
-    assert BotRunnerLease.authorized?(
-             hub_sid,
-             recovered_lease.lease_id,
-             recovered_lease.authority_epoch
+    refute BotRunnerLease.authorized?(
+             hub.hub_sid,
+             old_lease.lease_id,
+             old_lease.authority_epoch
            )
 
-    :ok = BotRunnerLease.unregister(hub_sid, recovered_lease.lease_id)
-    :ok = RetWeb.Presence.untrack(tracker_pid, "ret", presence_key)
-    send(tracker_pid, :stop)
+    assert {:error, :lease_unavailable} =
+             BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+
+    force_expiry!(hub.hub_id)
+    {:ok, recovered} = BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+    assert recovered.authority_epoch > old_lease.authority_epoch
+    assert :ok = BotRunnerLease.unregister(hub.hub_sid, recovered.lease_id)
   end
 
-  defp runtime_pids do
-    %{
-      BotRunnerLease => Process.whereis(BotRunnerLease),
-      RetWeb.Endpoint => Process.whereis(RetWeb.Endpoint),
-      RetWeb.Presence => Process.whereis(RetWeb.Presence)
-    }
+  test "authority sequence is globally JavaScript-safe and cannot cycle" do
+    assert %{rows: [[9_007_199_254_740_991, false]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT seqmax, seqcycle
+               FROM pg_sequence
+               WHERE seqrelid = 'ret0.bot_runner_authority_epoch_seq'::regclass
+               """,
+               []
+             )
+  end
+
+  defp start_coordinator(opts) do
+    {:ok, pid} =
+      BotRunnerLease.start_link(Keyword.merge([name: nil, renew_interval_ms: 60_000], opts))
+
+    pid
+  end
+
+  defp force_expiry!(hub_id) do
+    %{num_rows: 1} =
+      SQL.query!(
+        Repo,
+        """
+        UPDATE ret0.bot_runner_leases
+        SET expires_at = timezone('UTC', clock_timestamp()) - INTERVAL '1 second'
+        WHERE hub_id = $1
+        """,
+        [hub_id]
+      )
   end
 
   defp runtime_child_pid(name) do
@@ -306,19 +519,12 @@ defmodule Ret.BotRunnerLeaseTest do
     end)
   end
 
-  defp wait_for_presence(key, expected, attempts \\ 100)
-
-  defp wait_for_presence(_key, expected, 0), do: !expected
-
-  defp wait_for_presence(key, expected, attempts) do
-    present? = Map.has_key?(RetWeb.Presence.list("ret"), key)
-
-    if present? == expected do
-      present?
-    else
-      Process.sleep(10)
-      wait_for_presence(key, expected, attempts - 1)
-    end
+  defp runtime_pids do
+    %{
+      BotRunnerLease => Process.whereis(BotRunnerLease),
+      RetWeb.Endpoint => Process.whereis(RetWeb.Endpoint),
+      RetWeb.Presence => Process.whereis(RetWeb.Presence)
+    }
   end
 
   defp wait_for_replacement(name, previous_pid, attempts \\ 200)
@@ -332,8 +538,10 @@ defmodule Ret.BotRunnerLeaseTest do
         pid
 
       _ ->
-        Process.sleep(10)
-        wait_for_replacement(name, previous_pid, attempts - 1)
+        receive do
+        after
+          10 -> wait_for_replacement(name, previous_pid, attempts - 1)
+        end
     end
   end
 end

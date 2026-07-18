@@ -119,14 +119,17 @@ Kubernetes clusters can also be managed via GUI programs.  Here are some possibi
 ### YenHubs bot authority and waypoint-reservation rollout
 
 The complete YenHubs profile currently keeps Reticulum at exactly one replica
-with the exact `Recreate` deployment strategy. Bot-runner authority is
-process-local, so overlapping Reticulum pods could each authorize a runner for
-the same room. Generated-manifest verification rejects any other replica count,
-rolling-update fields, or a HorizontalPodAutoscaler targeting Reticulum. This
-reduces overlap during the standard rollout and deliberately accepts controlled
-Reticulum downtime. It is not fencing against node partitions or a stuck old
-process. Abort whenever inventory shows more than one Reticulum pod or Endpoint;
-full exclusivity still requires a database-backed lease with a fencing token.
+with the exact `Recreate` deployment strategy. Bot-runner authority now uses a
+shared PostgreSQL lease and fencing epoch, so the singleton deployment setting
+is no longer the authority primitive. Generated-manifest verification still
+rejects any other replica count, rolling-update fields, or a
+HorizontalPodAutoscaler targeting Reticulum because readiness, Endpoint checks
+and the `ret-pvc` RWO placement constraint have not yet been staged for two
+cold replicas. This topology deliberately accepts controlled Reticulum downtime.
+Abort whenever inventory shows more than one Reticulum pod or Endpoint until a
+separate rollout proves the multi-replica storage and operational gates and
+updates the tracked generator and verifier. Do not remove the singleton boundary
+merely because database fencing is present.
 
 The bot trust boundary uses four distinct credentials. The historical
 `BOT_ACCESS_KEY` remains scoped to integration routes such as hub bindings and

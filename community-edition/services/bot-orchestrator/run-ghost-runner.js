@@ -1993,6 +1993,43 @@ function authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId) {
   return authority && authority.leaseId === leaseId ? authority.authorityEpoch : 0;
 }
 
+function authenticatedRunnerAuthorityFence(presence, sessionId, leaseId) {
+  const authorityEpoch = authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId);
+  return authorityEpoch ? { leaseId, authorityEpoch } : null;
+}
+
+function botCommandMatchesRunnerFence(payload, authorityFence) {
+  return !!(
+    payload &&
+    typeof payload === "object" &&
+    authorityFence &&
+    typeof authorityFence.leaseId === "string" &&
+    authorityFence.leaseId &&
+    Number.isSafeInteger(authorityFence.authorityEpoch) &&
+    authorityFence.authorityEpoch > 0 &&
+    Object.prototype.hasOwnProperty.call(payload, "bot_runner_lease_id") &&
+    Object.prototype.hasOwnProperty.call(payload, "bot_runner_authority_epoch") &&
+    payload.bot_runner_lease_id === authorityFence.leaseId &&
+    payload.bot_runner_authority_epoch === authorityFence.authorityEpoch
+  );
+}
+
+function applyFencedBotCommand(payload, authorityFence, bots, startWalking, nowMs) {
+  if (!payload || payload.type !== "bot_command") return false;
+  if (!botCommandMatchesRunnerFence(payload, authorityFence)) return false;
+
+  const body = payload.body;
+  if (!body || typeof body !== "object") return false;
+  const botId = body.bot_id || body.botId;
+  if (!botId) return false;
+  const record = bots.get(botId);
+  if (!record || record.mobility === "static") return false;
+  if (body.type !== "go_to_waypoint" || !body.waypoint) return false;
+
+  startWalking(record, String(body.waypoint), nowMs);
+  return true;
+}
+
 function waitForAuthenticatedRunnerPresence(presence, sessionId, leaseId, timeoutMs = 5000) {
   const initialEpoch = authenticatedRunnerAuthorityEpoch(presence, sessionId, leaseId);
   if (initialEpoch) return Promise.resolve(initialEpoch);
@@ -2194,14 +2231,15 @@ async function main() {
   }
 
   const presence = new Presence(channel);
-  let runnerAuthorityEpoch;
+  let runnerAuthorityFence;
   try {
-    runnerAuthorityEpoch = await waitForAuthenticatedRunnerPresence(
+    const runnerAuthorityEpoch = await waitForAuthenticatedRunnerPresence(
       presence,
       sessionId,
       runnerLeaseId,
       5000
     );
+    runnerAuthorityFence = { leaseId: runnerLeaseId, authorityEpoch: runnerAuthorityEpoch };
   } catch (error) {
     socket.disconnect();
     throw error;
@@ -2461,7 +2499,7 @@ async function main() {
       spawnAttempts.set(botId, attempt);
       pendingSpawns.set(botId, pending);
 
-      requestBotSpawn(channel, payload, runnerAuthorityEpoch)
+      requestBotSpawn(channel, payload, runnerAuthorityFence.authorityEpoch)
         .then(() => {
           if (pendingSpawns.get(botId) !== pending) {
             spawnCleanup.observeAmbiguousSettlement(pending);
@@ -2837,17 +2875,13 @@ async function main() {
 
   // Handle commands from bot chat.
   channel.on("message", payload => {
-    if (!payload || payload.type !== "bot_command") return;
-    const body = payload.body;
-    if (!body || typeof body !== "object") return;
-    const botId = body.bot_id || body.botId;
-    if (!botId) return;
-    const record = bots.get(botId);
-    if (!record) return;
-    if (record.mobility === "static") return;
-    if (body.type === "go_to_waypoint" && body.waypoint) {
-      startWalking(record, String(body.waypoint), timekeeper.nowMs());
-    }
+    applyFencedBotCommand(
+      payload,
+      runnerAuthorityFence,
+      bots,
+      startWalking,
+      timekeeper.nowMs()
+    );
   });
 
   // Update config on hub refresh (room settings).
@@ -2890,11 +2924,17 @@ async function main() {
   // Presence / late joiners. Losing the authenticated self-presence is fatal:
   // the orchestrator will restart and reauthenticate before another spawn.
   presence.onSync(() => {
-    if (!presenceHasAuthenticatedBotRunner(presence, sessionId, runnerLeaseId)) {
+    const nextAuthorityFence = authenticatedRunnerAuthorityFence(
+      presence,
+      sessionId,
+      runnerLeaseId
+    );
+    if (!nextAuthorityFence) {
       log("Authenticated bot-runner presence was lost; exiting.");
       process.exit(1);
       return;
     }
+    runnerAuthorityFence = nextAuthorityFence;
     const keys = presence.list(key => key) || [];
     const currentOccupants = new Set();
 
@@ -3150,6 +3190,8 @@ if (require.main === module) {
 module.exports = {
   main,
   internals: {
+    applyFencedBotCommand,
+    authenticatedRunnerAuthorityFence,
     authoritativeBotRunnerLeaseId,
     applyHubRefreshSceneChange,
     cancelPendingSpawnsForTransition,
@@ -3172,6 +3214,7 @@ module.exports = {
     navigationReady,
     normalizeBotsConfig,
     parseManagedConfigMessage,
+    botCommandMatchesRunnerFence,
     parseGlbJson,
     presenceHasAuthenticatedBotRunner,
     projectWaypointsToNavmesh,

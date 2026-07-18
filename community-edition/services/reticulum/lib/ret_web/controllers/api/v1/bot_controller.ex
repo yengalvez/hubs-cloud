@@ -3,7 +3,15 @@ defmodule RetWeb.Api.V1.BotController do
 
   import Canada, only: [can?: 2]
 
-  alias Ret.{AppConfig, BotChatPresence, BotConfigApproval, BotOrchestrator, Hub, Repo}
+  alias Ret.{
+    AppConfig,
+    BotChatPresence,
+    BotConfigApproval,
+    BotOrchestrator,
+    BotRunnerLease,
+    Hub,
+    Repo
+  }
 
   @max_message_length 800
   @max_waypoints 64
@@ -106,18 +114,22 @@ defmodule RetWeb.Api.V1.BotController do
     action = normalize_action(map_get(response, "action"))
 
     BotConfigApproval.with_current_runtime_decision(hub_id, approval_decision, fn ->
-      if action do
-        RetWeb.Endpoint.broadcast("hub:#{hub_sid}", "message", %{
-          type: "bot_command",
-          body: Map.put(action, "bot_id", bot_id),
-          session_id: "reticulum",
-          from_session_id: "reticulum"
-        })
-      end
+      BotRunnerLease.with_current_authority(hub_sid, fn fence ->
+        if action do
+          RetWeb.Endpoint.broadcast("hub:#{hub_sid}", "message", %{
+            type: "bot_command",
+            body: Map.put(action, "bot_id", bot_id),
+            session_id: "reticulum",
+            from_session_id: "reticulum",
+            bot_runner_lease_id: fence.lease_id,
+            bot_runner_authority_epoch: fence.authority_epoch
+          })
+        end
 
-      conn
-      |> put_resp_content_type("application/json")
-      |> send_resp(200, Poison.encode!(%{reply: reply, action: action}))
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Poison.encode!(%{reply: reply, action: action}))
+      end)
     end)
   end
 
