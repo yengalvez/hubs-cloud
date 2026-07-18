@@ -199,6 +199,48 @@ function handleImageOverrides(processedConfig, replacedContent) {
   return `${yamlDocuments.map(doc => YAML.stringify(doc, {"lineWidth": 0, "directives": false})).join('---\n')}`;
 }
 
+function handleRunnerActivation(processedConfig, replacedContent) {
+  const yamlDocuments = YAML.parseAllDocuments(replacedContent);
+  const resources = yamlDocuments.map(document => document.toJS());
+  for (let index = 0; index < resources.length; index += 1) {
+    const resource = resources[index];
+    if (
+      (processedConfig.BOT_RUNNER_ACTIVATION_PHASE === "bootstrap" ||
+        processedConfig.BOT_RUNNER_RECOVERY_PHASE === "restore-fence") &&
+      resource?.kind === "Role" &&
+      resource?.metadata?.namespace === "hcce-bot-runners" &&
+      resource?.metadata?.name === "bot-orchestrator-runner-pods"
+    ) {
+      resource.rules = [];
+      yamlDocuments[index] = new YAML.Document(resource);
+    }
+  }
+
+  const priority = resource => {
+    const kind = resource?.kind;
+    const name = resource?.metadata?.name;
+    const namespace = resource?.metadata?.namespace || "";
+    if (kind === "Namespace" && name !== "hcce-bot-runners") return 0;
+    if (kind === "Namespace" && name === "hcce-bot-runners") return 1;
+    if (kind === "Secret") return 2;
+    if (kind === "ValidatingAdmissionPolicy" && name === "bot-runner-pods.yenhubs.org") return 10;
+    if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-runner-pods.yenhubs.org") return 11;
+    if (["ServiceAccount", "ResourceQuota", "NetworkPolicy"].includes(kind) &&
+        (namespace === "hcce-bot-runners" || name === "bot-orchestrator")) return 12;
+    if (kind === "Role" && namespace !== "hcce-bot-runners" && name === "bot-orchestrator-runner-pods") return 20;
+    if (kind === "RoleBinding" && namespace !== "hcce-bot-runners" && name === "bot-orchestrator-runner-pods") return 21;
+    if (kind === "Role" && namespace === "hcce-bot-runners" && name === "bot-orchestrator-runner-pods") return 22;
+    if (kind === "RoleBinding" && namespace === "hcce-bot-runners" && name === "bot-orchestrator-runner-pods") return 23;
+    if (kind === "Deployment" && name === "bot-orchestrator") return 30;
+    return 100;
+  };
+  return yamlDocuments
+    .map((document, index) => ({ document, index, priority: priority(document.toJS()) }))
+    .sort((left, right) => left.priority - right.priority || left.index - right.index)
+    .map(({ document }) => YAML.stringify(document, { lineWidth: 0, directives: false }))
+    .join("---\n");
+}
+
 // Main function to handle the script
 function main() {
   try {
@@ -206,6 +248,31 @@ function main() {
     // Values are already parsed YAML scalars. Do not reinterpret user-provided
     // strings as templates: a secret containing `$NAME` must remain literal.
     const processedConfig = utils.readConfig(inputPath);
+
+    const runnerActivationPhase = String(
+      processedConfig.BOT_RUNNER_ACTIVATION_PHASE || "bootstrap"
+    );
+    if (!["bootstrap", "admission", "active"].includes(runnerActivationPhase)) {
+      throw new Error("BOT_RUNNER_ACTIVATION_PHASE must be exactly bootstrap, admission, or active");
+    }
+    processedConfig.BOT_RUNNER_ACTIVATION_PHASE = runnerActivationPhase;
+    const runnerRecoveryPhase = String(processedConfig.BOT_RUNNER_RECOVERY_PHASE || "active");
+    if (!["active", "restore-fence"].includes(runnerRecoveryPhase)) {
+      throw new Error("BOT_RUNNER_RECOVERY_PHASE must be exactly active or restore-fence");
+    }
+    processedConfig.BOT_RUNNER_RECOVERY_PHASE = runnerRecoveryPhase;
+    const recoveryIsActive = runnerRecoveryPhase === "active";
+    processedConfig.RETICULUM_REPLICAS = recoveryIsActive ? 1 : 0;
+    processedConfig.PGBOUNCER_REPLICAS = recoveryIsActive ? 1 : 0;
+    processedConfig.PGBOUNCER_T_REPLICAS = recoveryIsActive ? 1 : 0;
+    processedConfig.COTURN_REPLICAS = recoveryIsActive ? 1 : 0;
+    processedConfig.BOT_ORCHESTRATOR_REPLICAS =
+      recoveryIsActive && runnerActivationPhase === "active" ? 1 : 0;
+    const runnerRecoveryEpoch = String(processedConfig.BOT_RUNNER_RECOVERY_EPOCH || "");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(runnerRecoveryEpoch)) {
+      throw new Error("BOT_RUNNER_RECOVERY_EPOCH must be a canonical lowercase UUID v4");
+    }
+    processedConfig.BOT_RUNNER_RECOVERY_EPOCH = runnerRecoveryEpoch;
 
     // Backward compatibility for older local files that still use OPENAI.
     if (!processedConfig.OPENAI_API_KEY && processedConfig.OPENAI) {
@@ -349,6 +416,7 @@ function main() {
     replacedContent = generatePersistentVolumes(processedConfig, replacedContent);
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
+    replacedContent = handleRunnerActivation(processedConfig, replacedContent);
 
     utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);
 

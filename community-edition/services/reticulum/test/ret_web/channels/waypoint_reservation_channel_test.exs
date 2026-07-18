@@ -197,19 +197,21 @@ defmodule RetWeb.WaypointReservationChannelTest do
       })
       |> BotConfigAdmission.update(admin)
 
-    bot_key = String.duplicate("test-bot-key-", 3)
-    old_key = Application.get_env(:ret, :bot_runner_access_key)
-    Application.put_env(:ret, :bot_runner_access_key, bot_key)
+    orchestrator_key = String.duplicate("test-orchestrator-key-", 2)
+    old_key = Application.get_env(:ret, :bot_orchestrator_access_key)
+    Application.put_env(:ret, :bot_orchestrator_access_key, orchestrator_key)
 
     on_exit(fn ->
       if old_key == nil,
-        do: Application.delete_env(:ret, :bot_runner_access_key),
-        else: Application.put_env(:ret, :bot_runner_access_key, old_key)
+        do: Application.delete_env(:ret, :bot_orchestrator_access_key),
+        else: Application.put_env(:ret, :bot_orchestrator_access_key, old_key)
     end)
+
+    generation_token = runner_generation_token(hub.hub_sid, orchestrator_key)
 
     params =
       join_params(SecureRandom.uuid())
-      |> Map.put("bot_access_key", bot_key)
+      |> Map.put("bot_access_key", generation_token)
       |> Map.put("context", %{"bot_runner" => true})
 
     {:ok, response, bot_socket} =
@@ -320,5 +322,25 @@ defmodule RetWeb.WaypointReservationChannelTest do
       "reservation_id" => Keyword.get(opts, :reservation_id, SecureRandom.uuid()),
       "request_seq" => sequence
     }
+  end
+
+  defp runner_generation_token(hub_sid, key) do
+    payload = %{
+      "v" => 1,
+      "aud" => "yenhubs-bot-runner",
+      "hub_sid" => hub_sid,
+      "process_generation" => Ecto.UUID.generate(),
+      "holder_id" => Ecto.UUID.generate(),
+      "recovery_epoch" => "44444444-4444-4444-8444-444444444444",
+      "exp" => System.system_time(:second) + 300
+    }
+
+    encoded_payload = payload |> Jason.encode!() |> Base.url_encode64(padding: false)
+
+    signature =
+      :crypto.mac(:hmac, :sha256, key, "v1.#{encoded_payload}")
+      |> Base.url_encode64(padding: false)
+
+    "v1.#{encoded_payload}.#{signature}"
   end
 end

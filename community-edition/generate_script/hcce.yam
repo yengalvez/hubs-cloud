@@ -6,6 +6,18 @@ metadata:
     domain: "$HUB_DOMAIN"
     adm: "$ADM_EMAIL"
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hcce-bot-runners
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.34
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: v1.34
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: v1.34
+---
 ########################################################################
 ###################### configs #########################################
 ########################################################################
@@ -46,6 +58,15 @@ kind: Secret
 metadata:
   name: bot-images-pull
   namespace: "$Namespace"
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: "$BOT_IMAGE_PULL_CONFIG_JSON_BASE64"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bot-images-pull
+  namespace: hcce-bot-runners
 type: kubernetes.io/dockerconfigjson
 data:
   .dockerconfigjson: "$BOT_IMAGE_PULL_CONFIG_JSON_BASE64"
@@ -327,6 +348,7 @@ data:
     bot_access_key = "<BOT_ACCESS_KEY>"
     bot_runner_access_key = "<BOT_RUNNER_ACCESS_KEY>"
     bot_orchestrator_access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"
+    bot_runner_recovery_epoch = "<BOT_RUNNER_RECOVERY_EPOCH>"
     max_active_bot_rooms = <MAX_ACTIVE_ROOMS>
     # pgrest_host = ""
     # ita_host = ""
@@ -442,11 +464,12 @@ metadata:
   namespace: $Namespace
   annotations:
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 spec:
   # BotRunnerLease has PostgreSQL fencing, but this complete profile remains singleton
   # until readiness/endpoints and the ret-pvc RWO constraint pass a separate staged
   # two-replica rollout. Manifest verification also continues to reject Reticulum HPAs.
-  replicas: 1
+  replicas: $RETICULUM_REPLICAS
   selector:
     matchLabels:
       app: reticulum
@@ -464,6 +487,7 @@ spec:
         yenhubs.org/bot-access-key-checksum: "$BOT_ACCESS_KEY_CHECKSUM"
         yenhubs.org/bot-runner-access-key-checksum: "$BOT_RUNNER_ACCESS_KEY_CHECKSUM"
         yenhubs.org/bot-orchestrator-access-key-checksum: "$BOT_ORCHESTRATOR_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-runner-recovery-epoch: "$BOT_RUNNER_RECOVERY_EPOCH"
         yenhubs.org/dashboard-access-key-checksum: "$DASHBOARD_ACCESS_KEY_CHECKSUM"
         yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
@@ -620,6 +644,8 @@ spec:
             secretKeyRef:
               name: configs
               key: BOT_ORCHESTRATOR_ACCESS_KEY
+        - name: turkeyCfg_BOT_RUNNER_RECOVERY_EPOCH
+          value: "$BOT_RUNNER_RECOVERY_EPOCH"
         - name: turkeyCfg_MAX_ACTIVE_ROOMS
           value: "$MAX_ACTIVE_ROOMS"
         - name: turkeyCfg_DASHBOARD_ACCESS_KEY
@@ -709,8 +735,11 @@ metadata:
   namespace: $Namespace
   annotations:
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+    yenhubs.org/runner-activation-phase: "$BOT_RUNNER_ACTIVATION_PHASE"
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
+    yenhubs.org/bot-runner-recovery-epoch: "$BOT_RUNNER_RECOVERY_EPOCH"
 spec:
-  replicas: 1
+  replicas: $BOT_ORCHESTRATOR_REPLICAS
   # A second orchestrator must never overlap the authenticated runner lease.
   strategy:
     type: Recreate
@@ -723,6 +752,7 @@ spec:
         app: bot-orchestrator
       annotations:
         yenhubs.org/bot-orchestrator-access-key-checksum: "$BOT_ORCHESTRATOR_ACCESS_KEY_CHECKSUM"
+        yenhubs.org/bot-runner-recovery-epoch: "$BOT_RUNNER_RECOVERY_EPOCH"
     spec:
       serviceAccountName: bot-orchestrator
       automountServiceAccountToken: true
@@ -777,11 +807,15 @@ spec:
           value: /app/run-bot.js
         - name: BOT_RUNNER_IMAGE
           value: "$BOT_RUNNER_IMAGE"
+        - name: BOT_RUNNER_RECOVERY_EPOCH
+          value: "$BOT_RUNNER_RECOVERY_EPOCH"
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
               apiVersion: v1
               fieldPath: metadata.namespace
+        - name: RUNNER_POD_NAMESPACE
+          value: hcce-bot-runners
         - name: ORCHESTRATOR_POD_NAME
           valueFrom:
             fieldRef:
@@ -793,7 +827,7 @@ spec:
               apiVersion: v1
               fieldPath: metadata.uid
         - name: RUNNER_CONTROL_URL
-          value: http://bot-orchestrator:5001
+          value: http://bot-orchestrator.$Namespace.svc.cluster.local:5001
         - name: RUNNER_POD_RECONCILE_INTERVAL_MS
           value: "5000"
         - name: RUNNER_TOKEN_TTL_SECONDS
@@ -920,7 +954,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: bot-runner
-  namespace: $Namespace
+  namespace: hcce-bot-runners
 automountServiceAccountToken: false
 imagePullSecrets:
 - name: bot-images-pull
@@ -930,6 +964,47 @@ kind: Role
 metadata:
   name: bot-orchestrator-runner-pods
   namespace: $Namespace
+  annotations:
+    yenhubs.org/legacy-runner-authority: neutralized
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bot-orchestrator-runner-pods
+  namespace: $Namespace
+  annotations:
+    yenhubs.org/legacy-runner-authority: neutralized
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bot-orchestrator-runner-pods
+subjects:
+- kind: ServiceAccount
+  name: bot-orchestrator
+  namespace: $Namespace
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: bot-runner-capacity
+  namespace: hcce-bot-runners
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: 250m
+    requests.memory: 1280Mi
+    limits.cpu: "5"
+    limits.memory: 5Gi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bot-orchestrator-runner-pods
+  namespace: hcce-bot-runners
+  annotations:
+    yenhubs.org/runner-activation-phase: "$BOT_RUNNER_ACTIVATION_PHASE"
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 rules:
 - apiGroups:
   - ""
@@ -945,7 +1020,10 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: bot-orchestrator-runner-pods
-  namespace: $Namespace
+  namespace: hcce-bot-runners
+  annotations:
+    yenhubs.org/runner-activation-phase: "$BOT_RUNNER_ACTIVATION_PHASE"
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -954,6 +1032,325 @@ subjects:
 - kind: ServiceAccount
   name: bot-orchestrator
   namespace: $Namespace
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: bot-runner-pods.yenhubs.org
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: hcce-bot-runners
+    objectSelector: {}
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - DELETE
+      resources:
+      - pods
+      scope: Namespaced
+  variables:
+  - name: pod
+    expression: >-
+      request.operation == 'DELETE' ? oldObject : object
+  - name: labels
+    expression: variables.pod.metadata.labels
+  - name: annotations
+    expression: variables.pod.metadata.annotations
+  - name: container
+    expression: variables.pod.spec.containers[0]
+  - name: env
+    expression: variables.container.env
+  - name: parentPodName
+    expression: >-
+      request.operation == 'DELETE' ? '' : request.userInfo.extra['authentication.kubernetes.io/pod-name'][0]
+  - name: parentPodUid
+    expression: >-
+      request.operation == 'DELETE' ? '' : request.userInfo.extra['authentication.kubernetes.io/pod-uid'][0]
+  validations:
+  - expression: >-
+      request.namespace == 'hcce-bot-runners' &&
+      (request.operation == 'DELETE' ||
+       (request.userInfo.username == 'system:serviceaccount:$Namespace:bot-orchestrator' &&
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+        size(request.userInfo.extra['authentication.kubernetes.io/pod-name']) == 1 &&
+        'authentication.kubernetes.io/pod-uid' in request.userInfo.extra &&
+        size(request.userInfo.extra['authentication.kubernetes.io/pod-uid']) == 1))
+    message: runner Pod mutations require the exact Pod-bound parent ServiceAccount principal
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (variables.pod.apiVersion == 'v1' &&
+      variables.pod.kind == 'Pod' &&
+      variables.pod.metadata.namespace == 'hcce-bot-runners' &&
+      size(variables.labels) == 4 &&
+      variables.labels['app'] == 'bot-runner' &&
+      variables.labels['yenhubs.org/managed-by'] == 'bot-orchestrator' &&
+      variables.labels['yenhubs.org/room-key'].matches('^[0-9a-f]{20}$') &&
+      variables.labels['yenhubs.org/generation'].matches('^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') &&
+      variables.pod.metadata.name == 'bot-runner-' + variables.labels['yenhubs.org/room-key'].substring(0, 16) + '-' + variables.labels['yenhubs.org/generation'].substring(0, 8) &&
+      size(variables.annotations) == 4 &&
+      variables.annotations['yenhubs.org/expires-at'].matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.000Z$') &&
+      variables.annotations['yenhubs.org/parent-namespace'] == '$Namespace' &&
+      variables.annotations['yenhubs.org/parent-name'].matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$') &&
+      variables.annotations['yenhubs.org/parent-uid'].matches('^[A-Za-z0-9_.:-]{1,128}$') &&
+      variables.annotations['yenhubs.org/parent-name'] == variables.parentPodName &&
+      variables.annotations['yenhubs.org/parent-uid'] == variables.parentPodUid &&
+      (!has(variables.pod.metadata.ownerReferences) || size(variables.pod.metadata.ownerReferences) == 0) &&
+      (!has(variables.pod.metadata.finalizers) || size(variables.pod.metadata.finalizers) == 0) &&
+      (!has(variables.pod.metadata.generateName) || variables.pod.metadata.generateName == ''))
+    message: runner Pod metadata, parent binding, labels, and annotations must match the exact contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (variables.pod.spec.serviceAccountName == 'bot-runner' &&
+      variables.pod.spec.automountServiceAccountToken == false &&
+      size(variables.pod.spec.imagePullSecrets) == 1 &&
+      variables.pod.spec.imagePullSecrets[0].name == 'bot-images-pull' &&
+      variables.pod.spec.enableServiceLinks == false &&
+      variables.pod.spec.restartPolicy == 'Never' &&
+      variables.pod.spec.terminationGracePeriodSeconds == 10 &&
+      variables.pod.spec.activeDeadlineSeconds == 3600 &&
+      (!has(variables.pod.spec.hostNetwork) || variables.pod.spec.hostNetwork == false) &&
+      (!has(variables.pod.spec.hostPID) || variables.pod.spec.hostPID == false) &&
+      (!has(variables.pod.spec.hostIPC) || variables.pod.spec.hostIPC == false) &&
+      (!has(variables.pod.spec.shareProcessNamespace) || variables.pod.spec.shareProcessNamespace == false) &&
+      variables.pod.spec.dnsPolicy == 'ClusterFirst' &&
+      variables.pod.spec.schedulerName == 'default-scheduler' &&
+      (!has(variables.pod.spec.serviceAccount) || variables.pod.spec.serviceAccount == 'bot-runner'))
+    message: runner Pod service account, deadline, scheduling defaults, and host isolation must match the exact contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (variables.pod.spec.securityContext.runAsNonRoot == true &&
+      variables.pod.spec.securityContext.runAsUser == 10001 &&
+      variables.pod.spec.securityContext.runAsGroup == 10001 &&
+      variables.pod.spec.securityContext.fsGroup == 10001 &&
+      variables.pod.spec.securityContext.seccompProfile.type == 'RuntimeDefault' &&
+      !has(variables.pod.spec.securityContext.seccompProfile.localhostProfile) &&
+      variables.pod.spec.securityContext.appArmorProfile.type == 'RuntimeDefault' &&
+      !has(variables.pod.spec.securityContext.appArmorProfile.localhostProfile) &&
+      !has(variables.pod.spec.securityContext.fsGroupChangePolicy) &&
+      !has(variables.pod.spec.securityContext.seLinuxChangePolicy) &&
+      !has(variables.pod.spec.securityContext.seLinuxOptions) &&
+      (!has(variables.pod.spec.securityContext.supplementalGroups) || size(variables.pod.spec.securityContext.supplementalGroups) == 0) &&
+      !has(variables.pod.spec.securityContext.supplementalGroupsPolicy) &&
+      (!has(variables.pod.spec.securityContext.sysctls) || size(variables.pod.spec.securityContext.sysctls) == 0) &&
+      !has(variables.pod.spec.securityContext.windowsOptions))
+    message: runner Pod security context must match the restricted UID, seccomp, and AppArmor contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (size(variables.pod.spec.containers) == 1 &&
+      (!has(variables.pod.spec.initContainers) || size(variables.pod.spec.initContainers) == 0) &&
+      (!has(variables.pod.spec.ephemeralContainers) || size(variables.pod.spec.ephemeralContainers) == 0) &&
+      !has(variables.pod.spec.affinity) &&
+      !has(variables.pod.spec.dnsConfig) &&
+      (!has(variables.pod.spec.hostAliases) || size(variables.pod.spec.hostAliases) == 0) &&
+      !has(variables.pod.spec.hostname) &&
+      !has(variables.pod.spec.hostnameOverride) &&
+      !has(variables.pod.spec.hostUsers) &&
+      !has(variables.pod.spec.nodeName) &&
+      (!has(variables.pod.spec.nodeSelector) || size(variables.pod.spec.nodeSelector) == 0) &&
+      !has(variables.pod.spec.os) &&
+      !has(variables.pod.spec.overhead) &&
+      (!has(variables.pod.spec.priority) || variables.pod.spec.priority == 0) &&
+      (!has(variables.pod.spec.preemptionPolicy) || variables.pod.spec.preemptionPolicy == 'PreemptLowerPriority') &&
+      (!has(variables.pod.spec.priorityClassName) || variables.pod.spec.priorityClassName == '') &&
+      (!has(variables.pod.spec.readinessGates) || size(variables.pod.spec.readinessGates) == 0) &&
+      (!has(variables.pod.spec.resourceClaims) || size(variables.pod.spec.resourceClaims) == 0) &&
+      !has(variables.pod.spec.resources) &&
+      !has(variables.pod.spec.runtimeClassName) &&
+      (!has(variables.pod.spec.schedulingGates) || size(variables.pod.spec.schedulingGates) == 0) &&
+      !has(variables.pod.spec.setHostnameAsFQDN) &&
+      !has(variables.pod.spec.subdomain) &&
+      (!has(variables.pod.spec.topologySpreadConstraints) || size(variables.pod.spec.topologySpreadConstraints) == 0) &&
+      (!has(variables.pod.spec.tolerations) || size(variables.pod.spec.tolerations) == 0 ||
+        (size(variables.pod.spec.tolerations) == 2 &&
+         variables.pod.spec.tolerations.all(t,
+           t.operator == 'Exists' && t.effect == 'NoExecute' && t.tolerationSeconds == 300 &&
+           (t.key == 'node.kubernetes.io/not-ready' || t.key == 'node.kubernetes.io/unreachable')))))
+    message: runner Pod may not select nodes, runtime classes, devices, claims, injectors, or auxiliary containers
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (variables.container.name == 'bot-runner' &&
+      variables.container.image == '$BOT_RUNNER_IMAGE' &&
+      variables.container.imagePullPolicy == 'Always' &&
+      variables.container.command == ['node', '/app/run-ghost-runner.js'] &&
+      size(variables.container.args) == 5 &&
+      variables.container.args[0] == '--url' &&
+      variables.container.args[1] == 'https://$HUB_DOMAIN' &&
+      variables.container.args[2] == '--room' &&
+      variables.container.args[3].matches('^[A-Za-z0-9_-]{1,64}$') &&
+      variables.container.args[4] == '--runner')
+    message: runner image, command, and arguments must match the immutable runtime contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (size(variables.env) == 23 &&
+      variables.env[0].name == 'GHOST_FEATURED_FETCH_TIMEOUT_MS' && variables.env[0].value == '$GHOST_FEATURED_FETCH_TIMEOUT_MS' && !has(variables.env[0].valueFrom) &&
+      variables.env[1].name == 'GHOST_FEATURED_MAX_BYTES' && variables.env[1].value == '$GHOST_FEATURED_MAX_BYTES' && !has(variables.env[1].valueFrom) &&
+      variables.env[2].name == 'GHOST_FEATURED_MAX_ENTRIES' && variables.env[2].value == '$GHOST_FEATURED_MAX_ENTRIES' && !has(variables.env[2].valueFrom) &&
+      variables.env[3].name == 'GHOST_FEATURED_MAX_REDIRECTS' && variables.env[3].value == '$GHOST_FEATURED_MAX_REDIRECTS' && !has(variables.env[3].valueFrom) &&
+      variables.env[4].name == 'GHOST_FEATURED_MAX_REFS' && variables.env[4].value == '$GHOST_FEATURED_MAX_REFS' && !has(variables.env[4].valueFrom) &&
+      variables.env[5].name == 'GHOST_NAVIGATION_MODE' && variables.env[5].value == 'navmesh_preferred' && !has(variables.env[5].valueFrom) &&
+      variables.env[6].name == 'GHOST_NAVIGATION_RECOVERY_RESTART_MS' && variables.env[6].value == '30000' && !has(variables.env[6].valueFrom) &&
+      variables.env[7].name == 'GHOST_NAVIGATION_REQUIRE_NAVMESH' && variables.env[7].value == 'true' && !has(variables.env[7].valueFrom) &&
+      variables.env[8].name == 'GHOST_NAVMESH_MAX_ROUTE_POINTS' && variables.env[8].value == '$GHOST_NAVMESH_MAX_ROUTE_POINTS' && !has(variables.env[8].valueFrom) &&
+      variables.env[9].name == 'GHOST_NAVMESH_MAX_SNAP_DISTANCE_M' && variables.env[9].value == '$GHOST_NAVMESH_MAX_SNAP_DISTANCE_M' && !has(variables.env[9].valueFrom) &&
+      variables.env[10].name == 'GHOST_NAVMESH_MAX_TRIANGLES' && variables.env[10].value == '$GHOST_NAVMESH_MAX_TRIANGLES' && !has(variables.env[10].valueFrom) &&
+      variables.env[11].name == 'GHOST_RAYCAST_MODE' && variables.env[11].value == 'spoke_colliders' && !has(variables.env[11].valueFrom) &&
+      variables.env[12].name == 'GHOST_SCENE_FETCH_TIMEOUT_MS' && variables.env[12].value == '10000' && !has(variables.env[12].valueFrom) &&
+      variables.env[13].name == 'GHOST_SCENE_MAX_BYTES' && variables.env[13].value == '67108864' && !has(variables.env[13].valueFrom) &&
+      variables.env[14].name == 'GHOST_SCENE_MAX_EDGES' && variables.env[14].value == '200000' && !has(variables.env[14].valueFrom) &&
+      variables.env[15].name == 'GHOST_SCENE_MAX_JSON_BYTES' && variables.env[15].value == '4194304' && !has(variables.env[15].valueFrom) &&
+      variables.env[16].name == 'GHOST_SCENE_MAX_NODES' && variables.env[16].value == '50000' && !has(variables.env[16].valueFrom) &&
+      variables.env[17].name == 'GHOST_SPAWN_RECOVERY_RESTART_MS' && variables.env[17].value == '5000' && !has(variables.env[17].valueFrom) &&
+      variables.env[18].name == 'BOT_RUNNER_GENERATION_TOKEN' && variables.env[18].value.matches('^v1\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$') && !has(variables.env[18].valueFrom) &&
+      variables.env[19].name == 'RUNNER_PROCESS_GENERATION' && variables.env[19].value == variables.labels['yenhubs.org/generation'] && !has(variables.env[19].valueFrom) &&
+      variables.env[20].name == 'RUNNER_LEASE_HOLDER_ID' && variables.env[20].value == variables.annotations['yenhubs.org/parent-uid'] && !has(variables.env[20].valueFrom) &&
+      variables.env[21].name == 'RUNNER_CONTROL_URL' && variables.env[21].value == 'http://bot-orchestrator.$Namespace.svc.cluster.local:5001' && !has(variables.env[21].valueFrom) &&
+      variables.env[22].name == 'RUNNER_POD_UID' && !has(variables.env[22].value) &&
+      variables.env[22].valueFrom.fieldRef.apiVersion == 'v1' &&
+      variables.env[22].valueFrom.fieldRef.fieldPath == 'metadata.uid' &&
+      !has(variables.env[22].valueFrom.configMapKeyRef) &&
+      !has(variables.env[22].valueFrom.fileKeyRef) &&
+      !has(variables.env[22].valueFrom.resourceFieldRef) &&
+      !has(variables.env[22].valueFrom.secretKeyRef))
+    message: runner environment must be the exact non-secret allowlist with generation and holder binding
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (variables.container.securityContext.runAsNonRoot == true &&
+      variables.container.securityContext.runAsUser == 10001 &&
+      variables.container.securityContext.runAsGroup == 10001 &&
+      variables.container.securityContext.allowPrivilegeEscalation == false &&
+      variables.container.securityContext.readOnlyRootFilesystem == true &&
+      variables.container.securityContext.capabilities.drop == ['ALL'] &&
+      (!has(variables.container.securityContext.capabilities.add) || size(variables.container.securityContext.capabilities.add) == 0) &&
+      variables.container.securityContext.seccompProfile.type == 'RuntimeDefault' &&
+      !has(variables.container.securityContext.seccompProfile.localhostProfile) &&
+      variables.container.securityContext.appArmorProfile.type == 'RuntimeDefault' &&
+      !has(variables.container.securityContext.appArmorProfile.localhostProfile) &&
+      (!has(variables.container.securityContext.privileged) || variables.container.securityContext.privileged == false) &&
+      !has(variables.container.securityContext.procMount) &&
+      !has(variables.container.securityContext.seLinuxOptions) &&
+      !has(variables.container.securityContext.windowsOptions) &&
+      !has(variables.container.envFrom) &&
+      !has(variables.container.lifecycle) &&
+      !has(variables.container.livenessProbe) &&
+      (!has(variables.container.ports) || size(variables.container.ports) == 0) &&
+      !has(variables.container.resizePolicy) &&
+      !has(variables.container.restartPolicy) &&
+      !has(variables.container.restartPolicyRules) &&
+      !has(variables.container.startupProbe) &&
+      (!has(variables.container.stdin) || variables.container.stdin == false) &&
+      (!has(variables.container.stdinOnce) || variables.container.stdinOnce == false) &&
+      (!has(variables.container.tty) || variables.container.tty == false) &&
+      (!has(variables.container.volumeDevices) || size(variables.container.volumeDevices) == 0) &&
+      !has(variables.container.workingDir) &&
+      variables.container.terminationMessagePath == '/dev/termination-log' &&
+      variables.container.terminationMessagePolicy == 'File')
+    message: runner container security context and executable surface must match the exact contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (size(variables.container.resources.requests) == 2 &&
+      quantity(variables.container.resources.requests['cpu']).compareTo(quantity('25m')) == 0 &&
+      quantity(variables.container.resources.requests['memory']).compareTo(quantity('128Mi')) == 0 &&
+      size(variables.container.resources.limits) == 2 &&
+      quantity(variables.container.resources.limits['cpu']).compareTo(quantity('500m')) == 0 &&
+      quantity(variables.container.resources.limits['memory']).compareTo(quantity('512Mi')) == 0 &&
+      (!has(variables.container.resources.claims) || size(variables.container.resources.claims) == 0) &&
+      size(variables.container.volumeMounts) == 1 &&
+      variables.container.volumeMounts[0].name == 'runner-tmp' &&
+      variables.container.volumeMounts[0].mountPath == '/tmp' &&
+      (!has(variables.container.volumeMounts[0].readOnly) || variables.container.volumeMounts[0].readOnly == false) &&
+      !has(variables.container.volumeMounts[0].mountPropagation) &&
+      !has(variables.container.volumeMounts[0].recursiveReadOnly) &&
+      !has(variables.container.volumeMounts[0].subPath) &&
+      !has(variables.container.volumeMounts[0].subPathExpr) &&
+      variables.container.readinessProbe.exec.command == ['test', '-f', '/tmp/runner-ready'] &&
+      variables.container.readinessProbe.failureThreshold == 2 &&
+      variables.container.readinessProbe.initialDelaySeconds == 5 &&
+      variables.container.readinessProbe.periodSeconds == 5 &&
+      variables.container.readinessProbe.successThreshold == 1 &&
+      variables.container.readinessProbe.timeoutSeconds == 2 &&
+      !has(variables.container.readinessProbe.grpc) &&
+      !has(variables.container.readinessProbe.httpGet) &&
+      !has(variables.container.readinessProbe.tcpSocket) &&
+      !has(variables.container.readinessProbe.terminationGracePeriodSeconds))
+    message: runner resources, writable mount, and readiness probe must match the bounded contract
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (size(variables.pod.spec.volumes) == 1 &&
+      variables.pod.spec.volumes[0].name == 'runner-tmp' &&
+      quantity(variables.pod.spec.volumes[0].emptyDir.sizeLimit).compareTo(quantity('64Mi')) == 0 &&
+      (!has(variables.pod.spec.volumes[0].emptyDir.medium) || variables.pod.spec.volumes[0].emptyDir.medium == '') &&
+      !has(variables.pod.spec.volumes[0].awsElasticBlockStore) &&
+      !has(variables.pod.spec.volumes[0].azureDisk) &&
+      !has(variables.pod.spec.volumes[0].azureFile) &&
+      !has(variables.pod.spec.volumes[0].cephfs) &&
+      !has(variables.pod.spec.volumes[0].cinder) &&
+      !has(variables.pod.spec.volumes[0].configMap) &&
+      !has(variables.pod.spec.volumes[0].csi) &&
+      !has(variables.pod.spec.volumes[0].downwardAPI) &&
+      !has(variables.pod.spec.volumes[0].ephemeral) &&
+      !has(variables.pod.spec.volumes[0].fc) &&
+      !has(variables.pod.spec.volumes[0].flexVolume) &&
+      !has(variables.pod.spec.volumes[0].flocker) &&
+      !has(variables.pod.spec.volumes[0].gcePersistentDisk) &&
+      !has(variables.pod.spec.volumes[0].gitRepo) &&
+      !has(variables.pod.spec.volumes[0].glusterfs) &&
+      !has(variables.pod.spec.volumes[0].hostPath) &&
+      !has(variables.pod.spec.volumes[0].image) &&
+      !has(variables.pod.spec.volumes[0].iscsi) &&
+      !has(variables.pod.spec.volumes[0].nfs) &&
+      !has(variables.pod.spec.volumes[0].persistentVolumeClaim) &&
+      !has(variables.pod.spec.volumes[0].photonPersistentDisk) &&
+      !has(variables.pod.spec.volumes[0].portworxVolume) &&
+      !has(variables.pod.spec.volumes[0].projected) &&
+      !has(variables.pod.spec.volumes[0].quobyte) &&
+      !has(variables.pod.spec.volumes[0].rbd) &&
+      !has(variables.pod.spec.volumes[0].scaleIO) &&
+      !has(variables.pod.spec.volumes[0].secret) &&
+      !has(variables.pod.spec.volumes[0].storageos) &&
+      !has(variables.pod.spec.volumes[0].vsphereVolume))
+    message: runner Pod may mount only the bounded emptyDir scratch volume
+    reason: Forbidden
+  - expression: >-
+      request.operation != 'DELETE' ||
+      (has(request.options) &&
+       has(request.options.preconditions) &&
+       has(request.options.preconditions.uid) &&
+       string(request.options.preconditions.uid) == string(oldObject.metadata.uid))
+    message: runner Pod DELETE requires an exact UID precondition
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: bot-runner-pods.yenhubs.org
+spec:
+  policyName: bot-runner-pods.yenhubs.org
+  validationActions:
+  - Deny
+  matchResources:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: hcce-bot-runners
+    objectSelector: {}
 ---
 ########################################################################
 ######################   pgsql   #######################################
@@ -977,6 +1374,8 @@ kind: Deployment
 metadata:
   name: pgsql
   namespace: $Namespace
+  annotations:
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 spec:
   replicas: 1
   # pgsql-pvc is single-writer storage. Never run two PostgreSQL revisions.
@@ -1037,8 +1436,10 @@ kind: Deployment
 metadata:
   name: pgbouncer
   namespace: $Namespace
+  annotations:
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 spec:
-  replicas: 1
+  replicas: $PGBOUNCER_REPLICAS
   selector:
     matchLabels:
       app: pgbouncer
@@ -1095,8 +1496,10 @@ kind: Deployment
 metadata:
   name: pgbouncer-t
   namespace: $Namespace
+  annotations:
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 spec:
-  replicas: 1
+  replicas: $PGBOUNCER_T_REPLICAS
   selector:
     matchLabels:
       app: pgbouncer-t
@@ -1584,8 +1987,10 @@ kind: Deployment
 metadata:
   name: coturn
   namespace: $Namespace
+  annotations:
+    yenhubs.org/bot-runner-recovery-phase: "$BOT_RUNNER_RECOVERY_PHASE"
 spec:
-  replicas: 1
+  replicas: $COTURN_REPLICAS
   selector:
     matchLabels:
       app: coturn
@@ -1894,6 +2299,9 @@ spec:
         matchLabels:
           app: bot-runner
           yenhubs.org/managed-by: bot-orchestrator
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: hcce-bot-runners
     ports:
     - protocol: TCP
       port: 5001
@@ -1901,20 +2309,34 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: bot-runner-isolation
-  namespace: $Namespace
+  name: bot-runner-default-deny
+  namespace: hcce-bot-runners
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bot-runner-egress
+  namespace: hcce-bot-runners
 spec:
   podSelector:
     matchLabels:
       app: bot-runner
       yenhubs.org/managed-by: bot-orchestrator
   policyTypes:
-  - Ingress
   - Egress
-  ingress: []
   egress:
   - to:
-    - podSelector:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: $Namespace
+      podSelector:
         matchLabels:
           app: bot-orchestrator
     ports:

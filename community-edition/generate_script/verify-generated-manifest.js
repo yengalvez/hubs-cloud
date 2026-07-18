@@ -13,8 +13,11 @@ const {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerDefaultDenyNetworkPolicy,
   verifyBotRunnerNetworkPolicy,
+  verifyBotRunnerRecoveryContract,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,
@@ -144,6 +147,12 @@ if (!fs.existsSync(manifestPath)) {
   const resources = documents.map(document => document.toJS()).filter(Boolean);
   verifyManifestResourceIdentities(resources).forEach(fail);
   verifyManifestResourceInventory(resources).forEach(fail);
+  const primaryNamespace = resources.find(resource =>
+    resource?.apiVersion === "v1" &&
+    resource?.kind === "Namespace" &&
+    resource?.metadata?.name !== "hcce-bot-runners"
+  )?.metadata?.name;
+  verifyBotRunnerRecoveryContract(resources, primaryNamespace).forEach(fail);
   verifyNoReticulumHorizontalPodAutoscaler(resources).forEach(fail);
   const namespaceResource = resources.find(resource => {
     return resource?.apiVersion === "v1" &&
@@ -481,7 +490,7 @@ if (!fs.existsSync(manifestPath)) {
   } else {
     verifyBotOrchestratorSecretEnv(botContainer).forEach(fail);
     verifyBotOrchestratorSecurityContext(botContainer).forEach(fail);
-    verifyBotOrchestratorRuntimeEnv(botContainer).forEach(fail);
+    verifyBotOrchestratorRuntimeEnv(botContainer, manifestNamespace).forEach(fail);
     const botEnv = Object.fromEntries(
       (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
     );
@@ -673,14 +682,23 @@ if (!fs.existsSync(manifestPath)) {
 
   verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
   verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
+  verifyBotRunnerAdmissionResources(resources, manifestNamespace).forEach(fail);
+  const botRunnerDefaultDeny = findExactResource(
+    resources,
+    "networking.k8s.io",
+    "NetworkPolicy",
+    "hcce-bot-runners",
+    "bot-runner-default-deny"
+  );
+  verifyBotRunnerDefaultDenyNetworkPolicy(botRunnerDefaultDeny).forEach(fail);
   const botRunnerNetworkPolicy = findExactResource(
     resources,
     "networking.k8s.io",
     "NetworkPolicy",
-    manifestNamespace,
-    "bot-runner-isolation"
+    "hcce-bot-runners",
+    "bot-runner-egress"
   );
-  verifyBotRunnerNetworkPolicy(botRunnerNetworkPolicy).forEach(fail);
+  verifyBotRunnerNetworkPolicy(botRunnerNetworkPolicy, manifestNamespace).forEach(fail);
 
   verifyIngressPolicy(
     resources,
@@ -692,6 +710,11 @@ if (!fs.existsSync(manifestPath)) {
     [
       { podSelector: { matchLabels: { app: "reticulum" } } },
       {
+        namespaceSelector: {
+          matchLabels: {
+            "kubernetes.io/metadata.name": "hcce-bot-runners"
+          }
+        },
         podSelector: {
           matchLabels: {
             app: "bot-runner",

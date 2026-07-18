@@ -21,8 +21,8 @@ function runNode(script, env) {
 
 test("generator and verifier support dynamic and retained manual storage only", () => {
   for (const [storageClass, expectedResources] of [
-    ["do-block-storage", 50],
-    ["manual", 52]
+    ["do-block-storage", 58],
+    ["manual", 60]
   ]) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-storage-contract-"));
     const inputPath = path.join(directory, "input-values.yaml");
@@ -118,6 +118,80 @@ test("generator requires four independent access-key trust domains", () => {
     assert.notEqual(rejected.status, 0);
     assert.match(rejected.stderr, error);
   }
+});
+
+test("generator binds activation and restore-fence phases to exact replicas and inert authority", () => {
+  for (const [activationPhase, expectedBotReplicas, expectedRoleRules] of [
+    ["bootstrap", 0, 0],
+    ["admission", 0, 1],
+    ["active", 1, 1]
+  ]) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `hcce-phase-${activationPhase}-`));
+    const inputPath = path.join(directory, "input-values.yaml");
+    const outputPath = path.join(directory, "hcce.yaml");
+    fs.writeFileSync(inputPath, YAML.stringify({
+      ...ciInput,
+      BOT_RUNNER_ACTIVATION_PHASE: activationPhase,
+      BOT_RUNNER_RECOVERY_PHASE: "active"
+    }), { mode: 0o600 });
+    const generated = runNode(generatorPath, {
+      HCCE_INPUT_VALUES_PATH: inputPath,
+      HCCE_OUTPUT_PATH: outputPath
+    });
+    assert.equal(generated.status, 0, generated.stderr);
+    const verified = runNode(verifierPath, { HCCE_MANIFEST_PATH: outputPath });
+    assert.equal(verified.status, 0, verified.stderr);
+    const resources = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8"))
+      .map(document => document.toJS())
+      .filter(Boolean);
+    const bot = resources.find(resource =>
+      resource.kind === "Deployment" && resource.metadata?.name === "bot-orchestrator"
+    );
+    const role = resources.find(resource =>
+      resource.kind === "Role" &&
+      resource.metadata?.namespace === "hcce-bot-runners" &&
+      resource.metadata?.name === "bot-orchestrator-runner-pods"
+    );
+    assert.equal(bot.spec.replicas, expectedBotReplicas);
+    assert.equal(role.rules.length, expectedRoleRules);
+  }
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-restore-fence-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  fs.writeFileSync(inputPath, YAML.stringify({
+    ...ciInput,
+    BOT_RUNNER_ACTIVATION_PHASE: "active",
+    BOT_RUNNER_RECOVERY_PHASE: "restore-fence"
+  }), { mode: 0o600 });
+  const generated = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath
+  });
+  assert.equal(generated.status, 0, generated.stderr);
+  const verified = runNode(verifierPath, { HCCE_MANIFEST_PATH: outputPath });
+  assert.equal(verified.status, 0, verified.stderr);
+  const resources = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  for (const name of ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]) {
+    const deployment = resources.find(resource =>
+      resource.kind === "Deployment" && resource.metadata?.name === name
+    );
+    assert.equal(deployment.spec.replicas, 0, `${name} must be fenced`);
+    assert.equal(
+      deployment.metadata.annotations["yenhubs.org/bot-runner-recovery-phase"],
+      "restore-fence"
+    );
+  }
+  assert.equal(resources.find(resource =>
+    resource.kind === "Deployment" && resource.metadata?.name === "pgsql"
+  ).spec.replicas, 1);
+  assert.deepEqual(resources.find(resource =>
+    resource.kind === "Role" &&
+    resource.metadata?.namespace === "hcce-bot-runners" &&
+    resource.metadata?.name === "bot-orchestrator-runner-pods"
+  ).rules, []);
 });
 
 test("verifier binds every Reticulum access-key environment and TOML mapping to its own domain", () => {
