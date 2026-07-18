@@ -442,6 +442,40 @@ test("requires authenticated self-presence and a matching Reticulum spawn ACK", 
   );
 });
 
+test("applies bot commands only for the exact current runner authority fence", () => {
+  const authorityFence = { leaseId: "lease-current", authorityEpoch: 12 };
+  const record = { id: "bot-1", mobility: "medium" };
+  const bots = new Map([[record.id, record]]);
+  const calls = [];
+  const startWalking = (...args) => calls.push(args);
+  const exactCommand = {
+    type: "bot_command",
+    bot_runner_lease_id: "lease-current",
+    bot_runner_authority_epoch: 12,
+    body: { type: "go_to_waypoint", bot_id: "bot-1", waypoint: "spawbot-stage" }
+  };
+
+  assert.equal(
+    internals.applyFencedBotCommand(exactCommand, authorityFence, bots, startWalking, 1234),
+    true
+  );
+  assert.deepEqual(calls, [[record, "spawbot-stage", 1234]]);
+
+  const rejectedCommands = [
+    { ...exactCommand, bot_runner_authority_epoch: 11 },
+    { ...exactCommand, bot_runner_lease_id: "lease-old" },
+    { ...exactCommand, bot_runner_authority_epoch: "12" },
+    { type: exactCommand.type, body: exactCommand.body }
+  ];
+  for (const command of rejectedCommands) {
+    assert.equal(
+      internals.applyFencedBotCommand(command, authorityFence, bots, startWalking, 5678),
+      false
+    );
+  }
+  assert.equal(calls.length, 1);
+});
+
 test("bounds Featured avatar discovery and keeps only usable unique refs", async () => {
   const discovered = await internals.fetchFeaturedAvatarRefs("https://meta-hubs.org", {
     timeoutMs: 100,

@@ -1,12 +1,13 @@
 defmodule Ret.BotRuntimeSupervisor do
   @moduledoc """
-  Keeps process-local bot authority and its externally observable state atomic.
+  Keeps local lease-to-channel bindings and their observable state atomic.
 
-  None of these processes can be reconstructed independently. A lease restart
-  cannot recover its process-bound channel owners, while an Endpoint or
-  Presence restart cannot republish the state held by the surviving peers.
-  Restarting the complete group closes every old channel and removes every
-  stale authority advertisement before clients reconnect and register again.
+  PostgreSQL retains the shared fencing authority, but none of these local
+  processes can reconstruct a surviving channel owner independently. A lease
+  coordinator restart cannot recover its process binding, while an Endpoint or
+  Presence restart cannot republish the state held by surviving peers.
+  Restarting the complete group closes every old channel and removes stale
+  authority advertisements before clients reconnect and register again.
   """
 
   use Supervisor

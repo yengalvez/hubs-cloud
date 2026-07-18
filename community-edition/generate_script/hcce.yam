@@ -433,15 +433,16 @@ metadata:
   annotations:
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
 spec:
-  # BotRunnerLease authority is process-local. Keep this complete profile singleton;
-  # manifest verification also rejects Reticulum HPAs until DB fencing is implemented.
+  # BotRunnerLease has PostgreSQL fencing, but this complete profile remains singleton
+  # until readiness/endpoints and the ret-pvc RWO constraint pass a separate staged
+  # two-replica rollout. Manifest verification also continues to reject Reticulum HPAs.
   replicas: 1
   selector:
     matchLabels:
       app: reticulum
   minReadySeconds: 15
-  # Recreate reduces overlap during the standard rollout. Operators must still
-  # abort on duplicate pods/endpoints until bot authority has database fencing.
+  # Recreate preserves the current storage and operational boundary. Operators
+  # must still abort on duplicate pods/endpoints until those gates are updated.
   strategy:
     type: Recreate
   revisionHistoryLimit: 1
