@@ -7,11 +7,13 @@ const {
 } = require("../runner-generation-token");
 
 const key = "test-orchestrator-generation-key-at-least-32";
+const recoveryEpoch = "44444444-4444-4444-8444-444444444444";
 const claims = {
   hubSid: "Room_123",
   processGeneration: "11111111-1111-4111-8111-111111111111",
   holderId: "22222222-2222-4222-8222-222222222222",
-  expiresAtSeconds: 2_000_000_300
+  expiresAtSeconds: 2_000_000_300,
+  recoveryEpoch
 };
 
 test("runner generation credentials are exact room, generation, holder, and expiry scopes", () => {
@@ -20,28 +22,49 @@ test("runner generation credentials are exact room, generation, holder, and expi
     nowSeconds: 2_000_000_000,
     hubSid: claims.hubSid,
     processGeneration: claims.processGeneration,
-    holderId: claims.holderId
+    holderId: claims.holderId,
+    recoveryEpoch
   });
 
   assert.equal(verified.hub_sid, claims.hubSid);
   assert.equal(verified.process_generation, claims.processGeneration);
   assert.equal(verified.holder_id, claims.holderId);
   assert.equal(
-    verifyRunnerGenerationToken(token, key, { nowSeconds: 2_000_000_000, hubSid: "other" }),
+    verifyRunnerGenerationToken(token, key, {
+      nowSeconds: 2_000_000_000,
+      hubSid: "other",
+      recoveryEpoch
+    }),
     null
   );
-  assert.equal(verifyRunnerGenerationToken(token, key, { nowSeconds: 2_000_000_331 }), null);
+  assert.equal(
+    verifyRunnerGenerationToken(token, key, { nowSeconds: 2_000_000_331, recoveryEpoch }),
+    null
+  );
   const farFuture = createRunnerGenerationToken({
     key,
     ...claims,
-    expiresAtSeconds: 2_000_086_431
+    expiresAtSeconds: 2_000_003_601
   });
-  assert.equal(verifyRunnerGenerationToken(farFuture, key, { nowSeconds: 2_000_000_000 }), null);
+  assert.equal(
+    verifyRunnerGenerationToken(farFuture, key, { nowSeconds: 2_000_000_000, recoveryEpoch }),
+    null
+  );
+  assert.equal(
+    verifyRunnerGenerationToken(token, key, {
+      nowSeconds: 2_000_000_000,
+      recoveryEpoch: "55555555-5555-4555-8555-555555555555"
+    }),
+    null
+  );
 });
 
 test("runner generation credentials reject tampering and any authority pre-binding claim", () => {
   const token = createRunnerGenerationToken({ key, ...claims });
-  assert.equal(verifyRunnerGenerationToken(`${token}x`, key, { nowSeconds: 2_000_000_000 }), null);
+  assert.equal(
+    verifyRunnerGenerationToken(`${token}x`, key, { nowSeconds: 2_000_000_000, recoveryEpoch }),
+    null
+  );
   assert.throws(
     () => createRunnerGenerationToken({ key, ...claims, fenceEpoch: 0 }),
     /scope_invalid/

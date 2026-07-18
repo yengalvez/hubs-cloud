@@ -18,6 +18,8 @@ config :logger, level: :warning
 
 config :ret, Ret.AppConfig, caching?: false
 
+config :ret, bot_runner_recovery_epoch: "44444444-4444-4444-8444-444444444444"
+
 config :ret, Ret.Repo,
   adapter: Ecto.Adapters.Postgres,
   database: "ret_test",

@@ -75,6 +75,12 @@ also authenticates Reticulum when Reticulum calls the parent through
 `Ret.BotOrchestrator`; it is never placed in a runner Pod. Each Pod receives
 only a signed credential scoped to exact room, generation, holder and expiry;
 `Ret.BotRunnerGenerationToken` validates that scope before the Phoenix join.
+The verified claims travel intact through admission and lease acquisition. The
+same per-room PostgreSQL transaction records the room and generation once in
+`ret0.bot_runner_generations`, after proving that no lease is active and before
+allocating an authority epoch. Release, revoke, expiry and process restart do
+not delete that ledger row, so a replay (including A-B-A) is terminal while a
+new generation blocked by an incumbent remains unconsumed for a later retry.
 The v1 payload has no lease or fencing claims: after the join, Reticulum
 acquires the shared PostgreSQL lease and returns its mandatory exact UUID and
 positive JavaScript-safe authority epoch through the join and Presence. Spawn
@@ -83,8 +89,9 @@ values, and the parent requires the runner to report that exact UUID and epoch
 before authentication or readiness. Protected Reticulum side effects lock and
 revalidate the database row, so this post-join fence is authoritative without
 rotating the generation token.
-`bot_runner_access_key` remains accepted only as the legacy runner credential
-during this transition and no longer authenticates bot snapshot reads.
+`bot_runner_access_key` remains configured only for legacy non-channel
+integrations; the Phoenix bot-runner authority path rejects that master key and
+requires a signed, unconsumed generation credential.
 Dashboard authorization has its own
 minimum-32-character key and fails closed when it is absent; it never falls
 back to either bot key. The legacy `x-ret-admin-access-key` header for

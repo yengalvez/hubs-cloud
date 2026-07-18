@@ -243,7 +243,11 @@ defmodule RetWeb.BotControllerTest do
     approve_config!(hub, account)
 
     {:ok, lease} =
-      BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+      BotRunnerLease.register_for_session(
+        hub.hub_sid,
+        Ecto.UUID.generate(),
+        generation_claims(hub.hub_sid)
+      )
 
     previous_orchestrator = Application.get_env(:ret, Ret.BotOrchestrator)
     previous_client = Application.get_env(:ret, SuccessfulHttpClient)
@@ -301,6 +305,18 @@ defmodule RetWeb.BotControllerTest do
       approved_by_account_id: account.account_id,
       approved_at: DateTime.utc_now()
     })
+  end
+
+  defp generation_claims(hub_sid) do
+    %{
+      "v" => 1,
+      "aud" => "yenhubs-bot-runner",
+      "hub_sid" => hub_sid,
+      "process_generation" => Ecto.UUID.generate(),
+      "holder_id" => Ecto.UUID.generate(),
+      "recovery_epoch" => "44444444-4444-4444-8444-444444444444",
+      "exp" => System.system_time(:second) + 300
+    }
   end
 
   defp restore_application_env(app, key, nil), do: Application.delete_env(app, key)

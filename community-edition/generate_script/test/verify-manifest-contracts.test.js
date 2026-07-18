@@ -18,7 +18,9 @@ const {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerDefaultDenyNetworkPolicy,
   verifyBotRunnerNetworkPolicy,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
@@ -80,6 +82,8 @@ function validRuntimeContainer() {
               value:
                 name === "BOT_RUNNER_IMAGE"
                   ? `registry.invalid/bot-runner@sha256:${"a".repeat(64)}`
+                  : name === "BOT_RUNNER_RECOVERY_EPOCH"
+                    ? "44444444-4444-4444-8444-444444444444"
                   : BOT_ORCHESTRATOR_RUNTIME_ENV[name] ?? "test-literal"
             }
     )
@@ -96,7 +100,13 @@ function validResources() {
     {
       apiVersion: "apps/v1",
       kind: "Deployment",
-      metadata: { name: "bot-orchestrator" },
+      metadata: {
+        name: "bot-orchestrator",
+        annotations: {
+          "yenhubs.org/runner-activation-phase": "active",
+          "yenhubs.org/bot-runner-recovery-phase": "active"
+        }
+      },
       spec: {
         replicas: 1,
         strategy: { type: "Recreate" },
@@ -112,6 +122,7 @@ function validResources() {
 function apiVersionForGroup(group) {
   if (group === "") return "v1";
   if (group === "apps") return "apps/v1";
+  if (group === "admissionregistration.k8s.io") return "admissionregistration.k8s.io/v1";
   if (group === "networking.k8s.io") return "networking.k8s.io/v1";
   if (group === "rbac.authorization.k8s.io") return "rbac.authorization.k8s.io/v1";
   throw new Error(`unsupported test API group: ${group}`);
@@ -246,9 +257,9 @@ test("requires globally unique resource identities and exact critical resource c
   assert.match(deploymentErrors, /exactly one Deployment\/bot-orchestrator/);
 });
 
-test("requires the exact 50-resource apiVersion/kind/namespace/name inventory", () => {
+test("requires the exact 58-resource two-namespace apiVersion/kind/namespace/name inventory", () => {
   const resources = validInventoryResources();
-  assert.equal(resources.length, 50);
+  assert.equal(resources.length, 58);
   assert.deepEqual(verifyManifestResourceInventory(resources), []);
 
   const extraJob = {
@@ -258,7 +269,7 @@ test("requires the exact 50-resource apiVersion/kind/namespace/name inventory", 
   };
   const extraErrors = verifyManifestResourceInventory([...resources, extraJob]).join("\n");
   assert.match(extraErrors, /unexpected resource/);
-  assert.match(extraErrors, /exactly 50/);
+  assert.match(extraErrors, /exactly 58/);
 
   const wrongNamespace = clone(resources);
   wrongNamespace.find(resource => resource.kind === "Secret").metadata.namespace = "other";
@@ -271,7 +282,7 @@ test("requires the exact 50-resource apiVersion/kind/namespace/name inventory", 
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "pgsql-pv" } },
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "ret-pv" } }
   );
-  assert.equal(manualResources.length, 52);
+  assert.equal(manualResources.length, 60);
   assert.deepEqual(verifyManifestResourceInventory(manualResources), []);
 
   const incompleteManual = manualResources.filter(resource => resource.metadata?.name !== "ret-pv");
@@ -333,7 +344,7 @@ test("requires exactly one bot-orchestrator container", () => {
   assert.match(verifyBotOrchestratorContainers(deployment).join("\n"), /exactly one/);
 });
 
-test("requires exactly one Recreate bot-orchestrator replica", () => {
+test("requires an exact activation-phase replica contract and Recreate strategy", () => {
   const deployment = validResources()[1];
   assert.deepEqual(verifyBotOrchestratorDeploymentContract(deployment), []);
 
@@ -351,6 +362,13 @@ test("requires exactly one Recreate bot-orchestrator replica", () => {
     const changed = clone(deployment);
     mutate(changed);
     assert.notDeepEqual(verifyBotOrchestratorDeploymentContract(changed), []);
+  }
+
+  for (const phase of ["bootstrap", "admission"]) {
+    const staged = clone(deployment);
+    staged.metadata.annotations["yenhubs.org/runner-activation-phase"] = phase;
+    staged.spec.replicas = 0;
+    assert.deepEqual(verifyBotOrchestratorDeploymentContract(staged), []);
   }
 });
 
@@ -456,29 +474,62 @@ test("keeps exact minimal ServiceAccounts, namespaced Pod RBAC, and runner Netwo
     resource => resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull"
   );
   assert.equal(pullSecret.data[".dockerconfigjson"], "$BOT_IMAGE_PULL_CONFIG_JSON_BASE64");
+  assert.deepEqual(verifyBotRunnerAdmissionResources(resources, "$Namespace"), []);
   const botContainer = resources
     .find(resource => resource.kind === "Deployment" && resource.metadata?.name === "bot-orchestrator")
     .spec.template.spec.containers.find(container => container.name === "bot-orchestrator");
+  const botDeployment = resources.find(
+    resource => resource.kind === "Deployment" && resource.metadata?.name === "bot-orchestrator"
+  );
+  botDeployment.metadata.annotations["yenhubs.org/runner-activation-phase"] = "active";
+  botDeployment.metadata.annotations["yenhubs.org/bot-runner-recovery-phase"] = "active";
+  botDeployment.spec.replicas = 1;
+  const runnerRoleBinding = resources.find(
+    resource => resource.kind === "RoleBinding" &&
+      resource.metadata?.namespace === "hcce-bot-runners" &&
+      resource.metadata?.name === "bot-orchestrator-runner-pods"
+  );
+  runnerRoleBinding.metadata.annotations["yenhubs.org/runner-activation-phase"] = "active";
+  runnerRoleBinding.metadata.annotations["yenhubs.org/bot-runner-recovery-phase"] = "active";
+  runnerRoleBinding.subjects[0].name = "bot-orchestrator";
+  resources.find(
+    resource => resource.kind === "Role" &&
+      resource.metadata?.namespace === "hcce-bot-runners" &&
+      resource.metadata?.name === "bot-orchestrator-runner-pods"
+  ).metadata.annotations = {
+    "yenhubs.org/runner-activation-phase": "active",
+    "yenhubs.org/bot-runner-recovery-phase": "active"
+  };
   botContainer.image = `registry.invalid/yenhubs/bot-orchestrator@sha256:${"a".repeat(64)}`;
   botContainer.env.find(entry => entry.name === "BOT_RUNNER_IMAGE").value =
     `registry.invalid/yenhubs/bot-runner@sha256:${"b".repeat(64)}`;
-  pullSecret.data[".dockerconfigjson"] = Buffer.from(
+  const testPullConfig = Buffer.from(
     JSON.stringify({
       auths: { "registry.invalid": { auth: Buffer.from("ci-user:ci-token").toString("base64") } }
     }),
     "utf8"
   ).toString("base64");
+  pullSecret.data[".dockerconfigjson"] = testPullConfig;
+  resources.find(
+    resource => resource.kind === "Secret" && resource.metadata?.namespace === "hcce-bot-runners"
+  ).data[".dockerconfigjson"] = testPullConfig;
 
   assert.deepEqual(verifyBotImagePullSecret(resources, "$Namespace"), []);
   assert.deepEqual(verifyBotRunnerControlPlaneResources(resources, "$Namespace"), []);
   const policy = resources.find(
-    resource => resource.kind === "NetworkPolicy" && resource.metadata?.name === "bot-runner-isolation"
+    resource => resource.kind === "NetworkPolicy" && resource.metadata?.name === "bot-runner-egress"
   );
-  assert.deepEqual(verifyBotRunnerNetworkPolicy(policy), []);
+  const defaultDeny = resources.find(
+    resource => resource.kind === "NetworkPolicy" && resource.metadata?.name === "bot-runner-default-deny"
+  );
+  assert.deepEqual(verifyBotRunnerDefaultDenyNetworkPolicy(defaultDeny), []);
+  assert.deepEqual(verifyBotRunnerNetworkPolicy(policy, "$Namespace"), []);
 
   const expandedRole = clone(resources);
   expandedRole
-    .find(resource => resource.kind === "Role" && resource.metadata?.name === "bot-orchestrator-runner-pods")
+    .find(resource => resource.kind === "Role" &&
+      resource.metadata?.namespace === "hcce-bot-runners" &&
+      resource.metadata?.name === "bot-orchestrator-runner-pods")
     .rules[0].verbs.push("patch");
   assert.match(
     verifyBotRunnerControlPlaneResources(expandedRole, "$Namespace").join("\n"),
@@ -520,10 +571,77 @@ test("keeps exact minimal ServiceAccounts, namespaced Pod RBAC, and runner Netwo
   const broadenedPolicy = clone(policy);
   broadenedPolicy.spec.egress.push({ to: [{}] });
   assert.notDeepEqual(verifyBotRunnerNetworkPolicy(broadenedPolicy), []);
+
+  const narrowedDefaultDeny = clone(defaultDeny);
+  narrowedDefaultDeny.spec.podSelector = { matchLabels: { app: "bot-runner" } };
+  assert.notDeepEqual(verifyBotRunnerDefaultDenyNetworkPolicy(narrowedDefaultDeny), []);
+});
+
+test("pins the fail-closed runner admission policy and rejects policy bypass mutations", () => {
+  const templatePath = path.resolve(__dirname, "../hcce.yam");
+  const resources = YAML.parseAllDocuments(fs.readFileSync(templatePath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  assert.deepEqual(verifyBotRunnerAdmissionResources(resources, "$Namespace"), []);
+
+  const mutations = [
+    value => { value.spec.matchConstraints.objectSelector = { matchLabels: { admitted: "true" } }; },
+    value => { value.spec.matchConditions = [{ name: "operator-bypass", expression: "false" }]; },
+    value => { value.spec.validations[1].expression += " || true"; },
+    value => { value.spec.validations.at(-1).expression = "true"; },
+    value => { value.spec.failurePolicy = "Ignore"; }
+  ];
+  for (const mutate of mutations) {
+    const changed = clone(resources);
+    const admission = changed.find(resource => resource.kind === "ValidatingAdmissionPolicy");
+    mutate(admission);
+    assert.notDeepEqual(verifyBotRunnerAdmissionResources(changed, "$Namespace"), []);
+  }
+
+  const admission = resources.find(resource => resource.kind === "ValidatingAdmissionPolicy");
+  const expressions = admission.spec.validations.map(validation => validation.expression).join("\n");
+  assert.equal(admission.spec.matchConditions, undefined, "the exact policy must apply to every caller");
+  assert.match(
+    admission.spec.validations[0].expression,
+    /request\.operation == 'DELETE' \|\|\s*\(request\.userInfo\.username/,
+    "RBAC-authorized DELETE must not require Pod-bound ServiceAccount extras"
+  );
+  assert.doesNotMatch(expressions, /system:masters|do-role-name:Owner/);
+  assert.match(expressions, /size\(variables\.annotations\) == 4/);
+  assert.match(expressions, /appArmorProfile\.type == 'RuntimeDefault'/);
+  assert.match(expressions, /!has\(variables\.pod\.spec\.volumes\[0\]\.secret\)/);
+  assert.match(expressions, /serviceAccountName == 'bot-runner'/);
+  assert.match(expressions, /container\.image == '\$BOT_RUNNER_IMAGE'/);
+  assert.match(expressions, /size\(variables\.env\) == 23/);
+  assert.match(expressions, /request\.options\.preconditions\.uid/);
+  assert.match(expressions, /request\.operation == 'DELETE' \|\|/);
+  assert.doesNotMatch(expressions, /oldObject\.spec/);
+
+  const deleteUidValidation = admission.spec.validations.at(-1).expression;
+  for (const validation of admission.spec.validations.slice(0, -1)) {
+    assert.match(
+      validation.expression,
+      /request\.operation == 'DELETE' \|\|/,
+      "every CREATE identity/spec validation must allow RBAC-authorized cleanup of a drifted Pod"
+    );
+  }
+  assert.match(deleteUidValidation, /has\(request\.options\.preconditions\.uid\)/);
+  assert.match(
+    deleteUidValidation,
+    /string\(request\.options\.preconditions\.uid\) == string\(oldObject\.metadata\.uid\)/
+  );
+  const portableDeleteFixture = (oldUid, requestedUid) =>
+    typeof requestedUid === "string" && requestedUid === oldUid;
+  assert.equal(portableDeleteFixture("pod-uid", "pod-uid"), true);
+  assert.equal(portableDeleteFixture("pod-uid", undefined), false);
+  assert.equal(portableDeleteFixture("pod-uid", "replacement-uid"), false);
 });
 
 test("keeps Reticulum singleton until multi-replica storage and operational gates are staged", () => {
-  const deployment = { spec: { replicas: 1, strategy: { type: "Recreate" } } };
+  const deployment = {
+    metadata: { annotations: { "yenhubs.org/bot-runner-recovery-phase": "active" } },
+    spec: { replicas: 1, strategy: { type: "Recreate" } }
+  };
   assert.deepEqual(verifyReticulumBotRunnerAuthorityContract(deployment), []);
 
   for (const replicas of [undefined, 0, 2, "1"]) {

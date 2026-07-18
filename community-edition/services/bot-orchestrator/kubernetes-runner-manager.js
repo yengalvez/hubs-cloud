@@ -8,8 +8,12 @@ const MANAGED_BY_LABEL = "yenhubs.org/managed-by";
 const ROOM_KEY_LABEL = "yenhubs.org/room-key";
 const GENERATION_LABEL = "yenhubs.org/generation";
 const EXPIRES_AT_ANNOTATION = "yenhubs.org/expires-at";
+const PARENT_NAMESPACE_ANNOTATION = "yenhubs.org/parent-namespace";
+const PARENT_NAME_ANNOTATION = "yenhubs.org/parent-name";
+const PARENT_UID_ANNOTATION = "yenhubs.org/parent-uid";
 const MANAGED_BY_VALUE = "bot-orchestrator";
 const RUNNER_APP_LABEL = "bot-runner";
+const RUNNER_NAMESPACE = "hcce-bot-runners";
 const MAX_API_RESPONSE_BYTES = 1024 * 1024;
 
 function encodePathSegment(value) {
@@ -202,18 +206,6 @@ function podIsTerminal(pod) {
   return pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded";
 }
 
-function exactOwnerReference(pod, ownerPodName, ownerPodUid) {
-  const references = pod?.metadata?.ownerReferences;
-  return Array.isArray(references) &&
-    references.length === 1 &&
-    references[0]?.apiVersion === "v1" &&
-    references[0]?.kind === "Pod" &&
-    references[0]?.name === ownerPodName &&
-    references[0]?.uid === ownerPodUid &&
-    references[0]?.controller === false &&
-    references[0]?.blockOwnerDeletion === false;
-}
-
 function exactJsonValue(actual, expected) {
   return isDeepStrictEqual(actual, expected);
 }
@@ -283,6 +275,7 @@ class KubernetesRunnerManager extends EventEmitter {
   constructor({
     api = new KubernetesApi(),
     namespace,
+    parentNamespace,
     ownerPodName,
     ownerPodUid,
     runnerImage,
@@ -298,13 +291,14 @@ class KubernetesRunnerManager extends EventEmitter {
   }) {
     super();
     if (
-      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(namespace || "") ||
+      namespace !== RUNNER_NAMESPACE ||
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(parentNamespace || "") ||
       !/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(ownerPodName || "") ||
       !/^[A-Za-z0-9_.:-]{1,128}$/.test(ownerPodUid || "") ||
       !/^.+@sha256:[0-9a-f]{64}$/.test(runnerImage || "") ||
       !strongCredentialKey(credentialKey) ||
       !validHttpsBaseUrl(hubsBaseUrl) ||
-      controlUrl !== "http://bot-orchestrator:5001"
+      controlUrl !== `http://bot-orchestrator.${parentNamespace}.svc.cluster.local:5001`
     ) {
       throw new Error("runner_pod_manager_configuration_missing");
     }
@@ -325,6 +319,7 @@ class KubernetesRunnerManager extends EventEmitter {
     }
     this.api = api;
     this.namespace = namespace;
+    this.parentNamespace = parentNamespace;
     this.ownerPodName = ownerPodName;
     this.ownerPodUid = ownerPodUid;
     this.runnerImage = runnerImage;
@@ -333,7 +328,7 @@ class KubernetesRunnerManager extends EventEmitter {
     this.credentialKey = credentialKey;
     this.runnerEnvironment = { ...runnerEnvironment };
     this.tokenFactory = tokenFactory;
-    this.tokenTtlSeconds = Math.min(Math.max(Number(tokenTtlSeconds) || 3600, 300), 86_400);
+    this.tokenTtlSeconds = Math.min(Math.max(Number(tokenTtlSeconds) || 3600, 300), 3_600);
     this.maxActiveRooms = Math.min(Math.max(Number(maxActiveRooms) || 5, 1), 10);
     this.now = now;
     this.sleep = sleep;
@@ -396,18 +391,11 @@ class KubernetesRunnerManager extends EventEmitter {
           [GENERATION_LABEL]: identity.processGeneration
         },
         annotations: {
-          [EXPIRES_AT_ANNOTATION]: new Date(identity.expiresAtSeconds * 1000).toISOString()
-        },
-        ownerReferences: [
-          {
-            apiVersion: "v1",
-            kind: "Pod",
-            name: this.ownerPodName,
-            uid: this.ownerPodUid,
-            controller: false,
-            blockOwnerDeletion: false
-          }
-        ]
+          [EXPIRES_AT_ANNOTATION]: new Date(identity.expiresAtSeconds * 1000).toISOString(),
+          [PARENT_NAMESPACE_ANNOTATION]: this.parentNamespace,
+          [PARENT_NAME_ANNOTATION]: this.ownerPodName,
+          [PARENT_UID_ANNOTATION]: this.ownerPodUid
+        }
       },
       spec: {
         serviceAccountName: "bot-runner",
@@ -426,13 +414,14 @@ class KubernetesRunnerManager extends EventEmitter {
           runAsUser: 10001,
           runAsGroup: 10001,
           fsGroup: 10001,
-          seccompProfile: { type: "RuntimeDefault" }
+          seccompProfile: { type: "RuntimeDefault" },
+          appArmorProfile: { type: "RuntimeDefault" }
         },
         containers: [
           {
             name: "bot-runner",
             image: this.runnerImage,
-            imagePullPolicy: "IfNotPresent",
+            imagePullPolicy: "Always",
             command: ["node", "/app/run-ghost-runner.js"],
             args: ["--url", this.hubsBaseUrl, "--room", identity.hubSid, "--runner"],
             env: environment,
@@ -443,7 +432,8 @@ class KubernetesRunnerManager extends EventEmitter {
               allowPrivilegeEscalation: false,
               readOnlyRootFilesystem: true,
               capabilities: { drop: ["ALL"] },
-              seccompProfile: { type: "RuntimeDefault" }
+              seccompProfile: { type: "RuntimeDefault" },
+              appArmorProfile: { type: "RuntimeDefault" }
             },
             resources: {
               requests: { cpu: "25m", memory: "128Mi" },
@@ -541,9 +531,13 @@ class KubernetesRunnerManager extends EventEmitter {
       typeof pod?.metadata?.uid === "string" &&
       pod.metadata.uid.length > 0 &&
       exactJsonValue(pod.metadata.labels, expectedLabels) &&
-      pod.metadata.annotations?.[EXPIRES_AT_ANNOTATION] ===
-        new Date(handle.expiresAtSeconds * 1000).toISOString() &&
-      exactOwnerReference(pod, this.ownerPodName, this.ownerPodUid) &&
+      exactJsonValue(pod.metadata.annotations, {
+        [EXPIRES_AT_ANNOTATION]: new Date(handle.expiresAtSeconds * 1000).toISOString(),
+        [PARENT_NAMESPACE_ANNOTATION]: this.parentNamespace,
+        [PARENT_NAME_ANNOTATION]: this.ownerPodName,
+        [PARENT_UID_ANNOTATION]: this.ownerPodUid
+      }) &&
+      !Object.hasOwn(pod.metadata, "ownerReferences") &&
       this.podSpecMatchesHandle(pod, handle);
   }
 
@@ -583,6 +577,14 @@ class KubernetesRunnerManager extends EventEmitter {
       !Object.hasOwn(container, "envFrom") &&
       !Object.hasOwn(container, "lifecycle") &&
       !Object.hasOwn(container, "ports") &&
+      !Object.hasOwn(container, "volumeDevices") &&
+      !Object.hasOwn(container, "startupProbe") &&
+      !Object.hasOwn(container, "livenessProbe") &&
+      !Object.hasOwn(spec, "runtimeClassName") &&
+      !Object.hasOwn(spec, "resourceClaims") &&
+      !Object.hasOwn(spec, "hostAliases") &&
+      !Object.hasOwn(spec, "dnsConfig") &&
+      !Object.hasOwn(spec, "overhead") &&
       exactJsonValue(spec.volumes, expected.volumes);
   }
 
@@ -819,9 +821,12 @@ module.exports = {
   KubernetesRunnerManager,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
+  PARENT_NAME_ANNOTATION,
+  PARENT_NAMESPACE_ANNOTATION,
+  PARENT_UID_ANNOTATION,
   ROOM_KEY_LABEL,
   RUNNER_APP_LABEL,
-  exactOwnerReference,
+  RUNNER_NAMESPACE,
   podIsReady,
   roomKey,
   runnerPodName

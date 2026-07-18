@@ -1,7 +1,15 @@
 defmodule Ret.BotRunnerLeaseTest.ControlledStore do
   @behaviour Ret.BotRunnerLease.Store
 
-  def acquire(agent, hub_sid, lease_id, holder_id, session_id, _ttl_seconds) do
+  def acquire(
+        agent,
+        hub_sid,
+        lease_id,
+        holder_id,
+        session_id,
+        _generation_claims,
+        _ttl_seconds
+      ) do
     Agent.get_and_update(agent, fn state ->
       cond do
         state.mode == :database_unavailable ->
@@ -111,11 +119,15 @@ defmodule Ret.BotRunnerLeaseTest do
   alias Ret.BotRunnerLease
   alias Ret.BotRunnerLease.PostgresStore
 
+  @recovery_epoch "44444444-4444-4444-8444-444444444444"
+
   setup [:create_account, :create_owned_file, :create_scene, :create_hub]
 
   test "revocation consumes a global epoch and rejects the old exact fence", %{hub: hub} do
     session_id = Ecto.UUID.generate()
-    {:ok, lease} = BotRunnerLease.register_for_session(hub.hub_sid, session_id)
+
+    {:ok, lease} =
+      BotRunnerLease.register_for_session(hub.hub_sid, session_id, generation_claims(hub.hub_sid))
 
     assert {:ok, :executed} =
              BotRunnerLease.with_authority(
@@ -154,15 +166,30 @@ defmodule Ret.BotRunnerLeaseTest do
     second_session = Ecto.UUID.generate()
 
     {:ok, first_lease} =
-      BotRunnerLease.register_for_session(first, hub.hub_sid, first_session)
+      BotRunnerLease.register_for_session(
+        first,
+        hub.hub_sid,
+        first_session,
+        generation_claims(hub.hub_sid)
+      )
 
     assert {:error, :lease_unavailable} =
-             BotRunnerLease.register_for_session(second, hub.hub_sid, second_session)
+             BotRunnerLease.register_for_session(
+               second,
+               hub.hub_sid,
+               second_session,
+               generation_claims(hub.hub_sid)
+             )
 
     force_expiry!(hub.hub_id)
 
     {:ok, second_lease} =
-      BotRunnerLease.register_for_session(second, hub.hub_sid, second_session)
+      BotRunnerLease.register_for_session(
+        second,
+        hub.hub_sid,
+        second_session,
+        generation_claims(hub.hub_sid)
+      )
 
     assert second_lease.authority_epoch > first_lease.authority_epoch
 
@@ -227,7 +254,8 @@ defmodule Ret.BotRunnerLeaseTest do
             BotRunnerLease.register_for_session(
               coordinator,
               hub.hub_sid,
-              Ecto.UUID.generate()
+              Ecto.UUID.generate(),
+              generation_claims(hub.hub_sid)
             )
 
           send(parent, {:acquisition_result, self(), coordinator, result})
@@ -282,7 +310,8 @@ defmodule Ret.BotRunnerLeaseTest do
              BotRunnerLease.register_for_session(
                coordinator,
                hub.hub_sid,
-               Ecto.UUID.generate()
+               Ecto.UUID.generate(),
+               generation_claims(hub.hub_sid)
              )
 
     assert BotRunnerLease.snapshot(coordinator, hub.hub_sid) == nil
@@ -304,7 +333,12 @@ defmodule Ret.BotRunnerLeaseTest do
       )
 
     {:ok, lease} =
-      BotRunnerLease.register_for_session(coordinator, hub.hub_sid, Ecto.UUID.generate())
+      BotRunnerLease.register_for_session(
+        coordinator,
+        hub.hub_sid,
+        Ecto.UUID.generate(),
+        generation_claims(hub.hub_sid)
+      )
 
     Agent.update(agent, &%{&1 | mode: :database_unavailable})
     assert :ok = BotRunnerLease.renew_now(coordinator)
@@ -329,7 +363,12 @@ defmodule Ret.BotRunnerLeaseTest do
       )
 
     {:ok, lease} =
-      BotRunnerLease.register_for_session(coordinator, hub.hub_sid, Ecto.UUID.generate())
+      BotRunnerLease.register_for_session(
+        coordinator,
+        hub.hub_sid,
+        Ecto.UUID.generate(),
+        generation_claims(hub.hub_sid)
+      )
 
     reference = make_ref()
     test_pid = self()
@@ -363,7 +402,11 @@ defmodule Ret.BotRunnerLeaseTest do
     owner =
       Task.async(fn ->
         {:ok, lease} =
-          BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+          BotRunnerLease.register_for_session(
+            hub.hub_sid,
+            Ecto.UUID.generate(),
+            generation_claims(hub.hub_sid)
+          )
 
         send(parent, {:callback_lease, self(), lease})
 
@@ -436,12 +479,231 @@ defmodule Ret.BotRunnerLeaseTest do
     assert_atomic_runtime_restart(RetWeb.Presence, hub)
   end
 
+  test "release and A-B-A replacement cannot replay a consumed generation or advance epoch", %{
+    hub: hub
+  } do
+    generation_a =
+      generation_claims(hub.hub_sid, %{
+        "process_generation" => "11111111-1111-4111-8111-111111111111",
+        "holder_id" => "holder-a"
+      })
+
+    {lease_a, holder_a, session_a, epoch_a} = acquire_direct!(hub, generation_a)
+
+    assert {:ok, release_epoch_a} =
+             PostgresStore.release(
+               Repo,
+               hub.hub_sid,
+               lease_a,
+               holder_a,
+               session_a,
+               epoch_a
+             )
+
+    epoch_before_replay = authority_sequence_last()
+
+    assert {:error, :generation_replayed} =
+             acquire_direct(hub, generation_a) |> elem(0)
+
+    assert authority_sequence_last() == epoch_before_replay
+    assert release_epoch_a == epoch_before_replay
+
+    generation_b =
+      generation_claims(hub.hub_sid, %{
+        "process_generation" => "22222222-2222-4222-8222-222222222222",
+        "holder_id" => "holder-b"
+      })
+
+    {lease_b, holder_b, session_b, epoch_b} = acquire_direct!(hub, generation_b)
+
+    assert {:ok, _release_epoch_b} =
+             PostgresStore.release(
+               Repo,
+               hub.hub_sid,
+               lease_b,
+               holder_b,
+               session_b,
+               epoch_b
+             )
+
+    epoch_before_a_b_a = authority_sequence_last()
+    assert {:error, :generation_replayed} = acquire_direct(hub, generation_a) |> elem(0)
+    assert authority_sequence_last() == epoch_before_a_b_a
+    assert generation_count(hub.hub_id) == 2
+  end
+
+  test "revoke preserves the consumed generation and replay does not advance epoch", %{hub: hub} do
+    claims = generation_claims(hub.hub_sid)
+    {_lease_id, _holder_id, _session_id, _epoch} = acquire_direct!(hub, claims)
+
+    assert {:ok, revoke_epoch} = PostgresStore.revoke(Repo, hub.hub_sid)
+    epoch_before_replay = authority_sequence_last()
+    assert revoke_epoch == epoch_before_replay
+
+    assert {:error, :generation_replayed} = acquire_direct(hub, claims) |> elem(0)
+    assert authority_sequence_last() == epoch_before_replay
+    assert generation_count(hub.hub_id) == 1
+  end
+
+  test "lease expiry and coordinator restart cannot make a consumed generation reusable", %{
+    hub: hub
+  } do
+    coordinator = start_coordinator(holder_id: Ecto.UUID.generate())
+    claims = generation_claims(hub.hub_sid)
+
+    assert {:ok, _lease} =
+             BotRunnerLease.register_for_session(
+               coordinator,
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               claims
+             )
+
+    GenServer.stop(coordinator, :normal)
+    force_expiry!(hub.hub_id)
+    replacement = start_coordinator(holder_id: Ecto.UUID.generate())
+    epoch_before_replay = authority_sequence_last()
+
+    assert {:error, :runner_generation_replayed} =
+             BotRunnerLease.register_for_session(
+               replacement,
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               claims
+             )
+
+    assert authority_sequence_last() == epoch_before_replay
+    assert generation_count(hub.hub_id) == 1
+  end
+
+  test "an active lease blocks but does not consume the next exact generation", %{hub: hub} do
+    incumbent = start_coordinator(holder_id: Ecto.UUID.generate())
+    replacement = start_coordinator(holder_id: Ecto.UUID.generate())
+    incumbent_claims = generation_claims(hub.hub_sid)
+
+    replacement_claims =
+      generation_claims(hub.hub_sid, %{
+        "process_generation" => "33333333-3333-4333-8333-333333333333",
+        "holder_id" => "replacement-holder",
+        "exp" => System.system_time(:second) + 240
+      })
+
+    assert {:ok, incumbent_lease} =
+             BotRunnerLease.register_for_session(
+               incumbent,
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               incumbent_claims
+             )
+
+    epoch_before_block = authority_sequence_last()
+
+    assert {:error, :lease_unavailable} =
+             BotRunnerLease.register_for_session(
+               replacement,
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               replacement_claims
+             )
+
+    assert authority_sequence_last() == epoch_before_block
+    refute generation_consumed?(hub.hub_id, replacement_claims["process_generation"])
+    assert :ok = BotRunnerLease.unregister(incumbent, hub.hub_sid, incumbent_lease.lease_id)
+
+    assert {:ok, replacement_lease} =
+             BotRunnerLease.register_for_session(
+               replacement,
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               replacement_claims
+             )
+
+    assert generation_consumed?(hub.hub_id, replacement_claims["process_generation"])
+
+    assert %{rows: [["replacement-holder", token_expiry]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT holder_id, extract(epoch FROM token_expires_at)::bigint
+               FROM ret0.bot_runner_generations
+               WHERE hub_id = $1 AND process_generation = $2::text::uuid
+               """,
+               [hub.hub_id, replacement_claims["process_generation"]]
+             )
+
+    assert token_expiry == replacement_claims["exp"]
+    assert :ok = BotRunnerLease.unregister(replacement, hub.hub_sid, replacement_lease.lease_id)
+  end
+
+  test "claims expiring behind the advisory lock mutate no generation, lease, or epoch", %{
+    hub: hub
+  } do
+    %{rows: [[database_now]]} =
+      SQL.query!(Repo, "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint", [])
+
+    claims = generation_claims(hub.hub_sid, %{"exp" => database_now + 1})
+    epoch_before = authority_sequence_last()
+    generations_before = generation_count(hub.hub_id)
+    lease_rows_before = lease_count(hub.hub_id)
+
+    connection_options =
+      Repo.config()
+      |> Keyword.take([
+        :hostname,
+        :port,
+        :username,
+        :password,
+        :database,
+        :socket_dir,
+        :ssl,
+        :ssl_opts
+      ])
+
+    {:ok, lock_connection} = Postgrex.start_link(connection_options)
+    {:ok, clock_connection} = Postgrex.start_link(connection_options)
+    parent = self()
+
+    locker =
+      Task.async(fn ->
+        Postgrex.transaction(lock_connection, fn connection ->
+          Postgrex.query!(
+            connection,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            ["bot-runner-authority:v1:" <> hub.hub_sid]
+          )
+
+          send(parent, :advisory_lock_held)
+
+          receive do
+            :release_advisory_lock -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :advisory_lock_held, 2_000
+    acquire = Task.async(fn -> acquire_direct(hub, claims) |> elem(0) end)
+    assert Task.yield(acquire, 100) == nil
+    wait_for_database_time(clock_connection, claims["exp"])
+    send(locker.pid, :release_advisory_lock)
+
+    assert {:error, :invalid_generation_claims} = Task.await(acquire, 2_000)
+    assert {:ok, _} = Task.await(locker, 2_000)
+    assert authority_sequence_last() == epoch_before
+    assert generation_count(hub.hub_id) == generations_before
+    assert lease_count(hub.hub_id) == lease_rows_before
+    refute generation_consumed?(hub.hub_id, claims["process_generation"])
+  end
+
   defp assert_atomic_runtime_restart(crashed_name, hub) do
     old_holder = BotRunnerLease.holder_id()
     previous_pids = runtime_pids()
 
     {:ok, old_lease} =
-      BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+      BotRunnerLease.register_for_session(
+        hub.hub_sid,
+        Ecto.UUID.generate(),
+        generation_claims(hub.hub_sid)
+      )
 
     monitors =
       Map.new(previous_pids, fn {name, pid} ->
@@ -468,11 +730,24 @@ defmodule Ret.BotRunnerLeaseTest do
              old_lease.authority_epoch
            )
 
+    blocked_generation = generation_claims(hub.hub_sid)
+
     assert {:error, :lease_unavailable} =
-             BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+             BotRunnerLease.register_for_session(
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               blocked_generation
+             )
 
     force_expiry!(hub.hub_id)
-    {:ok, recovered} = BotRunnerLease.register_for_session(hub.hub_sid, Ecto.UUID.generate())
+
+    {:ok, recovered} =
+      BotRunnerLease.register_for_session(
+        hub.hub_sid,
+        Ecto.UUID.generate(),
+        blocked_generation
+      )
+
     assert recovered.authority_epoch > old_lease.authority_epoch
     assert :ok = BotRunnerLease.unregister(hub.hub_sid, recovered.lease_id)
   end
@@ -495,6 +770,104 @@ defmodule Ret.BotRunnerLeaseTest do
       BotRunnerLease.start_link(Keyword.merge([name: nil, renew_interval_ms: 60_000], opts))
 
     pid
+  end
+
+  defp acquire_direct(hub, claims) do
+    lease_id = Ecto.UUID.generate()
+    holder_instance_id = Ecto.UUID.generate()
+    session_id = Ecto.UUID.generate()
+
+    result =
+      PostgresStore.acquire(
+        Repo,
+        hub.hub_sid,
+        lease_id,
+        holder_instance_id,
+        session_id,
+        claims,
+        15
+      )
+
+    {result, lease_id, holder_instance_id, session_id}
+  end
+
+  defp acquire_direct!(hub, claims) do
+    {{:ok, %{epoch: epoch}}, lease_id, holder_instance_id, session_id} =
+      acquire_direct(hub, claims)
+
+    {lease_id, holder_instance_id, session_id, epoch}
+  end
+
+  defp authority_sequence_last do
+    %{rows: [[epoch]]} =
+      SQL.query!(Repo, "SELECT last_value FROM ret0.bot_runner_authority_epoch_seq", [])
+
+    epoch
+  end
+
+  defp generation_count(hub_id) do
+    %{rows: [[count]]} =
+      SQL.query!(
+        Repo,
+        "SELECT count(*) FROM ret0.bot_runner_generations WHERE hub_id = $1",
+        [hub_id]
+      )
+
+    count
+  end
+
+  defp lease_count(hub_id) do
+    %{rows: [[count]]} =
+      SQL.query!(Repo, "SELECT count(*) FROM ret0.bot_runner_leases WHERE hub_id = $1", [hub_id])
+
+    count
+  end
+
+  defp generation_consumed?(hub_id, process_generation) do
+    %{rows: [[consumed]]} =
+      SQL.query!(
+        Repo,
+        "SELECT EXISTS (SELECT 1 FROM ret0.bot_runner_generations WHERE hub_id = $1 AND process_generation = $2::text::uuid)",
+        [hub_id, process_generation]
+      )
+
+    consumed
+  end
+
+  defp generation_claims(hub_sid, overrides \\ %{}) do
+    Map.merge(
+      %{
+        "v" => 1,
+        "aud" => "yenhubs-bot-runner",
+        "hub_sid" => hub_sid,
+        "process_generation" => Ecto.UUID.generate(),
+        "holder_id" => Ecto.UUID.generate(),
+        "recovery_epoch" => @recovery_epoch,
+        "exp" => System.system_time(:second) + 300
+      },
+      overrides
+    )
+  end
+
+  defp wait_for_database_time(connection, target, attempts \\ 100)
+
+  defp wait_for_database_time(_connection, _target, 0),
+    do: flunk("database clock did not reach token expiry")
+
+  defp wait_for_database_time(connection, target, attempts) do
+    %{rows: [[now]]} =
+      Postgrex.query!(
+        connection,
+        "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
+        []
+      )
+
+    if now >= target do
+      :ok
+    else
+      Process.sleep(25)
+      wait_for_database_time(connection, target, attempts - 1)
+    end
   end
 
   defp force_expiry!(hub_id) do

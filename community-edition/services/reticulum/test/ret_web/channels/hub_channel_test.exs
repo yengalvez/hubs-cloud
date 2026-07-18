@@ -2,6 +2,7 @@ defmodule RetWeb.HubChannelTest do
   use RetWeb.ChannelCase
   import Ret.TestHelpers
 
+  alias Ecto.Adapters.SQL
   alias RetWeb.{Presence, SessionSocket}
 
   alias Ret.{
@@ -297,7 +298,7 @@ defmodule RetWeb.HubChannelTest do
     setup %{hub: hub} do
       original_bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
       original_orchestrator_access_key = Application.get_env(:ret, :bot_orchestrator_access_key)
-      bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
+      legacy_bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
       orchestrator_access_key = String.duplicate("trusted-orchestrator-key-", 2)
       bot_admin = create_account("bot-runner-admin-#{System.unique_integer([:positive])}", true)
 
@@ -316,8 +317,15 @@ defmodule RetWeb.HubChannelTest do
         })
         |> BotConfigAdmission.update(bot_admin)
 
-      Application.put_env(:ret, :bot_runner_access_key, bot_access_key)
+      Application.put_env(:ret, :bot_runner_access_key, legacy_bot_access_key)
       Application.put_env(:ret, :bot_orchestrator_access_key, orchestrator_access_key)
+
+      bot_access_key =
+        runner_generation_token(
+          hub.hub_sid,
+          orchestrator_access_key,
+          System.system_time(:second) + 300
+        )
 
       on_exit(fn ->
         if is_nil(original_bot_access_key) do
@@ -337,10 +345,11 @@ defmodule RetWeb.HubChannelTest do
        bot_access_key: bot_access_key,
        bot_admin: bot_admin,
        hub: hub,
+       legacy_bot_access_key: legacy_bot_access_key,
        orchestrator_access_key: orchestrator_access_key}
     end
 
-    test "publishes bot_runner=true only for a boolean request with a valid access key", %{
+    test "publishes bot_runner=true only for a boolean request with a generation credential", %{
       socket: socket,
       hub: hub,
       bot_access_key: bot_access_key
@@ -363,16 +372,36 @@ defmodule RetWeb.HubChannelTest do
       }
     end
 
+    test "the legacy master runner key cannot acquire bot_runner authority", %{
+      socket: socket,
+      hub: hub,
+      legacy_bot_access_key: legacy_bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => legacy_bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      assert {:error, %{reason: "invalid_bot_access_key"}} = join_hub(socket, hub, params)
+      assert BotRunnerLease.snapshot(hub.hub_sid) == nil
+    end
+
     test "accepts a generation token only for its exact room scope", %{
       socket: socket,
       hub: hub,
       orchestrator_access_key: orchestrator_access_key
     } do
+      process_generation = Ecto.UUID.generate()
+      holder_id = Ecto.UUID.generate()
+      expiry = System.system_time(:second) + 300
+
       generation_token =
         runner_generation_token(
           hub.hub_sid,
           orchestrator_access_key,
-          System.system_time(:second) + 300
+          expiry,
+          %{"process_generation" => process_generation, "holder_id" => holder_id}
         )
 
       wrong_room_token =
@@ -392,6 +421,20 @@ defmodule RetWeb.HubChannelTest do
 
       params = Map.put(wrong_params, "bot_access_key", generation_token)
       assert {:ok, %{bot_runner: true}, _runner_socket} = join_hub(socket, hub, params)
+
+      assert %{rows: [[^process_generation, ^holder_id, ^expiry]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT
+                   process_generation::text,
+                   holder_id,
+                   extract(epoch FROM token_expires_at)::bigint
+                 FROM ret0.bot_runner_generations
+                 WHERE hub_id = $1
+                 """,
+                 [hub.hub_id]
+               )
     end
 
     test "quarantine revokes an existing runner and denies new leases before room_stop", %{
@@ -450,7 +493,8 @@ defmodule RetWeb.HubChannelTest do
     test "rejects runner overlap and a later reconnect receives a newer fence", %{
       socket: first_transport,
       hub: hub,
-      bot_access_key: bot_access_key
+      bot_access_key: bot_access_key,
+      orchestrator_access_key: orchestrator_access_key
     } do
       params =
         join_params(%{
@@ -466,8 +510,25 @@ defmodule RetWeb.HubChannelTest do
 
       {:ok, second_transport} = connect(SessionSocket, %{})
 
+      replacement_token =
+        runner_generation_token(
+          hub.hub_sid,
+          orchestrator_access_key,
+          System.system_time(:second) + 300,
+          %{"process_generation" => Ecto.UUID.generate()}
+        )
+
+      replacement_params = Map.put(params, "bot_access_key", replacement_token)
+
       assert {:error, %{reason: "bot_runner_lease_unavailable"}} =
-               join_hub(second_transport, hub, params)
+               join_hub(second_transport, hub, replacement_params)
+
+      assert %{rows: [[0]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT count(*) FROM ret0.bot_runner_generations WHERE hub_id = $1 AND process_generation = $2::text::uuid",
+                 [hub.hub_id, generation_from_token(replacement_token)]
+               )
 
       network_id = bot_network_id(hub, 1)
 
@@ -480,7 +541,9 @@ defmodule RetWeb.HubChannelTest do
       GenServer.stop(first_socket.channel_pid, :normal)
 
       {:ok, replacement_transport} = connect(SessionSocket, %{})
-      {:ok, replacement_join, replacement_socket} = join_hub(replacement_transport, hub, params)
+
+      {:ok, replacement_join, replacement_socket} =
+        join_hub(replacement_transport, hub, replacement_params)
 
       assert replacement_join.bot_runner_authoritative
       assert replacement_join.bot_runner_authority_epoch > first_join.bot_runner_authority_epoch
@@ -498,6 +561,27 @@ defmodule RetWeb.HubChannelTest do
       assert_reply push(replacement_socket, "naf", bot_update_payload(network_id)), :error, %{
         reason: "bot_runner_not_authoritative"
       }
+    end
+
+    test "a released generation credential is terminally rejected on replay", %{
+      socket: first_transport,
+      hub: hub,
+      bot_access_key: bot_access_key
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, _first_join, first_socket} = join_hub(first_transport, hub, params)
+      Process.unlink(first_socket.channel_pid)
+      GenServer.stop(first_socket.channel_pid, :normal)
+
+      {:ok, replay_transport} = connect(SessionSocket, %{})
+
+      assert {:error, %{reason: "bot_runner_generation_replayed"}} =
+               join_hub(replay_transport, hub, params)
     end
 
     test "selects the Presence leader deterministically regardless of map/meta order" do
@@ -999,15 +1083,20 @@ defmodule RetWeb.HubChannelTest do
     "room-bot-#{hub_sid}-bot-#{bot_number}"
   end
 
-  defp runner_generation_token(hub_sid, key, expiry) do
-    payload = %{
-      "v" => 1,
-      "aud" => "yenhubs-bot-runner",
-      "hub_sid" => hub_sid,
-      "process_generation" => "11111111-1111-4111-8111-111111111111",
-      "holder_id" => "22222222-2222-4222-8222-222222222222",
-      "exp" => expiry
-    }
+  defp runner_generation_token(hub_sid, key, expiry, overrides \\ %{}) do
+    payload =
+      Map.merge(
+        %{
+          "v" => 1,
+          "aud" => "yenhubs-bot-runner",
+          "hub_sid" => hub_sid,
+          "process_generation" => "11111111-1111-4111-8111-111111111111",
+          "holder_id" => "22222222-2222-4222-8222-222222222222",
+          "recovery_epoch" => "44444444-4444-4444-8444-444444444444",
+          "exp" => expiry
+        },
+        overrides
+      )
 
     encoded_payload = payload |> Jason.encode!() |> Base.url_encode64(padding: false)
 
@@ -1016,6 +1105,12 @@ defmodule RetWeb.HubChannelTest do
       |> Base.url_encode64(padding: false)
 
     "v1.#{encoded_payload}.#{signature}"
+  end
+
+  defp generation_from_token(token) do
+    ["v1", encoded_payload, _signature] = String.split(token, ".")
+    {:ok, payload_json} = Base.url_decode64(encoded_payload, padding: false)
+    Jason.decode!(payload_json)["process_generation"]
   end
 
   defp create_invite_only_hub() do
