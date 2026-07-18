@@ -4,7 +4,11 @@
 // process can observe secrets inherited from an operator shell or container.
 delete process.env.BOT_ORCHESTRATOR_ACCESS_KEY;
 delete process.env.BOT_RUNNER_ACCESS_KEY;
+delete process.env.BOT_RUNNER_GENERATION_TOKEN;
 delete process.env.OPENAI_API_KEY;
+delete process.env.RUNNER_CONTROL_URL;
+delete process.env.RUNNER_LEASE_HOLDER_ID;
+delete process.env.RUNNER_POD_UID;
 
 const doc = `
 Usage:

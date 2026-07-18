@@ -57,3 +57,9 @@ When running [`render_hcce.sh`](../render_hcce.sh), you can specify your registr
 - [Haproxy](./haproxy/Dockerfile)
 - [Pgbouncer](./pgbouncer/Dockerfile)
 - [Bot Orchestrator](./bot-orchestrator/Dockerfile)
+- [Isolated Bot Runner](./bot-orchestrator/Dockerfile.runner)
+
+The two bot images are built and deployed as one source set but remain separate
+runtime trust domains. Follow the [bot image build, private pull-credential and
+Reticulum-first rollout procedure](./bot-orchestrator/README.md); do not use the
+generic local bulk builder for their production release.

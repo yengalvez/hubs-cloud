@@ -45,6 +45,7 @@ Before applying the configuration file to your Kubernetes cluster, you will need
 To deploy to your K8s cluster on your chosen hosting solution, follow these steps:
 
 - In `input-values.yaml` edit `HUB_DOMAIN`, `ADM_EMAIL`, `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` and optionally `SKETCHFAB_API_KEY` with the values for your site. Change `NODE_COOKIE`, `GUARDIAN_KEY`, and `PHX_KEY` to unique random values. Configure four different random values of at least 32 characters for `BOT_ACCESS_KEY` (legacy integrations only), `BOT_RUNNER_ACCESS_KEY`, `BOT_ORCHESTRATOR_ACCESS_KEY`, and `DASHBOARD_ACCESS_KEY`; the generator rejects reuse between these trust domains.
+- Keep production values in the private `0600` input selected by `HCCE_INPUT_VALUES_PATH` (YenHubs uses `deployment/input-values.local.yaml`). Set both bot image overrides to accepted immutable digests, then run `npm run set-bot-image-pull-config` with `GHCR_USERNAME` and a hidden `GHCR_TOKEN` as documented in [`services/bot-orchestrator/README.md`](services/bot-orchestrator/README.md). The generated kubelet-only pull Secret is mandatory and the generator rejects empty or wrong-registry credentials.
 - Keep `GENERATE_PERSISTENT_VOLUMES: true` and set `PERSISTENT_VOLUME_STORAGE_CLASS` explicitly. Use `default` for the cluster default or an explicit dynamic storage class supported by the cluster. Retained `manual` hostPath volumes are test-only and require the additional explicit `ALLOW_MANUAL_HOSTPATH_STORAGE: true`; omission never falls back to node-local storage.
 - Run `npm run gen-hcce && npm run apply` to generate your configuration in `hcce.yaml` and apply it to your K8s cluster. From the output read your load balancer's external IP address.
 - Expose the services
@@ -134,22 +135,48 @@ merely because database fencing is present.
 The bot trust boundary uses four distinct credentials. The historical
 `BOT_ACCESS_KEY` remains scoped to integration routes such as hub bindings and
 is never mounted into the bot orchestrator. The parent orchestrator receives a
-dedicated inbound key plus the runner key used only for bot snapshots and
-authenticated runner joins; the ghost child receives only the runner key.
+dedicated inbound/signing key plus `OPENAI_API_KEY`; it never receives
+`BOT_RUNNER_ACCESS_KEY`. Bot snapshots use the parent orchestrator credential.
+Each ghost Pod receives only a short-lived HMAC credential scoped to its exact
+room, process generation, orchestrator-Pod holder and expiry. Reticulum accepts
+that credential only for the matching room join; the credential is sent in the
+Phoenix join payload and authenticated control headers, never in a URL or
+client-visible state. It contains no lease or fencing claims. After join,
+Reticulum assigns the mandatory shared-database lease UUID and authority epoch;
+Presence, ACKs, commands and parent readiness must all agree on that exact
+fence. `BOT_RUNNER_ACCESS_KEY` remains only in Reticulum for the legacy runner
+transition and must not be mounted into either bot image.
 Dashboard administration has a fourth independent key and never falls back to
 any bot key. Generated manifests use an exact environment, mount and volume
 allowlist for the secret-bearing parent process.
 
-That child environment allowlist is defense in depth, not a process-isolation
-boundary. The current candidate runs the parent and all ghost children in one
-container under the same UID, PID namespace, and memory cgroup. Compromised
-child JavaScript can therefore attempt to inspect the parent's environment via
-`/proc`, signal sibling/parent processes, or exhaust the shared memory limit and
-take down every room. Public rollout and capacity certification are blocked
-until each runner has a separate pod/container and process namespace, its own
-runner-only credential and resource limits, a minimal NetworkPolicy, and an
-authenticated control channel to the parent. This separation is not yet
-implemented or deployed.
+The source candidate now creates one ephemeral Kubernetes Pod per room and
+generation instead of starting Node children in the parent container. Each Pod
+uses the dedicated digest-pinned `bot-runner` image, UID/GID 10001, its own PID
+namespace and cgroup, explicit requests/limits, read-only root, drop-ALL
+capabilities, RuntimeDefault seccomp and a bounded `/tmp`. Its ServiceAccount
+has no token or RBAC. The parent has a namespaced Role limited to create,
+get/list and UID-preconditioned delete of Pods; because Kubernetes RBAC
+cannot constrain create/list by label, the manager additionally requires exact
+owner, managed-by, room-HMAC and generation labels and deletes every unknown or
+stale managed Pod fail-closed. Room SIDs do not appear in Pod names or labels.
+
+Runner ingress is denied. Egress is limited to kube-dns, the parent control
+service, and public TCP 443 needed for the Hubs/scene endpoints. The
+runner polls an authenticated parent endpoint for exact configuration and
+posts generation-bound readiness status; three consecutive control failures
+terminate it. A readiness file is exposed only after authenticated Reticulum
+presence, exact config ACKs, required navmesh and authoritative bot spawn ACKs.
+The parent reconciles on startup and every five seconds, deletes orphaned Pods
+with UID preconditions, enforces the existing room ceiling, and rotates a Pod
+when its one-hour credential/active deadline expires. This source separation is
+implemented and tested but is not operationally complete until both bot images
+are built, digest-pinned, generated into a staging manifest and accepted live.
+Roll out Reticulum first because it alone provides the compatible legacy-plus-v1
+authentication window; verify it before the new parent/runners. Rollback is the
+reverse: restore legacy parent/runners before old Reticulum. A new runner against
+old Reticulum is an expected fail-closed incompatibility, never a reason to
+bypass authentication.
 
 Authenticated bot chat is private to the requesting browser and requires an
 exact random capability for that Phoenix channel and account in the same room.

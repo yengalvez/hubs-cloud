@@ -80,6 +80,10 @@ defmodule RetWeb.Router do
     plug RetWeb.Plugs.BotRunnerHeaderAuthorization
   end
 
+  pipeline :bot_orchestrator_header_auth do
+    plug RetWeb.Plugs.BotOrchestratorHeaderAuthorization
+  end
+
   pipeline :dashboard_header_auth do
     plug RetWeb.Plugs.DashboardHeaderAuthorization
   end
@@ -217,7 +221,7 @@ defmodule RetWeb.Router do
   end
 
   scope "/api-internal", RetWeb do
-    pipe_through [:bot_runner_header_auth, :secure_headers, :parsed_body, :api] ++
+    pipe_through [:bot_orchestrator_header_auth, :secure_headers, :parsed_body, :api] ++
                    if(secure?, do: [:ssl_only], else: [])
 
     scope "/v1", as: :api_internal_v1_bot_runner do

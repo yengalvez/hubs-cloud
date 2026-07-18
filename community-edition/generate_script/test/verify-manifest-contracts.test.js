@@ -17,6 +17,9 @@ const {
   verifyBotOrchestratorRuntimeEnv,
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
+  verifyBotImagePullSecret,
+  verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerNetworkPolicy,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,
@@ -29,10 +32,6 @@ const {
 function validContainer() {
   return {
     env: [
-      {
-        name: "BOT_RUNNER_ACCESS_KEY",
-        valueFrom: { secretKeyRef: { name: "configs", key: "BOT_RUNNER_ACCESS_KEY" } }
-      },
       {
         name: "BOT_ORCHESTRATOR_ACCESS_KEY",
         valueFrom: { secretKeyRef: { name: "configs", key: "BOT_ORCHESTRATOR_ACCESS_KEY" } }
@@ -62,11 +61,27 @@ function validBotContainer() {
 
 function validRuntimeContainer() {
   const secrets = Object.fromEntries(validContainer().env.map(entry => [entry.name, entry]));
+  const downwardApi = {
+    POD_NAMESPACE: "metadata.namespace",
+    ORCHESTRATOR_POD_NAME: "metadata.name",
+    ORCHESTRATOR_POD_UID: "metadata.uid"
+  };
   return {
     env: BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES.map(name =>
       secrets[name]
         ? clone(secrets[name])
-        : { name, value: BOT_ORCHESTRATOR_RUNTIME_ENV[name] ?? "test-literal" }
+        : downwardApi[name]
+          ? {
+              name,
+              valueFrom: { fieldRef: { apiVersion: "v1", fieldPath: downwardApi[name] } }
+            }
+          : {
+              name,
+              value:
+                name === "BOT_RUNNER_IMAGE"
+                  ? `registry.invalid/bot-runner@sha256:${"a".repeat(64)}`
+                  : BOT_ORCHESTRATOR_RUNTIME_ENV[name] ?? "test-literal"
+            }
     )
   };
 }
@@ -123,12 +138,12 @@ function validInventoryResources(namespace = "hcce") {
   });
 }
 
-test("accepts exactly one exclusive configs SecretKeyRef for each bot credential", () => {
+test("accepts exactly one exclusive configs SecretKeyRef for each parent credential", () => {
   assert.deepEqual(verifyBotOrchestratorSecretEnv(validContainer()), []);
 });
 
-test("rejects missing and duplicate bot credential environment entries", () => {
-  for (const name of ["BOT_RUNNER_ACCESS_KEY", "BOT_ORCHESTRATOR_ACCESS_KEY", "OPENAI_API_KEY"]) {
+test("rejects missing and duplicate parent credential environment entries", () => {
+  for (const name of ["BOT_ORCHESTRATOR_ACCESS_KEY", "OPENAI_API_KEY"]) {
     const missing = validContainer();
     missing.env = missing.env.filter(entry => entry.name !== name);
     assert.notDeepEqual(verifyBotOrchestratorSecretEnv(missing), [], `${name} missing`);
@@ -139,8 +154,8 @@ test("rejects missing and duplicate bot credential environment entries", () => {
   }
 });
 
-test("rejects literals, wrong Secret refs and extra fields for both bot credentials", () => {
-  for (const name of ["BOT_RUNNER_ACCESS_KEY", "BOT_ORCHESTRATOR_ACCESS_KEY", "OPENAI_API_KEY"]) {
+test("rejects literals, wrong Secret refs and extra fields for parent credentials", () => {
+  for (const name of ["BOT_ORCHESTRATOR_ACCESS_KEY", "OPENAI_API_KEY"]) {
     const index = validContainer().env.findIndex(entry => entry.name === name);
     const cases = [
       entry => {
@@ -173,6 +188,13 @@ test("rejects literals, wrong Secret refs and extra fields for both bot credenti
       assert.notDeepEqual(verifyBotOrchestratorSecretEnv(container), [], `${name} mutation rejected`);
     }
   }
+
+  const leakedMaster = validContainer();
+  leakedMaster.env.push({
+    name: "BOT_RUNNER_ACCESS_KEY",
+    valueFrom: { secretKeyRef: { name: "configs", key: "BOT_RUNNER_ACCESS_KEY" } }
+  });
+  assert.match(verifyBotOrchestratorSecretEnv(leakedMaster).join("\n"), /must never receive/);
 });
 
 test("requires the exact fail-closed bot securityContext", () => {
@@ -224,9 +246,9 @@ test("requires globally unique resource identities and exact critical resource c
   assert.match(deploymentErrors, /exactly one Deployment\/bot-orchestrator/);
 });
 
-test("requires the exact 44-resource apiVersion/kind/namespace/name inventory", () => {
+test("requires the exact 50-resource apiVersion/kind/namespace/name inventory", () => {
   const resources = validInventoryResources();
-  assert.equal(resources.length, 44);
+  assert.equal(resources.length, 50);
   assert.deepEqual(verifyManifestResourceInventory(resources), []);
 
   const extraJob = {
@@ -236,7 +258,7 @@ test("requires the exact 44-resource apiVersion/kind/namespace/name inventory", 
   };
   const extraErrors = verifyManifestResourceInventory([...resources, extraJob]).join("\n");
   assert.match(extraErrors, /unexpected resource/);
-  assert.match(extraErrors, /exactly 44/);
+  assert.match(extraErrors, /exactly 50/);
 
   const wrongNamespace = clone(resources);
   wrongNamespace.find(resource => resource.kind === "Secret").metadata.namespace = "other";
@@ -249,7 +271,7 @@ test("requires the exact 44-resource apiVersion/kind/namespace/name inventory", 
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "pgsql-pv" } },
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "ret-pv" } }
   );
-  assert.equal(manualResources.length, 46);
+  assert.equal(manualResources.length, 52);
   assert.deepEqual(verifyManifestResourceInventory(manualResources), []);
 
   const incompleteManual = manualResources.filter(resource => resource.metadata?.name !== "ret-pv");
@@ -383,6 +405,9 @@ test("pins the bot pod to one bounded tmp volume without executable injection fi
               volumeMounts: [{ name: "bot-orchestrator-tmp", mountPath: "/tmp" }]
             }
           ],
+          serviceAccountName: "bot-orchestrator",
+          automountServiceAccountToken: true,
+          imagePullSecrets: [{ name: "bot-images-pull" }],
           volumes: [{ name: "bot-orchestrator-tmp", emptyDir: { sizeLimit: "256Mi" } }]
         }
       }
@@ -420,6 +445,81 @@ test("keeps the tracked production template on the exact ghost runtime contract"
   );
   assert.deepEqual(verifyBotOrchestratorRuntimeEnv(container), []);
   assert.deepEqual(verifyBotOrchestratorIsolationContract(deployment), []);
+});
+
+test("keeps exact minimal ServiceAccounts, namespaced Pod RBAC, and runner NetworkPolicy", () => {
+  const templatePath = path.resolve(__dirname, "../hcce.yam");
+  const resources = YAML.parseAllDocuments(fs.readFileSync(templatePath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const pullSecret = resources.find(
+    resource => resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull"
+  );
+  assert.equal(pullSecret.data[".dockerconfigjson"], "$BOT_IMAGE_PULL_CONFIG_JSON_BASE64");
+  const botContainer = resources
+    .find(resource => resource.kind === "Deployment" && resource.metadata?.name === "bot-orchestrator")
+    .spec.template.spec.containers.find(container => container.name === "bot-orchestrator");
+  botContainer.image = `registry.invalid/yenhubs/bot-orchestrator@sha256:${"a".repeat(64)}`;
+  botContainer.env.find(entry => entry.name === "BOT_RUNNER_IMAGE").value =
+    `registry.invalid/yenhubs/bot-runner@sha256:${"b".repeat(64)}`;
+  pullSecret.data[".dockerconfigjson"] = Buffer.from(
+    JSON.stringify({
+      auths: { "registry.invalid": { auth: Buffer.from("ci-user:ci-token").toString("base64") } }
+    }),
+    "utf8"
+  ).toString("base64");
+
+  assert.deepEqual(verifyBotImagePullSecret(resources, "$Namespace"), []);
+  assert.deepEqual(verifyBotRunnerControlPlaneResources(resources, "$Namespace"), []);
+  const policy = resources.find(
+    resource => resource.kind === "NetworkPolicy" && resource.metadata?.name === "bot-runner-isolation"
+  );
+  assert.deepEqual(verifyBotRunnerNetworkPolicy(policy), []);
+
+  const expandedRole = clone(resources);
+  expandedRole
+    .find(resource => resource.kind === "Role" && resource.metadata?.name === "bot-orchestrator-runner-pods")
+    .rules[0].verbs.push("patch");
+  assert.match(
+    verifyBotRunnerControlPlaneResources(expandedRole, "$Namespace").join("\n"),
+    /minimal runner-Pod RBAC/
+  );
+
+  const tokenizedRunner = clone(resources);
+  tokenizedRunner
+    .find(resource => resource.kind === "ServiceAccount" && resource.metadata?.name === "bot-runner")
+    .automountServiceAccountToken = true;
+  assert.notDeepEqual(verifyBotRunnerControlPlaneResources(tokenizedRunner, "$Namespace"), []);
+
+  const malformedPullSecret = clone(resources);
+  malformedPullSecret
+    .find(resource => resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull")
+    .data[".dockerconfigjson"] = "not-base64";
+  assert.notDeepEqual(verifyBotImagePullSecret(malformedPullSecret, "$Namespace"), []);
+
+  const emptyPullCredential = clone(resources);
+  emptyPullCredential
+    .find(resource => resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull")
+    .data[".dockerconfigjson"] = Buffer.from(
+      JSON.stringify({ auths: { "registry.invalid": {} } }),
+      "utf8"
+    ).toString("base64");
+  assert.notDeepEqual(verifyBotImagePullSecret(emptyPullCredential, "$Namespace"), []);
+
+  const wrongPullRegistry = clone(resources);
+  wrongPullRegistry
+    .find(resource => resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull")
+    .data[".dockerconfigjson"] = Buffer.from(
+      JSON.stringify({
+        auths: { "other.invalid": { auth: Buffer.from("ci-user:ci-token").toString("base64") } }
+      }),
+      "utf8"
+    ).toString("base64");
+  assert.notDeepEqual(verifyBotImagePullSecret(wrongPullRegistry, "$Namespace"), []);
+
+  const broadenedPolicy = clone(policy);
+  broadenedPolicy.spec.egress.push({ to: [{}] });
+  assert.notDeepEqual(verifyBotRunnerNetworkPolicy(broadenedPolicy), []);
 });
 
 test("keeps Reticulum singleton until multi-replica storage and operational gates are staged", () => {

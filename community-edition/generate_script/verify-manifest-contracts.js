@@ -17,6 +17,79 @@ function exactStructuredValue(actual, expected) {
   return actual === expected;
 }
 
+function normalizedRegistryHost(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const raw = value.trim().toLowerCase();
+  let host;
+  try {
+    host = raw.includes("://") ? new URL(raw).host : raw.split("/")[0];
+  } catch (_error) {
+    return null;
+  }
+  if (!host) return null;
+  if (["index.docker.io", "registry-1.docker.io"].includes(host)) return "docker.io";
+  return host;
+}
+
+function imageRegistryHost(image) {
+  if (typeof image !== "string" || !image.trim() || image.includes("$")) return null;
+  const reference = image.trim();
+  const first = reference.split("/")[0].toLowerCase();
+  if (reference.includes("/") && (first.includes(".") || first.includes(":") || first === "localhost")) {
+    return normalizedRegistryHost(first);
+  }
+  return "docker.io";
+}
+
+function usableDockerRegistryCredential(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (
+    typeof value.identitytoken === "string" &&
+    value.identitytoken.trim() &&
+    !/[\u0000-\u001f\u007f]/u.test(value.identitytoken)
+  ) {
+    return true;
+  }
+  if (typeof value.auth !== "string" || !value.auth) return false;
+  try {
+    const decoded = Buffer.from(value.auth, "base64");
+    if (decoded.toString("base64") !== value.auth) return false;
+    const credential = decoded.toString("utf8");
+    const separator = credential.indexOf(":");
+    return separator > 0 && separator < credential.length - 1 && !/[\u0000-\u001f\u007f]/u.test(credential);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function verifyDockerConfigCredentials(encoded, imageReferences = []) {
+  if (typeof encoded !== "string" || !encoded) throw new Error("docker_config_base64_invalid");
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.toString("base64") !== encoded) throw new Error("docker_config_base64_invalid");
+  const parsed = JSON.parse(decoded.toString("utf8"));
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !parsed.auths ||
+    typeof parsed.auths !== "object" ||
+    Array.isArray(parsed.auths)
+  ) {
+    throw new Error("docker_config_auths_invalid");
+  }
+  const credentials = new Map();
+  for (const [registry, credential] of Object.entries(parsed.auths)) {
+    const host = normalizedRegistryHost(registry);
+    if (host && usableDockerRegistryCredential(credential)) credentials.set(host, credential);
+  }
+  if (credentials.size === 0) throw new Error("docker_config_credentials_missing");
+  const requiredRegistries = new Set(imageReferences.map(imageRegistryHost).filter(Boolean));
+  for (const registry of requiredRegistries) {
+    if (!credentials.has(registry)) throw new Error(`docker_config_registry_missing:${registry}`);
+  }
+  return parsed;
+}
+
 const EXPECTED_API_VERSION_BY_GROUP = Object.freeze({
   "": "v1",
   apps: "apps/v1",
@@ -39,9 +112,13 @@ const BOT_ORCHESTRATOR_RUNTIME_ENV = Object.freeze({
   RUNNER_BACKEND: "ghost",
   RUNNER_BACKEND_CANARY_HUBS: "",
   RUNNER_SCRIPT: "/app/run-bot.js",
+  RUNNER_CONTROL_URL: "http://bot-orchestrator:5001",
+  RUNNER_POD_RECONCILE_INTERVAL_MS: "5000",
+  RUNNER_TOKEN_TTL_SECONDS: "3600",
+  RUNNER_STARTUP_GRACE_MS: "180000",
   RET_INTERNAL_ENDPOINT: "http://ret:4001",
   RET_INTERNAL_PATH: "/api-internal/v1/hubs/configured_with_bots",
-  RET_INTERNAL_ACCESS_HEADER: "x-ret-bot-runner-access-key",
+  RET_INTERNAL_ACCESS_HEADER: "x-ret-bot-orchestrator-access-key",
   GHOST_RUNNER_SCRIPT: "/app/run-ghost-runner.js",
   GHOST_RAYCAST_MODE: "spoke_colliders",
   GHOST_NAVIGATION_MODE: "navmesh_preferred",
@@ -49,7 +126,6 @@ const BOT_ORCHESTRATOR_RUNTIME_ENV = Object.freeze({
 });
 
 const BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES = Object.freeze([
-  "BOT_RUNNER_ACCESS_KEY",
   "BOT_ORCHESTRATOR_ACCESS_KEY",
   "OPENAI_API_KEY",
   "OPENAI_MODEL",
@@ -58,6 +134,13 @@ const BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES = Object.freeze([
   "RUNNER_BACKEND",
   "RUNNER_BACKEND_CANARY_HUBS",
   "RUNNER_SCRIPT",
+  "BOT_RUNNER_IMAGE",
+  "POD_NAMESPACE",
+  "ORCHESTRATOR_POD_NAME",
+  "ORCHESTRATOR_POD_UID",
+  "RUNNER_CONTROL_URL",
+  "RUNNER_POD_RECONCILE_INTERVAL_MS",
+  "RUNNER_TOKEN_TTL_SECONDS",
   "RET_INTERNAL_ENDPOINT",
   "RET_INTERNAL_PATH",
   "RET_INTERNAL_ACCESS_HEADER",
@@ -238,13 +321,13 @@ function canonicalizeIngressSpec(spec) {
   return canonical;
 }
 
-function verifyExactIngressPolicy(policy, { name, targetApp, allowedApps, port }) {
+function verifyExactIngressPolicy(policy, { name, targetApp, allowedApps = [], allowedPeers = null, port }) {
   const expectedSpec = {
     podSelector: { matchLabels: { app: targetApp } },
     policyTypes: ["Ingress"],
     ingress: [
       {
-        from: allowedApps.map(app => ({ podSelector: { matchLabels: { app } } })),
+        from: allowedPeers || allowedApps.map(app => ({ podSelector: { matchLabels: { app } } })),
         ports: [{ protocol: "TCP", port }]
       }
     ]
@@ -265,6 +348,7 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
   const inventory = [
     ["", "Namespace", "", namespace],
     namespaced("", "Secret", "configs"),
+    namespaced("", "Secret", "bot-images-pull"),
     namespaced("", "PersistentVolumeClaim", "pgsql-pvc"),
     namespaced("", "PersistentVolumeClaim", "ret-pvc"),
     namespaced("networking.k8s.io", "Ingress", "ret"),
@@ -275,6 +359,10 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     namespaced("", "Service", "ret"),
     namespaced("apps", "Deployment", "bot-orchestrator"),
     namespaced("", "Service", "bot-orchestrator"),
+    namespaced("", "ServiceAccount", "bot-orchestrator"),
+    namespaced("", "ServiceAccount", "bot-runner"),
+    namespaced("rbac.authorization.k8s.io", "Role", "bot-orchestrator-runner-pods"),
+    namespaced("rbac.authorization.k8s.io", "RoleBinding", "bot-orchestrator-runner-pods"),
     namespaced("", "Service", "pgsql"),
     namespaced("apps", "Deployment", "pgsql"),
     namespaced("apps", "Deployment", "pgbouncer"),
@@ -302,6 +390,7 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     ["rbac.authorization.k8s.io", "ClusterRole", "", "haproxy-cr"],
     ["rbac.authorization.k8s.io", "ClusterRoleBinding", "", "haproxy-rb"],
     namespaced("networking.k8s.io", "NetworkPolicy", "bot-orchestrator-ingress"),
+    namespaced("networking.k8s.io", "NetworkPolicy", "bot-runner-isolation"),
     namespaced("networking.k8s.io", "NetworkPolicy", "pgsql-ingress"),
     namespaced("networking.k8s.io", "NetworkPolicy", "pgbouncer-ingress"),
     namespaced("networking.k8s.io", "NetworkPolicy", "pgbouncer-t-ingress"),
@@ -323,7 +412,6 @@ function verifyBotOrchestratorSecretEnv(container) {
   const errors = [];
   const env = Array.isArray(container && container.env) ? container.env : [];
   const contracts = [
-    { name: "BOT_RUNNER_ACCESS_KEY", key: "BOT_RUNNER_ACCESS_KEY" },
     { name: "BOT_ORCHESTRATOR_ACCESS_KEY", key: "BOT_ORCHESTRATOR_ACCESS_KEY" },
     { name: "OPENAI_API_KEY", key: "OPENAI_API_KEY" }
   ];
@@ -353,6 +441,10 @@ function verifyBotOrchestratorSecretEnv(container) {
         `valueFrom.secretKeyRef name=configs key=${contract.key} with no extra fields`
       );
     }
+  }
+
+  if (env.some(entry => entry?.name === "BOT_RUNNER_ACCESS_KEY")) {
+    errors.push("bot-orchestrator must never receive BOT_RUNNER_ACCESS_KEY");
   }
 
   return errors;
@@ -541,16 +633,38 @@ function verifyBotOrchestratorRuntimeEnv(container) {
     );
   }
 
-  const secretNames = new Set([
-    "BOT_RUNNER_ACCESS_KEY",
-    "BOT_ORCHESTRATOR_ACCESS_KEY",
-    "OPENAI_API_KEY"
-  ]);
+  const secretNames = new Set(["BOT_ORCHESTRATOR_ACCESS_KEY", "OPENAI_API_KEY"]);
+  const downwardApi = Object.freeze({
+    POD_NAMESPACE: "metadata.namespace",
+    ORCHESTRATOR_POD_NAME: "metadata.name",
+    ORCHESTRATOR_POD_UID: "metadata.uid"
+  });
   for (const entry of env) {
-    if (!entry || secretNames.has(entry.name)) continue;
+    if (!entry || secretNames.has(entry.name) || Object.hasOwn(downwardApi, entry.name)) continue;
     if (!hasExactOwnKeys(entry, ["name", "value"]) || typeof entry.value !== "string") {
       errors.push(`bot-orchestrator ${entry.name || "<unnamed>"} must be one literal string env entry`);
     }
+  }
+  for (const [name, fieldPath] of Object.entries(downwardApi)) {
+    const matches = env.filter(entry => entry?.name === name);
+    const expected = {
+      name,
+      valueFrom: { fieldRef: { apiVersion: "v1", fieldPath } }
+    };
+    if (matches.length !== 1 || !exactStructuredValue(matches[0], expected)) {
+      errors.push(`bot-orchestrator ${name} must use the exact Downward API field ${fieldPath}`);
+    }
+  }
+  const runnerImage = env.filter(entry => entry?.name === "BOT_RUNNER_IMAGE");
+  if (
+    runnerImage.length !== 1 ||
+    !hasExactOwnKeys(runnerImage[0], ["name", "value"]) ||
+    !(
+      /^.+@sha256:[0-9a-f]{64}$/.test(runnerImage[0].value || "") ||
+      runnerImage[0].value === "$BOT_RUNNER_IMAGE"
+    )
+  ) {
+    errors.push("bot-orchestrator BOT_RUNNER_IMAGE must be one immutable sha256 digest reference");
   }
   for (const [name, value] of Object.entries(BOT_ORCHESTRATOR_RUNTIME_ENV)) {
     const matches = Array.isArray(env) ? env.filter(entry => entry && entry.name === name) : [];
@@ -588,7 +702,172 @@ function verifyBotOrchestratorIsolationContract(deployment) {
   if (Array.isArray(podSpec?.initContainers) || Array.isArray(podSpec?.ephemeralContainers)) {
     errors.push("Deployment/bot-orchestrator must not define init or ephemeral containers");
   }
+  if (
+    podSpec?.serviceAccountName !== "bot-orchestrator" ||
+    podSpec?.automountServiceAccountToken !== true ||
+    !exactStructuredValue(podSpec?.imagePullSecrets, [{ name: "bot-images-pull" }])
+  ) {
+    errors.push("Deployment/bot-orchestrator must use its dedicated service account and image-pull Secret");
+  }
   return errors;
+}
+
+function verifyBotImagePullSecret(resources, namespace) {
+  const secret = findExactResource(resources, "", "Secret", namespace, "bot-images-pull");
+  if (
+    !secret ||
+    !hasExactOwnKeys(secret, ["apiVersion", "kind", "metadata", "type", "data"]) ||
+    secret.apiVersion !== "v1" ||
+    secret.kind !== "Secret" ||
+    !exactStructuredValue(secret.metadata, { name: "bot-images-pull", namespace }) ||
+    secret.type !== "kubernetes.io/dockerconfigjson" ||
+    !hasExactOwnKeys(secret.data, [".dockerconfigjson"]) ||
+    typeof secret.data[".dockerconfigjson"] !== "string"
+  ) {
+    return ["Secret/bot-images-pull must exactly define one Docker config JSON credential"];
+  }
+  try {
+    const encoded = secret.data[".dockerconfigjson"];
+    const deployment = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
+    const container = deployment?.spec?.template?.spec?.containers?.find(value => value?.name === "bot-orchestrator");
+    const runnerImage = container?.env?.find(value => value?.name === "BOT_RUNNER_IMAGE")?.value;
+    verifyDockerConfigCredentials(encoded, [container?.image, runnerImage]);
+  } catch (_error) {
+    return [
+      "Secret/bot-images-pull Docker config must contain canonical credentials for both bot image registries"
+    ];
+  }
+  return [];
+}
+
+function verifyBotRunnerControlPlaneResources(resources, namespace) {
+  const expected = [
+    {
+      identity: ["", "ServiceAccount", namespace, "bot-orchestrator"],
+      value: {
+        apiVersion: "v1",
+        kind: "ServiceAccount",
+        metadata: { name: "bot-orchestrator", namespace },
+        automountServiceAccountToken: true,
+        imagePullSecrets: [{ name: "bot-images-pull" }]
+      }
+    },
+    {
+      identity: ["", "ServiceAccount", namespace, "bot-runner"],
+      value: {
+        apiVersion: "v1",
+        kind: "ServiceAccount",
+        metadata: { name: "bot-runner", namespace },
+        automountServiceAccountToken: false,
+        imagePullSecrets: [{ name: "bot-images-pull" }]
+      }
+    },
+    {
+      identity: ["rbac.authorization.k8s.io", "Role", namespace, "bot-orchestrator-runner-pods"],
+      value: {
+        apiVersion: "rbac.authorization.k8s.io/v1",
+        kind: "Role",
+        metadata: { name: "bot-orchestrator-runner-pods", namespace },
+        rules: [
+          {
+            apiGroups: [""],
+            resources: ["pods"],
+            verbs: ["create", "delete", "get", "list"]
+          }
+        ]
+      }
+    },
+    {
+      identity: ["rbac.authorization.k8s.io", "RoleBinding", namespace, "bot-orchestrator-runner-pods"],
+      value: {
+        apiVersion: "rbac.authorization.k8s.io/v1",
+        kind: "RoleBinding",
+        metadata: { name: "bot-orchestrator-runner-pods", namespace },
+        roleRef: {
+          apiGroup: "rbac.authorization.k8s.io",
+          kind: "Role",
+          name: "bot-orchestrator-runner-pods"
+        },
+        subjects: [{ kind: "ServiceAccount", name: "bot-orchestrator", namespace }]
+      }
+    }
+  ];
+
+  return expected.flatMap(({ identity, value }) => {
+    const actual = findExactResource(resources, ...identity);
+    return exactStructuredValue(
+      canonicalizeUnorderedArrays(actual),
+      canonicalizeUnorderedArrays(value)
+    )
+      ? []
+      : [`${identity[1]}/${identity[3]} must exactly match the minimal runner-Pod RBAC contract`];
+  });
+}
+
+function verifyBotRunnerNetworkPolicy(policy) {
+  const expectedSpec = {
+    podSelector: {
+      matchLabels: {
+        app: "bot-runner",
+        "yenhubs.org/managed-by": "bot-orchestrator"
+      }
+    },
+    policyTypes: ["Ingress", "Egress"],
+    ingress: [],
+    egress: [
+      {
+        to: [{ podSelector: { matchLabels: { app: "bot-orchestrator" } } }],
+        ports: [{ protocol: "TCP", port: 5001 }]
+      },
+      {
+        to: [
+          {
+            namespaceSelector: {
+              matchLabels: { "kubernetes.io/metadata.name": "kube-system" }
+            },
+            podSelector: { matchLabels: { "k8s-app": "kube-dns" } }
+          }
+        ],
+        ports: [
+          { protocol: "UDP", port: 53 },
+          { protocol: "TCP", port: 53 }
+        ]
+      },
+      {
+        to: [
+          {
+            ipBlock: {
+              cidr: "0.0.0.0/0",
+              except: [
+                "0.0.0.0/8",
+                "10.0.0.0/8",
+                "100.64.0.0/10",
+                "127.0.0.0/8",
+                "169.254.0.0/16",
+                "172.16.0.0/12",
+                "192.0.0.0/24",
+                "192.0.2.0/24",
+                "192.168.0.0/16",
+                "198.18.0.0/15",
+                "198.51.100.0/24",
+                "203.0.113.0/24",
+                "224.0.0.0/4",
+                "240.0.0.0/4"
+              ]
+            }
+          }
+        ],
+        ports: [{ protocol: "TCP", port: 443 }]
+      }
+    ]
+  };
+
+  return exactStructuredValue(
+    canonicalizeUnorderedArrays(policy?.spec),
+    canonicalizeUnorderedArrays(expectedSpec)
+  )
+    ? []
+    : ["NetworkPolicy/bot-runner-isolation must exactly match the audited deny-ingress and bounded-egress contract"];
 }
 
 function verifyReticulumBotRunnerAuthorityContract(deployment) {
@@ -663,6 +942,7 @@ module.exports = {
   findExactResource,
   hasExactOwnKeys,
   resourceIdentity,
+  verifyDockerConfigCredentials,
   verifyAuditedDeploymentContainers,
   verifyBotOrchestratorContainers,
   verifyBotOrchestratorDeploymentContract,
@@ -670,6 +950,9 @@ module.exports = {
   verifyBotOrchestratorRuntimeEnv,
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
+  verifyBotImagePullSecret,
+  verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerNetworkPolicy,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,

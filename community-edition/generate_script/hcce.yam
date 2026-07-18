@@ -41,6 +41,15 @@ stringData:
   PERMS_KEY: '$PERMS_KEY'
   PGRST_JWT_SECRET: '$PGRST_JWT_SECRET'
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bot-images-pull
+  namespace: "$Namespace"
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: "$BOT_IMAGE_PULL_CONFIG_JSON_BASE64"
+---
 ######################################################################################
 ###################################### ingress #######################################
 ######################################################################################
@@ -317,6 +326,7 @@ data:
     [ret]
     bot_access_key = "<BOT_ACCESS_KEY>"
     bot_runner_access_key = "<BOT_RUNNER_ACCESS_KEY>"
+    bot_orchestrator_access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"
     max_active_bot_rooms = <MAX_ACTIVE_ROOMS>
     # pgrest_host = ""
     # ita_host = ""
@@ -712,10 +722,12 @@ spec:
       labels:
         app: bot-orchestrator
       annotations:
-        yenhubs.org/bot-runner-access-key-checksum: "$BOT_RUNNER_ACCESS_KEY_CHECKSUM"
         yenhubs.org/bot-orchestrator-access-key-checksum: "$BOT_ORCHESTRATOR_ACCESS_KEY_CHECKSUM"
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: bot-orchestrator
+      automountServiceAccountToken: true
+      imagePullSecrets:
+      - name: bot-images-pull
       containers:
       - name: bot-orchestrator
         image: $Container_Dockerhub_Username/bot-orchestrator:$Container_Tag
@@ -741,11 +753,6 @@ spec:
         - containerPort: 5001
           name: http
         env:
-        - name: BOT_RUNNER_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: configs
-              key: BOT_RUNNER_ACCESS_KEY
         - name: BOT_ORCHESTRATOR_ACCESS_KEY
           valueFrom:
             secretKeyRef:
@@ -768,12 +775,35 @@ spec:
           value: ""
         - name: RUNNER_SCRIPT
           value: /app/run-bot.js
+        - name: BOT_RUNNER_IMAGE
+          value: "$BOT_RUNNER_IMAGE"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: ORCHESTRATOR_POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: ORCHESTRATOR_POD_UID
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.uid
+        - name: RUNNER_CONTROL_URL
+          value: http://bot-orchestrator:5001
+        - name: RUNNER_POD_RECONCILE_INTERVAL_MS
+          value: "5000"
+        - name: RUNNER_TOKEN_TTL_SECONDS
+          value: "3600"
         - name: RET_INTERNAL_ENDPOINT
           value: http://ret:4001
         - name: RET_INTERNAL_PATH
           value: /api-internal/v1/hubs/configured_with_bots
         - name: RET_INTERNAL_ACCESS_HEADER
-          value: x-ret-bot-runner-access-key
+          value: x-ret-bot-orchestrator-access-key
         - name: GHOST_RUNNER_SCRIPT
           value: /app/run-ghost-runner.js
         - name: GHOST_RAYCAST_MODE
@@ -821,7 +851,8 @@ spec:
         - name: RUNNER_CONFIG_ACK_TIMEOUT_MS
           value: "15000"
         - name: RUNNER_STARTUP_GRACE_MS
-          value: "60000"
+          # Includes first scheduling and a cold private-image pull.
+          value: "180000"
         - name: RUNNER_STALE_RESTART_MS
           value: "30000"
         - name: RUNNER_TERMINAL_RECOVERY_GRACE_MS
@@ -853,7 +884,7 @@ spec:
           periodSeconds: 15
         readinessProbe:
           httpGet:
-            path: /ready
+            path: /transport-ready
             port: 5001
           initialDelaySeconds: 5
           periodSeconds: 10
@@ -875,6 +906,54 @@ spec:
     protocol: TCP
     port: 5001
     targetPort: 5001
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bot-orchestrator
+  namespace: $Namespace
+automountServiceAccountToken: true
+imagePullSecrets:
+- name: bot-images-pull
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bot-runner
+  namespace: $Namespace
+automountServiceAccountToken: false
+imagePullSecrets:
+- name: bot-images-pull
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bot-orchestrator-runner-pods
+  namespace: $Namespace
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bot-orchestrator-runner-pods
+  namespace: $Namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bot-orchestrator-runner-pods
+subjects:
+- kind: ServiceAccount
+  name: bot-orchestrator
+  namespace: $Namespace
 ---
 ########################################################################
 ######################   pgsql   #######################################
@@ -1811,9 +1890,69 @@ spec:
     - podSelector:
         matchLabels:
           app: reticulum
+    - podSelector:
+        matchLabels:
+          app: bot-runner
+          yenhubs.org/managed-by: bot-orchestrator
     ports:
     - protocol: TCP
       port: 5001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bot-runner-isolation
+  namespace: $Namespace
+spec:
+  podSelector:
+    matchLabels:
+      app: bot-runner
+      yenhubs.org/managed-by: bot-orchestrator
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: bot-orchestrator
+    ports:
+    - protocol: TCP
+      port: 5001
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 0.0.0.0/8
+        - 10.0.0.0/8
+        - 100.64.0.0/10
+        - 127.0.0.0/8
+        - 169.254.0.0/16
+        - 172.16.0.0/12
+        - 192.0.0.0/24
+        - 192.0.2.0/24
+        - 192.168.0.0/16
+        - 198.18.0.0/15
+        - 198.51.100.0/24
+        - 203.0.113.0/24
+        - 224.0.0.0/4
+        - 240.0.0.0/4
+    ports:
+    - protocol: TCP
+      port: 443
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

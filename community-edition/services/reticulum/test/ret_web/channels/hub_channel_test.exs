@@ -296,7 +296,9 @@ defmodule RetWeb.HubChannelTest do
   describe "bot runner presence context" do
     setup %{hub: hub} do
       original_bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
+      original_orchestrator_access_key = Application.get_env(:ret, :bot_orchestrator_access_key)
       bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
+      orchestrator_access_key = String.duplicate("trusted-orchestrator-key-", 2)
       bot_admin = create_account("bot-runner-admin-#{System.unique_integer([:positive])}", true)
 
       {:ok, hub} =
@@ -315,6 +317,7 @@ defmodule RetWeb.HubChannelTest do
         |> BotConfigAdmission.update(bot_admin)
 
       Application.put_env(:ret, :bot_runner_access_key, bot_access_key)
+      Application.put_env(:ret, :bot_orchestrator_access_key, orchestrator_access_key)
 
       on_exit(fn ->
         if is_nil(original_bot_access_key) do
@@ -322,9 +325,19 @@ defmodule RetWeb.HubChannelTest do
         else
           Application.put_env(:ret, :bot_runner_access_key, original_bot_access_key)
         end
+
+        restore_application_env(
+          :ret,
+          :bot_orchestrator_access_key,
+          original_orchestrator_access_key
+        )
       end)
 
-      {:ok, bot_access_key: bot_access_key, bot_admin: bot_admin, hub: hub}
+      {:ok,
+       bot_access_key: bot_access_key,
+       bot_admin: bot_admin,
+       hub: hub,
+       orchestrator_access_key: orchestrator_access_key}
     end
 
     test "publishes bot_runner=true only for a boolean request with a valid access key", %{
@@ -348,6 +361,37 @@ defmodule RetWeb.HubChannelTest do
         bot_spawn_accepted: true,
         network_id: ^network_id
       }
+    end
+
+    test "accepts a generation token only for its exact room scope", %{
+      socket: socket,
+      hub: hub,
+      orchestrator_access_key: orchestrator_access_key
+    } do
+      generation_token =
+        runner_generation_token(
+          hub.hub_sid,
+          orchestrator_access_key,
+          System.system_time(:second) + 300
+        )
+
+      wrong_room_token =
+        runner_generation_token(
+          "other-room",
+          orchestrator_access_key,
+          System.system_time(:second) + 300
+        )
+
+      wrong_params =
+        join_params(%{
+          "bot_access_key" => wrong_room_token,
+          "context" => %{"bot_runner" => true}
+        })
+
+      assert {:error, %{reason: "invalid_bot_access_key"}} = join_hub(socket, hub, wrong_params)
+
+      params = Map.put(wrong_params, "bot_access_key", generation_token)
+      assert {:ok, %{bot_runner: true}, _runner_socket} = join_hub(socket, hub, params)
     end
 
     test "quarantine revokes an existing runner and denies new leases before room_stop", %{
@@ -953,6 +997,25 @@ defmodule RetWeb.HubChannelTest do
 
   defp bot_network_id(%Hub{hub_sid: hub_sid}, bot_number) do
     "room-bot-#{hub_sid}-bot-#{bot_number}"
+  end
+
+  defp runner_generation_token(hub_sid, key, expiry) do
+    payload = %{
+      "v" => 1,
+      "aud" => "yenhubs-bot-runner",
+      "hub_sid" => hub_sid,
+      "process_generation" => "11111111-1111-4111-8111-111111111111",
+      "holder_id" => "22222222-2222-4222-8222-222222222222",
+      "exp" => expiry
+    }
+
+    encoded_payload = payload |> Jason.encode!() |> Base.url_encode64(padding: false)
+
+    signature =
+      :crypto.mac(:hmac, :sha256, key, "v1.#{encoded_payload}")
+      |> Base.url_encode64(padding: false)
+
+    "v1.#{encoded_payload}.#{signature}"
   end
 
   defp create_invite_only_hub() do
