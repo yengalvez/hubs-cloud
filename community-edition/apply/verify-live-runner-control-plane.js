@@ -1,11 +1,10 @@
 const { execFileSync, spawnSync } = require("node:child_process");
 const path = require("node:path");
-const utils = require("../utils");
 const {
   collectLiveRunnerControlPlane,
   verifyLiveRunnerControlPlane
 } = require("./live-runner-control-plane");
-const { readActivationPlan } = require("./runner-activation");
+const { verifyManifestAgainstInputValues } = require("./manifest-input-contract");
 const {
   effectiveRbacReviewSpecs,
   selfSubjectRulesReviewRequest,
@@ -25,6 +24,7 @@ function requiredEnvironmentPath(name) {
 function main() {
   const inputPath = requiredEnvironmentPath("HCCE_INPUT_VALUES_PATH");
   const manifestPath = requiredEnvironmentPath("HCCE_MANIFEST_PATH");
+  const { config, plan } = verifyManifestAgainstInputValues(inputPath, manifestPath);
   const context = process.env.KUBECTL_CONTEXT;
   if (typeof context !== "string" || !context || context !== context.trim()) {
     throw new Error("kubectl_context_invalid");
@@ -36,8 +36,6 @@ function main() {
   }).trim();
   if (currentContext !== context) throw new Error("kubectl_context_mismatch");
 
-  const config = utils.readConfig(inputPath);
-  const plan = readActivationPlan(manifestPath);
   const namespace = config.Namespace;
   const manifestNamespace = plan.resources.find(resource =>
     resource?.apiVersion === "v1" &&
@@ -58,12 +56,7 @@ function main() {
   ));
   const liveResources = collectLiveRunnerControlPlane(kubectlJson, namespace);
   const errors = verifyLiveRunnerControlPlane(liveResources, plan.resources, namespace);
-  const runnerRole = plan.resources.find(resource =>
-    resource?.kind === "Role" &&
-    resource?.metadata?.namespace === "hcce-bot-runners" &&
-    resource?.metadata?.name === "bot-orchestrator-runner-pods"
-  );
-  const runnerAuthorityEnabled = Array.isArray(runnerRole?.rules) && runnerRole.rules.length === 1;
+  const runnerAuthorityEnabled = true;
   const reviews = new Map();
   for (const spec of effectiveRbacReviewSpecs(namespace, runnerAuthorityEnabled)) {
     const result = spawnSync(
