@@ -13,6 +13,7 @@ defmodule RetWeb.HubChannel do
     AccountFavorite,
     BotConfig,
     BotConfigAdmission,
+    BotConfigApproval,
     BotChatPresence,
     BotOrchestrator,
     BotRunnerLease,
@@ -1814,7 +1815,7 @@ defmodule RetWeb.HubChannel do
 
     socket = Guardian.Phoenix.Socket.put_current_resource(socket, account)
 
-    with socket <-
+    with {:ok, socket} <-
            socket
            |> assign(:hub_sid, hub.hub_sid)
            |> assign(:hub_requires_oauth, params[:hub_requires_oauth])
@@ -1822,7 +1823,7 @@ defmodule RetWeb.HubChannel do
            |> assign(:oauth_account_id, params[:oauth_account_id])
            |> assign(:oauth_source, params[:oauth_source])
            |> assign(:has_valid_bot_access_key, params[:has_valid_bot_access_key])
-           |> assign_bot_runner_lease(params[:has_valid_bot_access_key], hub.hub_sid),
+           |> assign_bot_runner_lease(params[:has_valid_bot_access_key], hub),
          {socket, waypoint_capability, waypoint_states} <-
            configure_waypoint_reservation(socket, hub, context, params),
          response <-
@@ -1879,9 +1880,25 @@ defmodule RetWeb.HubChannel do
     end
   end
 
-  defp assign_bot_runner_lease(socket, true, hub_sid) do
-    {:ok, lease} = BotRunnerLease.register(hub_sid)
+  defp assign_bot_runner_lease(socket, true, %Hub{} = hub) do
+    case BotConfigApproval.register_runtime_lease(hub.hub_sid) do
+      {:ok, lease} ->
+        {:ok, assign_registered_bot_runner_lease(socket, lease)}
 
+      {:error, _reason} ->
+        {:error,
+         %{
+           message: "Bot configuration is not approved",
+           reason: "bot_config_unapproved"
+         }}
+    end
+  end
+
+  defp assign_bot_runner_lease(socket, _authenticated, %Hub{}) do
+    {:ok, assign_no_bot_runner_lease(socket)}
+  end
+
+  defp assign_registered_bot_runner_lease(socket, lease) do
     socket
     |> assign(:bot_runner_lease_id, lease.lease_id)
     |> assign(:bot_runner_join_order, lease.join_order)
@@ -1890,7 +1907,7 @@ defmodule RetWeb.HubChannel do
     |> assign(:bot_runner_presence_tracked, false)
   end
 
-  defp assign_bot_runner_lease(socket, _authenticated, _hub_sid) do
+  defp assign_no_bot_runner_lease(socket) do
     socket
     |> assign(:bot_runner_lease_id, nil)
     |> assign(:bot_runner_join_order, nil)
@@ -2184,7 +2201,7 @@ defmodule RetWeb.HubChannel do
   defp sync_bot_orchestrator(%Hub{} = hub) do
     bots = BotConfig.normalize(hub.user_data)
 
-    if hub.entry_mode != :deny && bots["enabled"] && bots["count"] > 0 do
+    if BotConfigApproval.runtime_enabled?(hub) do
       _ =
         BotOrchestrator.room_config(%{
           hub_sid: hub.hub_sid,

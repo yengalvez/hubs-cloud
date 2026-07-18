@@ -11,9 +11,8 @@ defmodule Ret.BotConfigAdmission do
   import Ecto.Changeset
   import Ecto.Query
 
-  alias Ret.{Account, BotConfig, Hub, Locking, Repo}
+  alias Ret.{Account, BotConfig, BotConfigApproval, Hub, Locking, Repo}
 
-  @admission_lock "bot-config-admission:v1"
   @default_max_active_rooms 5
   @hard_max_active_rooms 10
 
@@ -45,7 +44,7 @@ defmodule Ret.BotConfigAdmission do
 
   defp persist_with_admission(changeset, actor, operation) do
     result =
-      Locking.exec_after_lock(@admission_lock, fn ->
+      Locking.exec_after_lock(BotConfigApproval.admission_lock(), fn ->
         current_actor = current_actor(actor)
         current_hub = current_hub_for_update(changeset, operation)
         intended_user_data = intended_user_data(changeset, current_hub)
@@ -59,8 +58,14 @@ defmodule Ret.BotConfigAdmission do
                  intended_user_data,
                  intended_entry_mode
                ),
+             :ok <-
+               BotConfigApproval.validate_admitted_change(
+                 current_hub,
+                 intended_user_data,
+                 current_actor
+               ),
              :ok <- admit_capacity(current_hub, intended_user_data, intended_entry_mode) do
-          apply_repo(operation, changeset)
+          persist_and_record_approval(changeset, operation, current_hub, current_actor)
         else
           {:error, code, message} ->
             {:error, add_error(changeset, :user_data, message, validation: code)}
@@ -102,8 +107,7 @@ defmodule Ret.BotConfigAdmission do
     current_state = bot_config_state(current_hub && current_hub.user_data)
     intended_state = bot_config_state(intended_user_data)
 
-    current_consumes =
-      !!(current_hub && effective_active?(current_hub.user_data, current_hub.entry_mode))
+    current_consumes = !!(current_hub && BotConfigApproval.runtime_enabled?(current_hub))
 
     intended_consumes = effective_active?(intended_user_data, intended_entry_mode)
 
@@ -123,7 +127,7 @@ defmodule Ret.BotConfigAdmission do
 
   defp admit_capacity(current_hub, intended_user_data, intended_entry_mode) do
     if consumes_new_slot?(current_hub, intended_user_data, intended_entry_mode) &&
-         configured_active_room_count() >= max_active_rooms() do
+         BotConfigApproval.configured_active_room_count() >= max_active_rooms() do
       {:error, :bot_room_limit, "the configured active bot room limit has been reached"}
     else
       :ok
@@ -131,19 +135,9 @@ defmodule Ret.BotConfigAdmission do
   end
 
   defp consumes_new_slot?(current_hub, intended_user_data, intended_entry_mode) do
-    current_consumes =
-      !!(current_hub && effective_active?(current_hub.user_data, current_hub.entry_mode))
+    current_consumes = !!(current_hub && BotConfigApproval.runtime_enabled?(current_hub))
 
     not current_consumes && effective_active?(intended_user_data, intended_entry_mode)
-  end
-
-  defp configured_active_room_count do
-    Hub
-    |> where([h], h.hub_sid != "admin")
-    |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
-    |> BotConfig.with_active_bot_config()
-    |> select([h], count(h.hub_id))
-    |> Repo.one()
   end
 
   defp admission_required?(changeset, :insert) do
@@ -192,13 +186,21 @@ defmodule Ret.BotConfigAdmission do
   defp apply_repo(:insert, changeset), do: Repo.insert(changeset)
   defp apply_repo(:update, changeset), do: Repo.update(changeset)
 
-  defp bot_config_state(user_data) when is_map(user_data) do
-    bots = Map.get(user_data, "bots") || Map.get(user_data, :bots)
+  defp persist_and_record_approval(changeset, operation, current_hub, current_actor) do
+    case apply_repo(operation, changeset) do
+      {:ok, persisted_hub} ->
+        {:ok,
+         BotConfigApproval.record_admitted_change!(current_hub, persisted_hub, current_actor)}
 
-    if is_map(bots) do
-      {:present, BotConfig.normalize(%{"bots" => bots})}
-    else
-      :absent
+      {:error, %Ecto.Changeset{} = invalid_changeset} ->
+        {:error, invalid_changeset}
+    end
+  end
+
+  defp bot_config_state(user_data) when is_map(user_data) do
+    case BotConfigApproval.raw_bots(user_data) do
+      %{} = bots -> {:present, bots}
+      nil -> :absent
     end
   end
 

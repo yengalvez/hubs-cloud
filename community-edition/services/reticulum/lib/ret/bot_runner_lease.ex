@@ -31,6 +31,12 @@ defmodule Ret.BotRunnerLease do
     GenServer.call(@name, {:unregister, hub_sid, lease_id})
   end
 
+  def revoke(hub_sid) when is_binary(hub_sid) and byte_size(hub_sid) > 0 do
+    GenServer.call(@name, {:revoke, hub_sid})
+  end
+
+  def revoke(_hub_sid), do: :ok
+
   @doc false
   def snapshot(hub_sid) when is_binary(hub_sid) do
     GenServer.call(@name, {:snapshot, hub_sid})
@@ -120,6 +126,25 @@ defmodule Ret.BotRunnerLease do
 
       _other_owner ->
         {:reply, {:error, :not_owner}, state}
+    end
+  end
+
+  def handle_call({:revoke, hub_sid}, _from, state) do
+    case Map.pop(state.hubs, hub_sid) do
+      {nil, _remaining_hubs} ->
+        {:reply, :ok, state}
+
+      {hub, remaining_hubs} ->
+        revoked_epoch = next_monotonic_id()
+
+        monitor_refs =
+          Enum.reduce(hub.leases, state.monitor_refs, fn {lease_id, lease}, refs ->
+            Process.demonitor(lease.monitor_ref, [:flush])
+            send(lease.owner_pid, {:bot_runner_lease_authority, lease_id, revoked_epoch, false})
+            Map.delete(refs, lease.monitor_ref)
+          end)
+
+        {:reply, :ok, %{state | hubs: remaining_hubs, monitor_refs: monitor_refs}}
     end
   end
 

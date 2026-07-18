@@ -20,7 +20,11 @@ defmodule Ret.AppConfigTest do
       }
     }
 
-    set1 = Ret.AppConfig.get_config() |> MapSet.new()
+    # This test verifies the rows inserted in its SQL sandbox transaction. The
+    # process-wide Cachex entry can legitimately contain a snapshot populated
+    # by an earlier test, so bypass it instead of making the suite seed-order
+    # dependent.
+    set1 = Ret.AppConfig.get_config(true) |> MapSet.new()
     set2 = expected |> MapSet.new()
     true = MapSet.subset?(set1, set2)
     true = MapSet.subset?(set2, set1)

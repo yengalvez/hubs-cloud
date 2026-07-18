@@ -76,6 +76,9 @@ jobs:
       - name: Compile without warnings
         run: mix compile --warnings-as-errors
 
+      - name: Verify bot config approval migration
+        run: mix run --no-start scripts/verify_bot_config_approval_migration.exs
+
       - name: Run test suite
         run: mix test
 

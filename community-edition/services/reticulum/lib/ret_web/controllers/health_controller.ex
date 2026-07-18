@@ -20,7 +20,10 @@ defmodule RetWeb.HealthController do
   end
 
   def capabilities(conn, _params) do
-    json(conn, %{
+    conn
+    |> put_resp_header("cache-control", "no-store")
+    |> json(%{
+      bot_config_approval: Ret.BotConfigApproval.capability_contract(),
       waypoint_reservation: Ret.WaypointReservation.capability_contract()
     })
   end

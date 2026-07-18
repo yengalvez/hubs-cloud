@@ -61,6 +61,36 @@ dashboard administrative domain in the generated CE config, not a fifth trust
 domain; both plug implementations reject missing, short, wrong or duplicate
 headers.
 
+Bot configuration activation is also fail-closed. The
+`ret0.bot_config_approvals` table stores one durable decision per room and the
+runtime accepts a room only when its `approved_bots` JSONB object exactly
+matches `hubs.user_data.bots`. The migration copies every legacy bot object to
+a quarantined candidate and sets only its persisted `enabled` field to false;
+it never silently approves an existing configuration. Rolling the migration
+back is refused while any stored bot object is not explicitly disabled.
+CI runs `scripts/verify_bot_config_approval_migration.exs` against a disposable
+database on PostgreSQL 12 and 14 to verify exact backfill, selective disable,
+the guarded rollback and cleanup without touching the normal test database.
+
+Global administrators review the redacted, paginated inventory at
+`GET /api/v1/bot_config_approvals` and act on one room at a time through the
+`approve` and `quarantine` endpoints. Approval requires the current exact
+`v1:<sha256>` candidate fingerprint, revalidates capacity and administrator
+status transactionally, and rejects bot objects over 16 KiB. Inventory and
+decision responses use `Cache-Control: no-store`; they expose fingerprints,
+counts and prompt length metadata, never prompt text or configuration JSON.
+The public `/health/capabilities` contract advertises protocol 1 so Admin can
+refuse mixed-version operation. A durable approval means the database config
+is eligible; bot-orchestrator readiness remains a separate rollout gate.
+Authenticated runner joins reload the exact decision and register their local
+lease while holding the same PostgreSQL admission lock as quarantine. Thus a
+join that wins first is revoked by quarantine, while a join that waits observes
+the committed quarantine and is rejected on the current singleton Reticulum
+deployment. Multi-replica lease fencing remains a deployment blocker tracked
+separately by AUD-076. Final bot chat delivery is revalidated and emitted under
+the same lock, after the provider call, so quarantine and delivery have one
+linear order.
+
 Waypoint reservations use protocol 2. State-changing transactions allocate one
 global PostgreSQL `state_version` for their whole broadcast batch. Joins take a
 second sequence value after assembling `active` and `current`, exposing it as

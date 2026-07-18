@@ -3,7 +3,7 @@ defmodule RetWeb.WaypointReservationChannelTest do
 
   import Ret.TestHelpers
 
-  alias Ret.{Repo, WaypointReservation}
+  alias Ret.{BotConfigAdmission, Hub, Repo, WaypointReservation}
   alias RetWeb.{HubChannel, SessionSocket}
 
   setup [:create_account, :create_owned_file, :create_scene, :create_hub]
@@ -180,6 +180,23 @@ defmodule RetWeb.WaypointReservationChannelTest do
     socket: socket,
     hub: hub
   } do
+    admin = create_account("waypoint-bot-admin-#{System.unique_integer([:positive])}", true)
+
+    {:ok, hub} =
+      hub
+      |> Hub.add_attrs_to_changeset(%{
+        user_data: %{
+          "bots" => %{
+            "enabled" => true,
+            "count" => 1,
+            "mobility" => "static",
+            "chat_enabled" => false,
+            "prompt" => ""
+          }
+        }
+      })
+      |> BotConfigAdmission.update(admin)
+
     bot_key = String.duplicate("test-bot-key-", 3)
     old_key = Application.get_env(:ret, :bot_runner_access_key)
     Application.put_env(:ret, :bot_runner_access_key, bot_key)
