@@ -1092,6 +1092,7 @@ defmodule RetWeb.HubChannelTest do
           "hub_sid" => hub_sid,
           "process_generation" => "11111111-1111-4111-8111-111111111111",
           "holder_id" => "22222222-2222-4222-8222-222222222222",
+          "recovery_epoch" => "44444444-4444-4444-8444-444444444444",
           "exp" => expiry
         },
         overrides

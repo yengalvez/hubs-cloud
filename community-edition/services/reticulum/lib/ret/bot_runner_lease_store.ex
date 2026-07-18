@@ -83,75 +83,93 @@ defmodule Ret.BotRunnerLease.PostgresStore do
     if Ret.BotRunnerGenerationToken.valid_claims?(generation_claims, hub_sid) do
       transaction(repo, fn ->
         lock_authority!(repo, hub_sid)
+        database_now_seconds = database_now_seconds!(repo)
 
-        case hub_id(repo, hub_sid) do
-          nil ->
-            {:error, :unavailable}
+        if Ret.BotRunnerGenerationToken.valid_claims_after_lock?(
+             generation_claims,
+             hub_sid,
+             database_now_seconds
+           ) do
+          case hub_id(repo, hub_sid) do
+            nil ->
+              {:error, :unavailable}
 
-          hub_id ->
-            current = lock_current!(repo, hub_id)
+            hub_id ->
+              current = lock_current!(repo, hub_id)
 
-            cond do
-              current && current.active ->
-                # A contender must be able to retry its still-unused generation
-                # after the incumbent exits. Do not consume it or advance epoch.
-                {:error, :unavailable}
+              cond do
+                current && current.active ->
+                  # A contender must be able to retry its still-unused generation
+                  # after the incumbent exits. Do not consume it or advance epoch.
+                  {:error, :unavailable}
 
-              not consume_generation!(repo, hub_id, generation_claims) ->
-                # Generation rows are never removed by release, revoke, lease
-                # expiry or process restart. A prior row is a terminal replay.
-                {:error, :generation_replayed}
+                not Ret.BotRunnerGenerationToken.valid_claims_after_lock?(
+                  generation_claims,
+                  hub_sid,
+                  database_now_seconds!(repo)
+                ) ->
+                  # FOR UPDATE can itself wait behind an unrelated row holder.
+                  # Re-read the database clock at the last mutation boundary.
+                  {:error, :invalid_generation_claims}
 
-              true ->
-                epoch = next_epoch!(repo)
+                not consume_generation!(repo, hub_id, generation_claims) ->
+                  # Generation rows are never removed by release, revoke, lease
+                  # expiry or process restart. A prior row is a terminal replay.
+                  {:error, :generation_replayed}
 
-                if current do
-                  SQL.query!(
-                    repo,
-                    """
-                    UPDATE ret0.bot_runner_leases
-                    SET lease_id = $2::text::uuid,
-                        holder_instance_id = $3::text::uuid,
-                        session_id = $4::text::uuid,
-                        authority_epoch = $5,
-                        expires_at = timezone('UTC', clock_timestamp()) +
-                          ($6::bigint * INTERVAL '1 second'),
-                        updated_at = timezone('UTC', clock_timestamp())
-                    WHERE hub_id = $1
-                    """,
-                    [hub_id, lease_id, holder_instance_id, session_id, epoch, ttl_seconds]
-                  )
-                else
-                  SQL.query!(
-                    repo,
-                    """
-                    INSERT INTO ret0.bot_runner_leases (
-                      hub_id,
-                      lease_id,
-                      holder_instance_id,
-                      session_id,
-                      authority_epoch,
-                      expires_at,
-                      inserted_at,
-                      updated_at
+                true ->
+                  epoch = next_epoch!(repo)
+
+                  if current do
+                    SQL.query!(
+                      repo,
+                      """
+                      UPDATE ret0.bot_runner_leases
+                      SET lease_id = $2::text::uuid,
+                          holder_instance_id = $3::text::uuid,
+                          session_id = $4::text::uuid,
+                          authority_epoch = $5,
+                          expires_at = timezone('UTC', clock_timestamp()) +
+                            ($6::bigint * INTERVAL '1 second'),
+                          updated_at = timezone('UTC', clock_timestamp())
+                      WHERE hub_id = $1
+                      """,
+                      [hub_id, lease_id, holder_instance_id, session_id, epoch, ttl_seconds]
                     )
-                    VALUES (
-                      $1,
-                      $2::text::uuid,
-                      $3::text::uuid,
-                      $4::text::uuid,
-                      $5,
-                      timezone('UTC', clock_timestamp()) + ($6::bigint * INTERVAL '1 second'),
-                      timezone('UTC', clock_timestamp()),
-                      timezone('UTC', clock_timestamp())
+                  else
+                    SQL.query!(
+                      repo,
+                      """
+                      INSERT INTO ret0.bot_runner_leases (
+                        hub_id,
+                        lease_id,
+                        holder_instance_id,
+                        session_id,
+                        authority_epoch,
+                        expires_at,
+                        inserted_at,
+                        updated_at
+                      )
+                      VALUES (
+                        $1,
+                        $2::text::uuid,
+                        $3::text::uuid,
+                        $4::text::uuid,
+                        $5,
+                        timezone('UTC', clock_timestamp()) + ($6::bigint * INTERVAL '1 second'),
+                        timezone('UTC', clock_timestamp()),
+                        timezone('UTC', clock_timestamp())
+                      )
+                      """,
+                      [hub_id, lease_id, holder_instance_id, session_id, epoch, ttl_seconds]
                     )
-                    """,
-                    [hub_id, lease_id, holder_instance_id, session_id, epoch, ttl_seconds]
-                  )
-                end
+                  end
 
-                {:ok, %{epoch: epoch}}
-            end
+                  {:ok, %{epoch: epoch}}
+              end
+          end
+        else
+          {:error, :invalid_generation_claims}
         end
       end)
     else
@@ -367,6 +385,17 @@ defmodule Ret.BotRunnerLease.PostgresStore do
       "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
       [@authority_lock_prefix <> hub_sid]
     )
+  end
+
+  defp database_now_seconds!(repo) do
+    %{rows: [[seconds]]} =
+      SQL.query!(
+        repo,
+        "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
+        []
+      )
+
+    seconds
   end
 
   defp hub_id(repo, hub_sid) do

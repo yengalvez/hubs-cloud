@@ -9,6 +9,9 @@ const {
   KubernetesApi,
   KubernetesRunnerManager,
   MANAGED_BY_LABEL,
+  PARENT_NAME_ANNOTATION,
+  PARENT_NAMESPACE_ANNOTATION,
+  PARENT_UID_ANNOTATION,
   ROOM_KEY_LABEL
 } = require("../kubernetes-runner-manager");
 const {
@@ -19,6 +22,7 @@ const {
 const key = "test-orchestrator-generation-key-at-least-32";
 const generation = "11111111-1111-4111-8111-111111111111";
 const ownerUid = "22222222-2222-4222-8222-222222222222";
+const recoveryEpoch = "44444444-4444-4444-8444-444444444444";
 
 class FakeApi {
   constructor() {
@@ -62,12 +66,13 @@ class FakeApi {
 function manager(api = new FakeApi(), overrides = {}) {
   return new KubernetesRunnerManager({
     api,
-    namespace: "hcce",
+    namespace: "hcce-bot-runners",
+    parentNamespace: "hcce",
     ownerPodName: "bot-orchestrator-abc",
     ownerPodUid: ownerUid,
     runnerImage: `registry.invalid/bot-runner@sha256:${"a".repeat(64)}`,
     hubsBaseUrl: "https://hubs.example.test",
-    controlUrl: "http://bot-orchestrator:5001",
+    controlUrl: "http://bot-orchestrator.hcce.svc.cluster.local:5001",
     credentialKey: key,
     runnerEnvironment: {
       GHOST_NAVIGATION_MODE: "navmesh_preferred",
@@ -77,7 +82,7 @@ function manager(api = new FakeApi(), overrides = {}) {
     maxActiveRooms: 2,
     now: () => 2_000_000_000_000,
     sleep: async () => {},
-    tokenFactory: input => createRunnerGenerationToken({ key, ...input }),
+    tokenFactory: input => createRunnerGenerationToken({ key, recoveryEpoch, ...input }),
     ...overrides
   });
 }
@@ -97,16 +102,13 @@ test("creates one hardened, bounded, room-hashed runner Pod without parent secre
   assert.equal(JSON.stringify(pod.metadata.labels).includes("private-room-sid"), false);
   assert.equal(pod.metadata.labels[MANAGED_BY_LABEL], "bot-orchestrator");
   assert.match(pod.metadata.labels[ROOM_KEY_LABEL], /^[0-9a-f]{20}$/);
-  assert.deepEqual(pod.metadata.ownerReferences, [
-    {
-      apiVersion: "v1",
-      kind: "Pod",
-      name: "bot-orchestrator-abc",
-      uid: ownerUid,
-      controller: false,
-      blockOwnerDeletion: false
-    }
-  ]);
+  assert.equal(Object.hasOwn(pod.metadata, "ownerReferences"), false);
+  assert.deepEqual(pod.metadata.annotations, {
+    "yenhubs.org/expires-at": "2033-05-18T04:33:20.000Z",
+    [PARENT_NAMESPACE_ANNOTATION]: "hcce",
+    [PARENT_NAME_ANNOTATION]: "bot-orchestrator-abc",
+    [PARENT_UID_ANNOTATION]: ownerUid
+  });
   assert.equal(pod.spec.serviceAccountName, "bot-runner");
   assert.equal(pod.spec.automountServiceAccountToken, false);
   assert.deepEqual(pod.spec.imagePullSecrets, [{ name: "bot-images-pull" }]);
@@ -114,6 +116,8 @@ test("creates one hardened, bounded, room-hashed runner Pod without parent secre
   assert.equal(pod.spec.shareProcessNamespace, false);
   assert.equal(container.securityContext.readOnlyRootFilesystem, true);
   assert.equal(container.securityContext.allowPrivilegeEscalation, false);
+  assert.deepEqual(container.securityContext.appArmorProfile, { type: "RuntimeDefault" });
+  assert.equal(container.imagePullPolicy, "Always");
   assert.deepEqual(container.securityContext.capabilities, { drop: ["ALL"] });
   assert.deepEqual(container.resources, {
     requests: { cpu: "25m", memory: "128Mi" },
@@ -144,6 +148,7 @@ test("a same-room replacement embeds a fresh exact generation credential", () =>
     hubSid: "replacement-generation-room",
     processGeneration: replacementGeneration,
     holderId: ownerUid,
+    recoveryEpoch,
     nowSeconds: Math.floor(2_000_000_000_000 / 1000)
   });
 
@@ -181,6 +186,28 @@ test("accepts only the exact immutable Pod contract", async () => {
   const extraIdentityLabel = structuredClone(pod);
   extraIdentityLabel.metadata.labels["yenhubs.org/hub-sid"] = "contract-room";
   assert.equal(podManager.podMatchesHandle(extraIdentityLabel, handle), false);
+
+  const extraAnnotation = structuredClone(pod);
+  extraAnnotation.metadata.annotations["container.apparmor.security.beta.kubernetes.io/bot-runner"] =
+    "unconfined";
+  assert.equal(podManager.podMatchesHandle(extraAnnotation, handle), false);
+
+  const secretMount = structuredClone(pod);
+  secretMount.spec.volumes[0] = { name: "runner-tmp", secret: { secretName: "bot-images-pull" } };
+  assert.equal(podManager.podMatchesHandle(secretMount, handle), false);
+
+  for (const mutate of [
+    value => { value.spec.runtimeClassName = "unsafe"; },
+    value => { value.spec.resourceClaims = [{ name: "device" }]; },
+    value => { value.spec.hostAliases = [{ ip: "127.0.0.1", hostnames: ["api.openai.com"] }]; },
+    value => { value.spec.dnsConfig = { nameservers: ["203.0.113.1"] }; },
+    value => { value.spec.overhead = { cpu: "1" }; },
+    value => { value.spec.containers[0].volumeDevices = [{ name: "runner-tmp", devicePath: "/dev/x" }]; }
+  ]) {
+    const changed = structuredClone(pod);
+    mutate(changed);
+    assert.equal(podManager.podMatchesHandle(changed, handle), false);
+  }
 });
 
 test("rejects unsafe manager configuration and sensitive runner environment", () => {
@@ -191,6 +218,10 @@ test("rejects unsafe manager configuration and sensitive runner environment", ()
   assert.throws(
     () => manager(new FakeApi(), { runnerEnvironment: { OPENAI_API_KEY: "forbidden" } }),
     /environment_invalid/
+  );
+  assert.throws(
+    () => manager(new FakeApi(), { namespace: "hcce" }),
+    /configuration_missing/
   );
 });
 

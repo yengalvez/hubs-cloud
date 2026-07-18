@@ -6,6 +6,7 @@ on:
       - ".github/workflows/services-ci.yml"
       - ".github/workflows/bot-images-build-push.yml"
       - "community-edition/generate_script/**"
+      - "community-edition/apply/**"
       - "community-edition/input-values.ci.yaml"
       - "community-edition/package*.json"
       - "community-edition/utils.js"
@@ -19,6 +20,7 @@ on:
       - ".github/workflows/services-ci.yml"
       - ".github/workflows/bot-images-build-push.yml"
       - "community-edition/generate_script/**"
+      - "community-edition/apply/**"
       - "community-edition/input-values.ci.yaml"
       - "community-edition/package*.json"
       - "community-edition/utils.js"
@@ -55,6 +57,7 @@ jobs:
           npm ci
           npm audit --omit=dev --audit-level=high
           npm run test:generator
+          npm run test:apply
           fixture_dir="$(mktemp -d)"
           trap 'find "$fixture_dir" -type f -delete; rmdir "$fixture_dir"' EXIT
           HCCE_INPUT_VALUES_PATH="$PWD/input-values.ci.yaml" \

@@ -7,16 +7,23 @@ defmodule Ret.BotRunnerGenerationTokenTest do
   @hub_sid "Room_123"
   @generation "11111111-1111-4111-8111-111111111111"
   @holder_id "22222222-2222-4222-8222-222222222222"
+  @recovery_epoch "44444444-4444-4444-8444-444444444444"
   @now 2_000_000_000
 
   setup do
     original = Application.get_env(:ret, :bot_orchestrator_access_key)
+    original_epoch = Application.get_env(:ret, :bot_runner_recovery_epoch)
     Application.put_env(:ret, :bot_orchestrator_access_key, @key)
+    Application.put_env(:ret, :bot_runner_recovery_epoch, @recovery_epoch)
 
     on_exit(fn ->
       if is_nil(original),
         do: Application.delete_env(:ret, :bot_orchestrator_access_key),
         else: Application.put_env(:ret, :bot_orchestrator_access_key, original)
+
+      if is_nil(original_epoch),
+        do: Application.delete_env(:ret, :bot_runner_recovery_epoch),
+        else: Application.put_env(:ret, :bot_runner_recovery_epoch, original_epoch)
     end)
   end
 
@@ -31,7 +38,15 @@ defmodule Ret.BotRunnerGenerationTokenTest do
     assert :error = BotRunnerGenerationToken.verify(token, @hub_sid, @now + 331)
 
     assert :error =
-             BotRunnerGenerationToken.verify(token(%{"exp" => @now + 86_431}), @hub_sid, @now)
+             BotRunnerGenerationToken.verify(token(%{"exp" => @now + 3_601}), @hub_sid, @now)
+
+    Application.put_env(
+      :ret,
+      :bot_runner_recovery_epoch,
+      "55555555-5555-4555-8555-555555555555"
+    )
+
+    assert :error = BotRunnerGenerationToken.verify(token, @hub_sid, @now)
   end
 
   test "rejects tampering, unknown authority claims and weak signing keys" do
@@ -66,7 +81,8 @@ defmodule Ret.BotRunnerGenerationTokenTest do
           "aud" => "yenhubs-bot-runner",
           "hub_sid" => @hub_sid,
           "process_generation" => @generation,
-          "holder_id" => @holder_id
+          "holder_id" => @holder_id,
+          "recovery_epoch" => @recovery_epoch
         },
         overrides
       )

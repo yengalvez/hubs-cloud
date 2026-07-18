@@ -12,9 +12,12 @@ process.env.RUNNER_AUTOSTART = "false";
 process.env.CHAT_RATE_LIMIT_MS = "1";
 process.env.CHAT_RATE_LIMIT_MAX_REQUESTS = "3";
 process.env.POD_NAMESPACE = "hcce";
+process.env.RUNNER_POD_NAMESPACE = "hcce-bot-runners";
 process.env.ORCHESTRATOR_POD_NAME = "bot-orchestrator-test";
 process.env.ORCHESTRATOR_POD_UID = "22222222-2222-4222-8222-222222222222";
 process.env.BOT_RUNNER_IMAGE = `registry.invalid/bot-runner@sha256:${"a".repeat(64)}`;
+process.env.BOT_RUNNER_RECOVERY_EPOCH = "44444444-4444-4444-8444-444444444444";
+process.env.RUNNER_CONTROL_URL = "http://bot-orchestrator.hcce.svc.cluster.local:5001";
 
 const { startServer, internals } = require("../app");
 const { createRunnerGenerationToken } = require("../runner-generation-token");
@@ -299,6 +302,7 @@ test("runner control is bearer-authenticated, Pod-UID-bound, and generation-scop
     hubSid,
     processGeneration,
     holderId: process.env.ORCHESTRATOR_POD_UID,
+    recoveryEpoch: process.env.BOT_RUNNER_RECOVERY_EPOCH,
     expiresAtSeconds: Math.floor(Date.now() / 1000) + 300
   });
   const message = {

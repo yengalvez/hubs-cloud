@@ -119,6 +119,8 @@ defmodule Ret.BotRunnerLeaseTest do
   alias Ret.BotRunnerLease
   alias Ret.BotRunnerLease.PostgresStore
 
+  @recovery_epoch "44444444-4444-4444-8444-444444444444"
+
   setup [:create_account, :create_owned_file, :create_scene, :create_hub]
 
   test "revocation consumes a global epoch and rejects the old exact fence", %{hub: hub} do
@@ -633,6 +635,65 @@ defmodule Ret.BotRunnerLeaseTest do
     assert :ok = BotRunnerLease.unregister(replacement, hub.hub_sid, replacement_lease.lease_id)
   end
 
+  test "claims expiring behind the advisory lock mutate no generation, lease, or epoch", %{
+    hub: hub
+  } do
+    %{rows: [[database_now]]} =
+      SQL.query!(Repo, "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint", [])
+
+    claims = generation_claims(hub.hub_sid, %{"exp" => database_now + 1})
+    epoch_before = authority_sequence_last()
+    generations_before = generation_count(hub.hub_id)
+    lease_rows_before = lease_count(hub.hub_id)
+
+    connection_options =
+      Repo.config()
+      |> Keyword.take([
+        :hostname,
+        :port,
+        :username,
+        :password,
+        :database,
+        :socket_dir,
+        :ssl,
+        :ssl_opts
+      ])
+
+    {:ok, lock_connection} = Postgrex.start_link(connection_options)
+    {:ok, clock_connection} = Postgrex.start_link(connection_options)
+    parent = self()
+
+    locker =
+      Task.async(fn ->
+        Postgrex.transaction(lock_connection, fn connection ->
+          Postgrex.query!(
+            connection,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            ["bot-runner-authority:v1:" <> hub.hub_sid]
+          )
+
+          send(parent, :advisory_lock_held)
+
+          receive do
+            :release_advisory_lock -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :advisory_lock_held, 2_000
+    acquire = Task.async(fn -> acquire_direct(hub, claims) |> elem(0) end)
+    assert Task.yield(acquire, 100) == nil
+    wait_for_database_time(clock_connection, claims["exp"])
+    send(locker.pid, :release_advisory_lock)
+
+    assert {:error, :invalid_generation_claims} = Task.await(acquire, 2_000)
+    assert {:ok, _} = Task.await(locker, 2_000)
+    assert authority_sequence_last() == epoch_before
+    assert generation_count(hub.hub_id) == generations_before
+    assert lease_count(hub.hub_id) == lease_rows_before
+    refute generation_consumed?(hub.hub_id, claims["process_generation"])
+  end
+
   defp assert_atomic_runtime_restart(crashed_name, hub) do
     old_holder = BotRunnerLease.holder_id()
     previous_pids = runtime_pids()
@@ -755,6 +816,13 @@ defmodule Ret.BotRunnerLeaseTest do
     count
   end
 
+  defp lease_count(hub_id) do
+    %{rows: [[count]]} =
+      SQL.query!(Repo, "SELECT count(*) FROM ret0.bot_runner_leases WHERE hub_id = $1", [hub_id])
+
+    count
+  end
+
   defp generation_consumed?(hub_id, process_generation) do
     %{rows: [[consumed]]} =
       SQL.query!(
@@ -774,10 +842,32 @@ defmodule Ret.BotRunnerLeaseTest do
         "hub_sid" => hub_sid,
         "process_generation" => Ecto.UUID.generate(),
         "holder_id" => Ecto.UUID.generate(),
+        "recovery_epoch" => @recovery_epoch,
         "exp" => System.system_time(:second) + 300
       },
       overrides
     )
+  end
+
+  defp wait_for_database_time(connection, target, attempts \\ 100)
+
+  defp wait_for_database_time(_connection, _target, 0),
+    do: flunk("database clock did not reach token expiry")
+
+  defp wait_for_database_time(connection, target, attempts) do
+    %{rows: [[now]]} =
+      Postgrex.query!(
+        connection,
+        "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
+        []
+      )
+
+    if now >= target do
+      :ok
+    else
+      Process.sleep(25)
+      wait_for_database_time(connection, target, attempts - 1)
+    end
   end
 
   defp force_expiry!(hub_id) do

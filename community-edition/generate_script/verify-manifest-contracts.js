@@ -1,3 +1,8 @@
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const YAML = require("yaml");
+
 function hasExactOwnKeys(value, expectedKeys) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const actualKeys = Object.keys(value).sort();
@@ -93,6 +98,7 @@ function verifyDockerConfigCredentials(encoded, imageReferences = []) {
 const EXPECTED_API_VERSION_BY_GROUP = Object.freeze({
   "": "v1",
   apps: "apps/v1",
+  "admissionregistration.k8s.io": "admissionregistration.k8s.io/v1",
   "networking.k8s.io": "networking.k8s.io/v1",
   "rbac.authorization.k8s.io": "rbac.authorization.k8s.io/v1"
 });
@@ -112,7 +118,8 @@ const BOT_ORCHESTRATOR_RUNTIME_ENV = Object.freeze({
   RUNNER_BACKEND: "ghost",
   RUNNER_BACKEND_CANARY_HUBS: "",
   RUNNER_SCRIPT: "/app/run-bot.js",
-  RUNNER_CONTROL_URL: "http://bot-orchestrator:5001",
+  RUNNER_POD_NAMESPACE: "hcce-bot-runners",
+  RUNNER_CONTROL_URL: "http://bot-orchestrator.$Namespace.svc.cluster.local:5001",
   RUNNER_POD_RECONCILE_INTERVAL_MS: "5000",
   RUNNER_TOKEN_TTL_SECONDS: "3600",
   RUNNER_STARTUP_GRACE_MS: "180000",
@@ -135,7 +142,9 @@ const BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES = Object.freeze([
   "RUNNER_BACKEND_CANARY_HUBS",
   "RUNNER_SCRIPT",
   "BOT_RUNNER_IMAGE",
+  "BOT_RUNNER_RECOVERY_EPOCH",
   "POD_NAMESPACE",
+  "RUNNER_POD_NAMESPACE",
   "ORCHESTRATOR_POD_NAME",
   "ORCHESTRATOR_POD_UID",
   "RUNNER_CONTROL_URL",
@@ -347,8 +356,10 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
   const namespaced = (group, kind, name) => [group, kind, namespace, name];
   const inventory = [
     ["", "Namespace", "", namespace],
+    ["", "Namespace", "", "hcce-bot-runners"],
     namespaced("", "Secret", "configs"),
     namespaced("", "Secret", "bot-images-pull"),
+    ["", "Secret", "hcce-bot-runners", "bot-images-pull"],
     namespaced("", "PersistentVolumeClaim", "pgsql-pvc"),
     namespaced("", "PersistentVolumeClaim", "ret-pvc"),
     namespaced("networking.k8s.io", "Ingress", "ret"),
@@ -360,9 +371,14 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     namespaced("apps", "Deployment", "bot-orchestrator"),
     namespaced("", "Service", "bot-orchestrator"),
     namespaced("", "ServiceAccount", "bot-orchestrator"),
-    namespaced("", "ServiceAccount", "bot-runner"),
     namespaced("rbac.authorization.k8s.io", "Role", "bot-orchestrator-runner-pods"),
     namespaced("rbac.authorization.k8s.io", "RoleBinding", "bot-orchestrator-runner-pods"),
+    ["", "ServiceAccount", "hcce-bot-runners", "bot-runner"],
+    ["", "ResourceQuota", "hcce-bot-runners", "bot-runner-capacity"],
+    ["rbac.authorization.k8s.io", "Role", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
+    ["rbac.authorization.k8s.io", "RoleBinding", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "bot-runner-pods.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "bot-runner-pods.yenhubs.org"],
     namespaced("", "Service", "pgsql"),
     namespaced("apps", "Deployment", "pgsql"),
     namespaced("apps", "Deployment", "pgbouncer"),
@@ -390,7 +406,8 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     ["rbac.authorization.k8s.io", "ClusterRole", "", "haproxy-cr"],
     ["rbac.authorization.k8s.io", "ClusterRoleBinding", "", "haproxy-rb"],
     namespaced("networking.k8s.io", "NetworkPolicy", "bot-orchestrator-ingress"),
-    namespaced("networking.k8s.io", "NetworkPolicy", "bot-runner-isolation"),
+    ["networking.k8s.io", "NetworkPolicy", "hcce-bot-runners", "bot-runner-default-deny"],
+    ["networking.k8s.io", "NetworkPolicy", "hcce-bot-runners", "bot-runner-egress"],
     namespaced("networking.k8s.io", "NetworkPolicy", "pgsql-ingress"),
     namespaced("networking.k8s.io", "NetworkPolicy", "pgbouncer-ingress"),
     namespaced("networking.k8s.io", "NetworkPolicy", "pgbouncer-t-ingress"),
@@ -503,11 +520,17 @@ function verifyManifestResourceInventory(resources) {
     const identity = resourceIdentity(resource);
     return identity && identity[0] === "" && identity[1] === "Namespace" && identity[2] === "";
   });
-  if (namespaceResources.length !== 1) {
-    return [`manifest must contain exactly one core Namespace (found ${namespaceResources.length})`];
+  const primaryNamespaces = namespaceResources.filter(
+    resource => resource.metadata?.name !== "hcce-bot-runners"
+  );
+  if (namespaceResources.length !== 2 || primaryNamespaces.length !== 1) {
+    return [
+      `manifest must contain exactly one primary Namespace and hcce-bot-runners ` +
+      `(found ${namespaceResources.length} total/${primaryNamespaces.length} primary)`
+    ];
   }
 
-  const namespace = namespaceResources[0].metadata.name;
+  const namespace = primaryNamespaces[0].metadata.name;
   const includeManualVolumes = (Array.isArray(resources) ? resources : []).some(
     resource => resourceIdentity(resource)?.[1] === "PersistentVolume"
   );
@@ -600,8 +623,17 @@ function verifyBotOrchestratorContainers(deployment) {
 function verifyBotOrchestratorDeploymentContract(deployment) {
   const errors = [];
   const spec = deployment && deployment.spec;
-  if (!spec || spec.replicas !== 1) {
-    errors.push("Deployment/bot-orchestrator must set replicas exactly to numeric 1");
+  const phase = deployment?.metadata?.annotations?.["yenhubs.org/runner-activation-phase"];
+  const recoveryPhase = deployment?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"];
+  const expectedReplicas = recoveryPhase === "restore-fence"
+    ? 0
+    : recoveryPhase === "active" && ["bootstrap", "admission"].includes(phase)
+      ? 0
+      : recoveryPhase === "active" && phase === "active" ? 1 : null;
+  if (expectedReplicas === null || !spec || spec.replicas !== expectedReplicas) {
+    errors.push(
+      "Deployment/bot-orchestrator must be stopped by restore-fence and otherwise bind replicas to activation phase"
+    );
   }
 
   const strategy = spec && spec.strategy;
@@ -613,7 +645,61 @@ function verifyBotOrchestratorDeploymentContract(deployment) {
   return errors;
 }
 
-function verifyBotOrchestratorRuntimeEnv(container) {
+function verifyBotRunnerRecoveryContract(resources, namespace) {
+  const errors = [];
+  const orchestrator = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
+  const recoveryPhase = orchestrator?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"];
+  if (!["active", "restore-fence"].includes(recoveryPhase)) {
+    return ["bot runner recovery phase must be exactly active or restore-fence"];
+  }
+  const expectedReplicas = recoveryPhase === "restore-fence" ? 0 : 1;
+  for (const deploymentName of ["reticulum", "pgbouncer", "pgbouncer-t", "coturn"]) {
+    const deployment = findExactResource(resources, "apps", "Deployment", namespace, deploymentName);
+    if (
+      deployment?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"] !== recoveryPhase ||
+      deployment?.spec?.replicas !== expectedReplicas
+    ) {
+      errors.push(
+        `Deployment/${deploymentName} must bind recovery phase ${recoveryPhase} to replicas=${expectedReplicas}`
+      );
+    }
+  }
+  const pgsql = findExactResource(resources, "apps", "Deployment", namespace, "pgsql");
+  if (
+    pgsql?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"] !== recoveryPhase ||
+    pgsql?.spec?.replicas !== 1
+  ) {
+    errors.push("Deployment/pgsql must remain at replicas=1 and carry the exact recovery phase");
+  }
+
+  const epoch = orchestrator?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-epoch"];
+  const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const reticulum = findExactResource(resources, "apps", "Deployment", namespace, "reticulum");
+  const orchestratorContainer = orchestrator?.spec?.template?.spec?.containers?.find(
+    container => container?.name === "bot-orchestrator"
+  );
+  const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
+    container => container?.name === "reticulum"
+  );
+  const literalEnv = (container, name) => {
+    const entries = (container?.env || []).filter(entry => entry?.name === name);
+    return entries.length === 1 && hasExactOwnKeys(entries[0], ["name", "value"])
+      ? entries[0].value
+      : null;
+  };
+  const epochBindings = [
+    orchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-epoch"],
+    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-epoch"],
+    literalEnv(orchestratorContainer, "BOT_RUNNER_RECOVERY_EPOCH"),
+    literalEnv(reticulumContainer, "turkeyCfg_BOT_RUNNER_RECOVERY_EPOCH")
+  ];
+  if (!uuidV4.test(epoch || "") || epochBindings.some(value => value !== epoch)) {
+    errors.push("Reticulum and bot-orchestrator must share one canonical recovery epoch in metadata and runtime");
+  }
+  return errors;
+}
+
+function verifyBotOrchestratorRuntimeEnv(container, namespace = "$Namespace") {
   const errors = [];
   const env = Array.isArray(container && container.env) ? container.env : [];
   const allowedNames = new Set(BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES);
@@ -666,7 +752,23 @@ function verifyBotOrchestratorRuntimeEnv(container) {
   ) {
     errors.push("bot-orchestrator BOT_RUNNER_IMAGE must be one immutable sha256 digest reference");
   }
-  for (const [name, value] of Object.entries(BOT_ORCHESTRATOR_RUNTIME_ENV)) {
+  const recoveryEpoch = env.filter(entry => entry?.name === "BOT_RUNNER_RECOVERY_EPOCH");
+  if (
+    recoveryEpoch.length !== 1 ||
+    !hasExactOwnKeys(recoveryEpoch[0], ["name", "value"]) ||
+    !(
+      recoveryEpoch[0].value === "$BOT_RUNNER_RECOVERY_EPOCH" ||
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        recoveryEpoch[0].value || ""
+      )
+    )
+  ) {
+    errors.push("bot-orchestrator BOT_RUNNER_RECOVERY_EPOCH must be one canonical UUID v4 literal");
+  }
+  for (const [name, configuredValue] of Object.entries(BOT_ORCHESTRATOR_RUNTIME_ENV)) {
+    const value = name === "RUNNER_CONTROL_URL"
+      ? `http://bot-orchestrator.${namespace}.svc.cluster.local:5001`
+      : configuredValue;
     const matches = Array.isArray(env) ? env.filter(entry => entry && entry.name === name) : [];
     if (
       matches.length !== 1 ||
@@ -714,6 +816,13 @@ function verifyBotOrchestratorIsolationContract(deployment) {
 
 function verifyBotImagePullSecret(resources, namespace) {
   const secret = findExactResource(resources, "", "Secret", namespace, "bot-images-pull");
+  const runnerSecret = findExactResource(
+    resources,
+    "",
+    "Secret",
+    "hcce-bot-runners",
+    "bot-images-pull"
+  );
   if (
     !secret ||
     !hasExactOwnKeys(secret, ["apiVersion", "kind", "metadata", "type", "data"]) ||
@@ -725,6 +834,21 @@ function verifyBotImagePullSecret(resources, namespace) {
     typeof secret.data[".dockerconfigjson"] !== "string"
   ) {
     return ["Secret/bot-images-pull must exactly define one Docker config JSON credential"];
+  }
+  if (
+    !runnerSecret ||
+    !hasExactOwnKeys(runnerSecret, ["apiVersion", "kind", "metadata", "type", "data"]) ||
+    runnerSecret.apiVersion !== "v1" ||
+    runnerSecret.kind !== "Secret" ||
+    !exactStructuredValue(runnerSecret.metadata, {
+      name: "bot-images-pull",
+      namespace: "hcce-bot-runners"
+    }) ||
+    runnerSecret.type !== "kubernetes.io/dockerconfigjson" ||
+    !hasExactOwnKeys(runnerSecret.data, [".dockerconfigjson"]) ||
+    runnerSecret.data[".dockerconfigjson"] !== secret.data[".dockerconfigjson"]
+  ) {
+    return ["runner namespace Secret/bot-images-pull must be an exact copy of the parent pull credential"];
   }
   try {
     const encoded = secret.data[".dockerconfigjson"];
@@ -740,8 +864,39 @@ function verifyBotImagePullSecret(resources, namespace) {
   return [];
 }
 
-function verifyBotRunnerControlPlaneResources(resources, namespace) {
-  const expected = [
+function expectedBotRunnerControlPlaneResources(
+  namespace,
+  activationPhase = "active",
+  recoveryPhase = "active"
+) {
+  if (!["bootstrap", "admission", "active"].includes(activationPhase)) {
+    throw new Error("bot_runner_activation_phase_invalid");
+  }
+  if (!["active", "restore-fence"].includes(recoveryPhase)) {
+    throw new Error("bot_runner_recovery_phase_invalid");
+  }
+  const runnerRoleRules = activationPhase === "bootstrap" || recoveryPhase === "restore-fence"
+    ? []
+    : [{ apiGroups: [""], resources: ["pods"], verbs: ["create", "delete", "get", "list"] }];
+  return [
+    {
+      identity: ["", "Namespace", "", "hcce-bot-runners"],
+      value: {
+        apiVersion: "v1",
+        kind: "Namespace",
+        metadata: {
+          name: "hcce-bot-runners",
+          labels: {
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "v1.34",
+            "pod-security.kubernetes.io/audit": "restricted",
+            "pod-security.kubernetes.io/audit-version": "v1.34",
+            "pod-security.kubernetes.io/warn": "restricted",
+            "pod-security.kubernetes.io/warn-version": "v1.34"
+          }
+        }
+      }
+    },
     {
       identity: ["", "ServiceAccount", namespace, "bot-orchestrator"],
       value: {
@@ -753,28 +908,16 @@ function verifyBotRunnerControlPlaneResources(resources, namespace) {
       }
     },
     {
-      identity: ["", "ServiceAccount", namespace, "bot-runner"],
-      value: {
-        apiVersion: "v1",
-        kind: "ServiceAccount",
-        metadata: { name: "bot-runner", namespace },
-        automountServiceAccountToken: false,
-        imagePullSecrets: [{ name: "bot-images-pull" }]
-      }
-    },
-    {
       identity: ["rbac.authorization.k8s.io", "Role", namespace, "bot-orchestrator-runner-pods"],
       value: {
         apiVersion: "rbac.authorization.k8s.io/v1",
         kind: "Role",
-        metadata: { name: "bot-orchestrator-runner-pods", namespace },
-        rules: [
-          {
-            apiGroups: [""],
-            resources: ["pods"],
-            verbs: ["create", "delete", "get", "list"]
-          }
-        ]
+        metadata: {
+          name: "bot-orchestrator-runner-pods",
+          namespace,
+          annotations: { "yenhubs.org/legacy-runner-authority": "neutralized" }
+        },
+        rules: []
       }
     },
     {
@@ -782,7 +925,75 @@ function verifyBotRunnerControlPlaneResources(resources, namespace) {
       value: {
         apiVersion: "rbac.authorization.k8s.io/v1",
         kind: "RoleBinding",
-        metadata: { name: "bot-orchestrator-runner-pods", namespace },
+        metadata: {
+          name: "bot-orchestrator-runner-pods",
+          namespace,
+          annotations: { "yenhubs.org/legacy-runner-authority": "neutralized" }
+        },
+        roleRef: {
+          apiGroup: "rbac.authorization.k8s.io",
+          kind: "Role",
+          name: "bot-orchestrator-runner-pods"
+        },
+        subjects: [{ kind: "ServiceAccount", name: "bot-orchestrator", namespace }]
+      }
+    },
+    {
+      identity: ["", "ServiceAccount", "hcce-bot-runners", "bot-runner"],
+      value: {
+        apiVersion: "v1",
+        kind: "ServiceAccount",
+        metadata: { name: "bot-runner", namespace: "hcce-bot-runners" },
+        automountServiceAccountToken: false,
+        imagePullSecrets: [{ name: "bot-images-pull" }]
+      }
+    },
+    {
+      identity: ["", "ResourceQuota", "hcce-bot-runners", "bot-runner-capacity"],
+      value: {
+        apiVersion: "v1",
+        kind: "ResourceQuota",
+        metadata: { name: "bot-runner-capacity", namespace: "hcce-bot-runners" },
+        spec: {
+          hard: {
+            pods: "10",
+            "requests.cpu": "250m",
+            "requests.memory": "1280Mi",
+            "limits.cpu": "5",
+            "limits.memory": "5Gi"
+          }
+        }
+      }
+    },
+    {
+      identity: ["rbac.authorization.k8s.io", "Role", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
+      value: {
+        apiVersion: "rbac.authorization.k8s.io/v1",
+        kind: "Role",
+        metadata: {
+          name: "bot-orchestrator-runner-pods",
+          namespace: "hcce-bot-runners",
+          annotations: {
+            "yenhubs.org/runner-activation-phase": activationPhase,
+            "yenhubs.org/bot-runner-recovery-phase": recoveryPhase
+          }
+        },
+        rules: runnerRoleRules
+      }
+    },
+    {
+      identity: ["rbac.authorization.k8s.io", "RoleBinding", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
+      value: {
+        apiVersion: "rbac.authorization.k8s.io/v1",
+        kind: "RoleBinding",
+        metadata: {
+          name: "bot-orchestrator-runner-pods",
+          namespace: "hcce-bot-runners",
+          annotations: {
+            "yenhubs.org/runner-activation-phase": activationPhase,
+            "yenhubs.org/bot-runner-recovery-phase": recoveryPhase
+          }
+        },
         roleRef: {
           apiGroup: "rbac.authorization.k8s.io",
           kind: "Role",
@@ -792,6 +1003,20 @@ function verifyBotRunnerControlPlaneResources(resources, namespace) {
       }
     }
   ];
+}
+
+function verifyBotRunnerControlPlaneResources(resources, namespace) {
+  const deployment = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
+  const activationPhase = deployment?.metadata?.annotations?.["yenhubs.org/runner-activation-phase"];
+  const recoveryPhase = deployment?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"];
+  let expected;
+  try {
+    expected = expectedBotRunnerControlPlaneResources(namespace, activationPhase, recoveryPhase);
+  } catch (_error) {
+    return [
+      "bot runner phases must be activation=bootstrap/admission/active and recovery=active/restore-fence"
+    ];
+  }
 
   return expected.flatMap(({ identity, value }) => {
     const actual = findExactResource(resources, ...identity);
@@ -804,7 +1029,27 @@ function verifyBotRunnerControlPlaneResources(resources, namespace) {
   });
 }
 
-function verifyBotRunnerNetworkPolicy(policy) {
+function verifyBotRunnerDefaultDenyNetworkPolicy(policy) {
+  const expected = {
+    apiVersion: "networking.k8s.io/v1",
+    kind: "NetworkPolicy",
+    metadata: { name: "bot-runner-default-deny", namespace: "hcce-bot-runners" },
+    spec: {
+      podSelector: {},
+      policyTypes: ["Ingress", "Egress"],
+      ingress: [],
+      egress: []
+    }
+  };
+  return exactStructuredValue(
+    canonicalizeUnorderedArrays(policy),
+    canonicalizeUnorderedArrays(expected)
+  )
+    ? []
+    : ["NetworkPolicy/bot-runner-default-deny must select every runner-namespace Pod and deny all traffic"];
+}
+
+function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
   const expectedSpec = {
     podSelector: {
       matchLabels: {
@@ -812,11 +1057,15 @@ function verifyBotRunnerNetworkPolicy(policy) {
         "yenhubs.org/managed-by": "bot-orchestrator"
       }
     },
-    policyTypes: ["Ingress", "Egress"],
-    ingress: [],
+    policyTypes: ["Egress"],
     egress: [
       {
-        to: [{ podSelector: { matchLabels: { app: "bot-orchestrator" } } }],
+        to: [{
+          namespaceSelector: {
+            matchLabels: { "kubernetes.io/metadata.name": parentNamespace }
+          },
+          podSelector: { matchLabels: { app: "bot-orchestrator" } }
+        }],
         ports: [{ protocol: "TCP", port: 5001 }]
       },
       {
@@ -862,20 +1111,142 @@ function verifyBotRunnerNetworkPolicy(policy) {
     ]
   };
 
+  const expected = {
+    apiVersion: "networking.k8s.io/v1",
+    kind: "NetworkPolicy",
+    metadata: { name: "bot-runner-egress", namespace: "hcce-bot-runners" },
+    spec: expectedSpec
+  };
   return exactStructuredValue(
-    canonicalizeUnorderedArrays(policy?.spec),
-    canonicalizeUnorderedArrays(expectedSpec)
+    canonicalizeUnorderedArrays(policy),
+    canonicalizeUnorderedArrays(expected)
   )
     ? []
-    : ["NetworkPolicy/bot-runner-isolation must exactly match the audited deny-ingress and bounded-egress contract"];
+    : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
+}
+
+const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "8f5c8a716c8dba13af3dc9840b641cacc4f9c19c494f31933882f7197d4f4ba5";
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function botRunnerAdmissionTemplateResources() {
+  const templatePath = path.resolve(__dirname, "hcce.yam");
+  const resources = YAML.parseAllDocuments(fs.readFileSync(templatePath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  return [
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicy",
+      "",
+      "bot-runner-pods.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicyBinding",
+      "",
+      "bot-runner-pods.yenhubs.org"
+    )
+  ];
+}
+
+function botRunnerAdmissionRenderValues(resources, namespace) {
+  const deployment = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
+  const container = deployment?.spec?.template?.spec?.containers?.find(value => value?.name === "bot-orchestrator");
+  const env = new Map((container?.env || []).map(entry => [entry?.name, entry?.value]));
+  const hubsBaseUrl = env.get("HUBS_BASE_URL");
+  if (typeof hubsBaseUrl !== "string" || !/^https:\/\/[^/]+$/.test(hubsBaseUrl)) {
+    throw new Error("bot_runner_admission_hubs_base_url_invalid");
+  }
+  const values = {
+    Namespace: namespace,
+    HUB_DOMAIN: hubsBaseUrl.slice("https://".length),
+    BOT_RUNNER_IMAGE: env.get("BOT_RUNNER_IMAGE")
+  };
+  for (const name of [
+    "GHOST_FEATURED_FETCH_TIMEOUT_MS",
+    "GHOST_FEATURED_MAX_BYTES",
+    "GHOST_FEATURED_MAX_ENTRIES",
+    "GHOST_FEATURED_MAX_REDIRECTS",
+    "GHOST_FEATURED_MAX_REFS",
+    "GHOST_NAVMESH_MAX_ROUTE_POINTS",
+    "GHOST_NAVMESH_MAX_SNAP_DISTANCE_M",
+    "GHOST_NAVMESH_MAX_TRIANGLES"
+  ]) {
+    values[name] = env.get(name);
+  }
+  if (Object.values(values).some(value => typeof value !== "string")) {
+    throw new Error("bot_runner_admission_render_value_missing");
+  }
+  return values;
+}
+
+function renderAdmissionTemplateValue(value, replacements) {
+  if (Array.isArray(value)) {
+    return value.map(item => renderAdmissionTemplateValue(item, replacements));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, renderAdmissionTemplateValue(item, replacements)])
+    );
+  }
+  if (typeof value !== "string" || !value.includes("$")) return value;
+  return value.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => {
+    if (!Object.hasOwn(replacements, name)) throw new Error(`bot_runner_admission_placeholder_missing:${name}`);
+    return replacements[name];
+  });
+}
+
+function expectedBotRunnerAdmissionResources(resources, namespace) {
+  const templateResources = botRunnerAdmissionTemplateResources();
+  const actualHash = crypto
+    .createHash("sha256")
+    .update(canonicalJson(templateResources))
+    .digest("hex");
+  if (actualHash !== BOT_RUNNER_ADMISSION_TEMPLATE_SHA256) {
+    throw new Error("bot_runner_admission_template_hash_mismatch");
+  }
+  const replacements = botRunnerAdmissionRenderValues(resources, namespace);
+  return templateResources.map(resource => renderAdmissionTemplateValue(resource, replacements));
+}
+
+function verifyBotRunnerAdmissionResources(resources, namespace) {
+  let expected;
+  try {
+    expected = expectedBotRunnerAdmissionResources(resources, namespace);
+  } catch (_error) {
+    return ["runner ValidatingAdmissionPolicy contract or its audited render inputs are invalid"];
+  }
+  return expected.flatMap(resource => {
+    const identity = resourceIdentity(resource);
+    const actual = findExactResource(resources, ...identity);
+    return exactStructuredValue(actual, resource)
+      ? []
+      : [`${identity[1]}/${identity[3]} must exactly match the audited fail-closed admission contract`];
+  });
 }
 
 function verifyReticulumBotRunnerAuthorityContract(deployment) {
   const errors = [];
   const spec = deployment && deployment.spec;
-  if (!spec || spec.replicas !== 1) {
+  const recoveryPhase = deployment?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"];
+  const expectedReplicas = recoveryPhase === "active"
+    ? 1
+    : recoveryPhase === "restore-fence" ? 0 : null;
+  if (!spec || expectedReplicas === null || spec.replicas !== expectedReplicas) {
     errors.push(
-      "Deployment/reticulum must set replicas exactly to numeric 1 until multi-replica readiness, endpoints, and ret-pvc RWO placement are staged"
+      "Deployment/reticulum must use replicas=1 only in recovery active and replicas=0 in restore-fence"
     );
   }
 
@@ -934,10 +1305,13 @@ module.exports = {
   BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES,
   BOT_ORCHESTRATOR_RUNTIME_ENV,
   BOT_ORCHESTRATOR_SECURITY_CONTEXT,
+  BOT_RUNNER_ADMISSION_TEMPLATE_SHA256,
   EXPECTED_API_VERSION_BY_GROUP,
   HAPROXY_CLUSTER_ROLE,
   HAPROXY_CLUSTER_ROLE_RULES,
   apiGroup,
+  expectedBotRunnerAdmissionResources,
+  expectedBotRunnerControlPlaneResources,
   expectedManifestInventory,
   findExactResource,
   hasExactOwnKeys,
@@ -951,8 +1325,11 @@ module.exports = {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
+  verifyBotRunnerDefaultDenyNetworkPolicy,
   verifyBotRunnerNetworkPolicy,
+  verifyBotRunnerRecoveryContract,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,

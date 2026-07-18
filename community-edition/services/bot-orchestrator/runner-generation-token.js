@@ -4,7 +4,7 @@ const TOKEN_VERSION = "v1";
 const TOKEN_AUDIENCE = "yenhubs-bot-runner";
 const MAX_TOKEN_BYTES = 2048;
 const MAX_CLOCK_SKEW_SECONDS = 30;
-const MAX_TOKEN_TTL_SECONDS = 86_400;
+const MAX_TOKEN_TTL_SECONDS = 3_600;
 
 function validUuid(value) {
   return typeof value === "string" &&
@@ -32,7 +32,14 @@ function signEncodedPayload(encodedPayload, key) {
 }
 
 function createRunnerGenerationToken(input) {
-  const allowedInputKeys = ["expiresAtSeconds", "holderId", "hubSid", "key", "processGeneration"];
+  const allowedInputKeys = [
+    "expiresAtSeconds",
+    "holderId",
+    "hubSid",
+    "key",
+    "processGeneration",
+    "recoveryEpoch"
+  ];
   if (
     !input ||
     typeof input !== "object" ||
@@ -41,11 +48,12 @@ function createRunnerGenerationToken(input) {
   ) {
     throw new Error("runner_generation_token_scope_invalid");
   }
-  const { key, hubSid, processGeneration, holderId, expiresAtSeconds } = input;
+  const { key, hubSid, processGeneration, holderId, expiresAtSeconds, recoveryEpoch } = input;
   if (!strongKey(key)) throw new Error("runner_generation_token_key_invalid");
   if (!validHubSid(hubSid)) throw new Error("runner_generation_token_hub_invalid");
   if (!validUuid(processGeneration)) throw new Error("runner_generation_token_generation_invalid");
   if (!validHolderId(holderId)) throw new Error("runner_generation_token_holder_invalid");
+  if (!validUuid(recoveryEpoch)) throw new Error("runner_generation_token_recovery_epoch_invalid");
   if (!Number.isSafeInteger(expiresAtSeconds) || expiresAtSeconds <= 0) {
     throw new Error("runner_generation_token_expiry_invalid");
   }
@@ -55,6 +63,7 @@ function createRunnerGenerationToken(input) {
     hub_sid: hubSid,
     process_generation: processGeneration,
     holder_id: holderId,
+    recovery_epoch: recoveryEpoch,
     exp: expiresAtSeconds
   };
   const encodedPayload = base64UrlJson(payload);
@@ -70,7 +79,15 @@ function secureEqual(left, right) {
 
 function exactPayloadKeys(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-  const required = ["aud", "exp", "holder_id", "hub_sid", "process_generation", "v"];
+  const required = [
+    "aud",
+    "exp",
+    "holder_id",
+    "hub_sid",
+    "process_generation",
+    "recovery_epoch",
+    "v"
+  ];
   const keys = Object.keys(payload).sort();
   return keys.length === required.length && required.every(key => keys.includes(key));
 }
@@ -83,6 +100,7 @@ function verifyRunnerGenerationToken(
     hubSid = null,
     processGeneration = null,
     holderId = null,
+    recoveryEpoch,
     maxClockSkewSeconds = MAX_CLOCK_SKEW_SECONDS
   } = {}
 ) {
@@ -93,7 +111,8 @@ function verifyRunnerGenerationToken(
     !Number.isSafeInteger(nowSeconds) ||
     !Number.isSafeInteger(maxClockSkewSeconds) ||
     maxClockSkewSeconds < 0 ||
-    maxClockSkewSeconds > MAX_CLOCK_SKEW_SECONDS
+    maxClockSkewSeconds > MAX_CLOCK_SKEW_SECONDS ||
+    !validUuid(recoveryEpoch)
   ) {
     return null;
   }
@@ -117,9 +136,11 @@ function verifyRunnerGenerationToken(
     !validHubSid(payload.hub_sid) ||
     !validUuid(payload.process_generation) ||
     !validHolderId(payload.holder_id) ||
+    !validUuid(payload.recovery_epoch) ||
+    payload.recovery_epoch !== recoveryEpoch ||
     !Number.isSafeInteger(payload.exp) ||
     payload.exp <= nowSeconds - maxClockSkewSeconds ||
-    payload.exp > nowSeconds + MAX_TOKEN_TTL_SECONDS + maxClockSkewSeconds
+    payload.exp > nowSeconds + MAX_TOKEN_TTL_SECONDS
   ) {
     return null;
   }

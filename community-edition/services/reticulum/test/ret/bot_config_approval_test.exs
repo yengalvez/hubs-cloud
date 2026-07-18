@@ -541,6 +541,7 @@ defmodule Ret.BotConfigApprovalTest do
       "hub_sid" => hub_sid,
       "process_generation" => Ecto.UUID.generate(),
       "holder_id" => Ecto.UUID.generate(),
+      "recovery_epoch" => "44444444-4444-4444-8444-444444444444",
       "exp" => System.system_time(:second) + 300
     }
   end

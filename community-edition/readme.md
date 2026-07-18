@@ -228,6 +228,34 @@ manifest through the approved deployment procedure. The verifier rejects
 untracked containers, environment variables, mounts, RBAC and storage
 resources.
 
+#### Updating an active bot-runner control plane
+
+An `active` apply that detects drift between the live and generated runner
+Namespace, Secret, ServiceAccounts, quota, RBAC, NetworkPolicies or admission
+policy deliberately stops with
+`active_reapply_control_plane_drift_refenced_generate_and_apply_bootstrap_then_admission_then_active_do_not_retry_active`.
+This is an expected safety boundary: the apply first makes runner authority
+inert, scales the five recovery consumers to zero, deletes runner Pods with UID
+preconditions and proves a continuous Pod-free window. Do not retry the same
+`active` manifest and do not grant RBAC manually.
+
+Keep the intended configuration and image digests unchanged, then use the
+private input selected by `HCCE_INPUT_VALUES_PATH` to regenerate, verify and
+apply these three phases in order:
+
+1. Set `BOT_RUNNER_ACTIVATION_PHASE: bootstrap`, run
+   `npm run gen-hcce`, inspect `kubectl diff`, then run `npm run apply`.
+2. Set `BOT_RUNNER_ACTIVATION_PHASE: admission`, regenerate, inspect the diff
+   and apply again. This phase proves the admission denial before authority is
+   considered usable.
+3. Set `BOT_RUNNER_ACTIVATION_PHASE: active`, regenerate, inspect the diff and
+   apply once more. Completion requires exact live resources, effective RBAC,
+   admission denial and ready Deployments.
+
+The stopped state intentionally retains the live `active` phase annotations so
+the next generated `bootstrap` manifest is the only supported staged recovery
+path. A repeated `active` apply will remain fail-closed.
+
 If you just need to get the external IP address of your load balancer, run
 
 `npm run get-ip`

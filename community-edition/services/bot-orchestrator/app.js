@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { KubernetesRunnerManager } = require("./kubernetes-runner-manager");
+const { KubernetesRunnerManager, RUNNER_NAMESPACE } = require("./kubernetes-runner-manager");
 const {
   createRunnerGenerationToken,
   verifyRunnerGenerationToken
@@ -94,10 +94,12 @@ const RUNNER_TOKEN_TTL_SECONDS = Math.min(
   86_400
 );
 const POD_NAMESPACE = process.env.POD_NAMESPACE || "";
+const RUNNER_POD_NAMESPACE = process.env.RUNNER_POD_NAMESPACE || "";
 const ORCHESTRATOR_POD_NAME = process.env.ORCHESTRATOR_POD_NAME || "";
 const ORCHESTRATOR_POD_UID = process.env.ORCHESTRATOR_POD_UID || "";
 const BOT_RUNNER_IMAGE = process.env.BOT_RUNNER_IMAGE || "";
-const RUNNER_CONTROL_URL = (process.env.RUNNER_CONTROL_URL || "http://bot-orchestrator:5001").replace(
+const BOT_RUNNER_RECOVERY_EPOCH = process.env.BOT_RUNNER_RECOVERY_EPOCH || "";
+const RUNNER_CONTROL_URL = (process.env.RUNNER_CONTROL_URL || "").replace(
   /\/+$/,
   ""
 );
@@ -283,15 +285,27 @@ function validateRuntimeConfiguration() {
   if (
     RUNNER_AUTOSTART &&
     (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(POD_NAMESPACE) ||
+      RUNNER_POD_NAMESPACE !== RUNNER_NAMESPACE ||
       !/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(ORCHESTRATOR_POD_NAME) ||
       !/^[A-Za-z0-9_.:-]{1,128}$/.test(ORCHESTRATOR_POD_UID))
   ) {
     throw new Error("Kubernetes namespace and orchestrator Pod identity must be provided by the Downward API");
   }
+  if (
+    RUNNER_AUTOSTART &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      BOT_RUNNER_RECOVERY_EPOCH
+    )
+  ) {
+    throw new Error("BOT_RUNNER_RECOVERY_EPOCH must be a canonical lowercase UUID v4");
+  }
   if (RUNNER_AUTOSTART && !/^.+@sha256:[0-9a-f]{64}$/.test(BOT_RUNNER_IMAGE)) {
     throw new Error("BOT_RUNNER_IMAGE must be a dedicated immutable digest reference");
   }
-  if (RUNNER_AUTOSTART && RUNNER_CONTROL_URL !== "http://bot-orchestrator:5001") {
+  if (
+    RUNNER_AUTOSTART &&
+    RUNNER_CONTROL_URL !== `http://bot-orchestrator.${POD_NAMESPACE}.svc.cluster.local:5001`
+  ) {
     throw new Error("Runner control URL must match the audited in-cluster service contract");
   }
   if (
@@ -338,7 +352,8 @@ function ghostRunnerPodEnvironment(sourceEnvironment = process.env) {
 function createRunnerPodManager({ api } = {}) {
   return new KubernetesRunnerManager({
     ...(api ? { api } : {}),
-    namespace: POD_NAMESPACE,
+    namespace: RUNNER_POD_NAMESPACE,
+    parentNamespace: POD_NAMESPACE,
     ownerPodName: ORCHESTRATOR_POD_NAME,
     ownerPodUid: ORCHESTRATOR_POD_UID,
     runnerImage: BOT_RUNNER_IMAGE,
@@ -349,7 +364,11 @@ function createRunnerPodManager({ api } = {}) {
     tokenTtlSeconds: RUNNER_TOKEN_TTL_SECONDS,
     maxActiveRooms: MAX_ACTIVE_ROOMS,
     tokenFactory: claims =>
-      createRunnerGenerationToken({ key: BOT_ORCHESTRATOR_ACCESS_KEY, ...claims })
+      createRunnerGenerationToken({
+        key: BOT_ORCHESTRATOR_ACCESS_KEY,
+        recoveryEpoch: BOT_RUNNER_RECOVERY_EPOCH,
+        ...claims
+      })
   });
 }
 
@@ -2491,7 +2510,8 @@ function runnerControlAuthorization(req) {
   const token = authorization.slice("Bearer ".length);
   const podUid = exactSingleHeader(req, "x-yenhubs-runner-pod-uid") || "";
   const claims = verifyRunnerGenerationToken(token, BOT_ORCHESTRATOR_ACCESS_KEY, {
-    holderId: ORCHESTRATOR_POD_UID || null
+    holderId: ORCHESTRATOR_POD_UID || null,
+    recoveryEpoch: BOT_RUNNER_RECOVERY_EPOCH
   });
   if (!claims) return null;
 
