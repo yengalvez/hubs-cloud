@@ -442,6 +442,53 @@ test("requires authenticated self-presence and a matching Reticulum spawn ACK", 
   );
 });
 
+test("publishes the authenticated runner status with the joined authority epoch", async () => {
+  const presence = {
+    state: {
+      session: {
+        metas: [{
+          context: { bot_runner: true },
+          bot_runner_lease_id: "lease-current",
+          bot_runner_authority_epoch: 17,
+          bot_runner_authoritative: true
+        }]
+      }
+    }
+  };
+  const published = [];
+
+  const fence = await internals.establishAuthenticatedRunnerAuthority({
+    presence,
+    sessionId: "session",
+    leaseId: "lease-current",
+    processGeneration: TEST_PROCESS_GENERATION,
+    publishManagedMessage(message) {
+      published.push(message);
+      return true;
+    }
+  });
+
+  assert.deepEqual(fence, { leaseId: "lease-current", authorityEpoch: 17 });
+  assert.deepEqual(published, [{
+    type: "ghost-auth-status",
+    authenticated: true,
+    processGeneration: TEST_PROCESS_GENERATION,
+    runnerLeaseId: "lease-current",
+    runnerAuthorityEpoch: 17
+  }]);
+
+  await assert.rejects(
+    internals.establishAuthenticatedRunnerAuthority({
+      presence,
+      sessionId: "session",
+      leaseId: "lease-current",
+      processGeneration: TEST_PROCESS_GENERATION,
+      publishManagedMessage: () => false
+    }),
+    /ghost_auth_status_control_failed/
+  );
+});
+
 test("applies bot commands only for the exact current runner authority fence", () => {
   const authorityFence = { leaseId: "lease-current", authorityEpoch: 12 };
   const record = { id: "bot-1", mobility: "medium" };

@@ -2074,6 +2074,33 @@ function waitForAuthenticatedRunnerPresence(presence, sessionId, leaseId, timeou
   });
 }
 
+async function establishAuthenticatedRunnerAuthority({
+  presence,
+  sessionId,
+  leaseId,
+  processGeneration,
+  publishManagedMessage,
+  timeoutMs = 5000
+}) {
+  const authorityEpoch = await waitForAuthenticatedRunnerPresence(
+    presence,
+    sessionId,
+    leaseId,
+    timeoutMs
+  );
+  const authorityFence = { leaseId, authorityEpoch };
+  if (!publishManagedMessage({
+    type: "ghost-auth-status",
+    authenticated: true,
+    processGeneration,
+    runnerLeaseId: leaseId,
+    runnerAuthorityEpoch: authorityFence.authorityEpoch
+  })) {
+    throw new Error("ghost_auth_status_control_failed");
+  }
+  return authorityFence;
+}
+
 function sendNafr(channel, payload) {
   channel.push("nafr", { naf: JSON.stringify(payload) });
 }
@@ -2376,26 +2403,17 @@ async function main() {
   const presence = new Presence(channel);
   let runnerAuthorityFence;
   try {
-    const runnerAuthorityEpoch = await waitForAuthenticatedRunnerPresence(
+    runnerAuthorityFence = await establishAuthenticatedRunnerAuthority({
       presence,
       sessionId,
-      runnerLeaseId,
-      5000
-    );
-    runnerAuthorityFence = { leaseId: runnerLeaseId, authorityEpoch: runnerAuthorityEpoch };
+      leaseId: runnerLeaseId,
+      processGeneration: runnerProcessGeneration,
+      publishManagedMessage,
+      timeoutMs: 5000
+    });
   } catch (error) {
     socket.disconnect();
     throw error;
-  }
-  if (!publishManagedMessage({
-    type: "ghost-auth-status",
-    authenticated: true,
-    processGeneration: runnerProcessGeneration,
-    runnerLeaseId,
-    runnerAuthorityEpoch
-  })) {
-    socket.disconnect();
-    throw new Error("ghost_auth_status_control_failed");
   }
 
   log("Joined hub as authenticated bot runner:", hubSid, "session:", sessionId);
@@ -3323,6 +3341,7 @@ module.exports = {
   main,
   internals: {
     applyFencedBotCommand,
+    establishAuthenticatedRunnerAuthority,
     authenticatedRunnerAuthorityFence,
     authoritativeBotRunnerLeaseId,
     applyHubRefreshSceneChange,
