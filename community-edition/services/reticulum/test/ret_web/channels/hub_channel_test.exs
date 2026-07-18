@@ -9,6 +9,7 @@ defmodule RetWeb.HubChannelTest do
     Account,
     BotChatPresence,
     BotConfigAdmission,
+    BotConfigApproval,
     BotRunnerLease,
     Repo,
     Hub,
@@ -293,9 +294,25 @@ defmodule RetWeb.HubChannelTest do
   end
 
   describe "bot runner presence context" do
-    setup do
+    setup %{hub: hub} do
       original_bot_access_key = Application.get_env(:ret, :bot_runner_access_key)
       bot_access_key = String.duplicate("trusted-bot-access-key-", 2)
+      bot_admin = create_account("bot-runner-admin-#{System.unique_integer([:positive])}", true)
+
+      {:ok, hub} =
+        hub
+        |> Hub.add_attrs_to_changeset(%{
+          user_data: %{
+            "bots" => %{
+              "enabled" => true,
+              "count" => 1,
+              "mobility" => "static",
+              "chat_enabled" => true,
+              "prompt" => ""
+            }
+          }
+        })
+        |> BotConfigAdmission.update(bot_admin)
 
       Application.put_env(:ret, :bot_runner_access_key, bot_access_key)
 
@@ -307,7 +324,7 @@ defmodule RetWeb.HubChannelTest do
         end
       end)
 
-      {:ok, bot_access_key: bot_access_key}
+      {:ok, bot_access_key: bot_access_key, bot_admin: bot_admin, hub: hub}
     end
 
     test "publishes bot_runner=true only for a boolean request with a valid access key", %{
@@ -331,6 +348,59 @@ defmodule RetWeb.HubChannelTest do
         bot_spawn_accepted: true,
         network_id: ^network_id
       }
+    end
+
+    test "quarantine revokes an existing runner and denies new leases before room_stop", %{
+      socket: socket,
+      hub: hub,
+      bot_access_key: bot_access_key,
+      bot_admin: bot_admin
+    } do
+      params =
+        join_params(%{
+          "bot_access_key" => bot_access_key,
+          "context" => %{"bot_runner" => true}
+        })
+
+      {:ok, first_join, runner_socket} = join_hub(socket, hub, params)
+      network_id = bot_network_id(hub, 1)
+
+      assert first_join.bot_runner_authoritative
+
+      assert_reply push(runner_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
+        bot_spawn_accepted: true
+      }
+
+      assert {:ok, _quarantined_hub} = BotConfigApproval.quarantine(hub.hub_sid, bot_admin)
+      assert BotRunnerLease.snapshot(hub.hub_sid) == nil
+
+      assert_reply push(runner_socket, "naf", bot_spawn_payload(network_id)), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      assert_reply push(runner_socket, "naf", bot_update_payload(network_id)), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      multi_update = %{
+        "dataType" => "um",
+        "data" => %{"d" => [bot_update_payload(network_id)["data"]]}
+      }
+
+      assert_reply push(runner_socket, "naf", multi_update), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      remove = %{"dataType" => "r", "data" => %{"networkId" => network_id}}
+
+      assert_reply push(runner_socket, "naf", remove), :error, %{
+        reason: "bot_runner_not_authoritative"
+      }
+
+      {:ok, second_transport} = connect(SessionSocket, %{})
+
+      assert {:error, %{reason: "bot_config_unapproved"}} =
+               join_hub(second_transport, Repo.get!(Hub, hub.hub_id), params)
     end
 
     test "keeps the first registered lease authoritative during runner overlap", %{

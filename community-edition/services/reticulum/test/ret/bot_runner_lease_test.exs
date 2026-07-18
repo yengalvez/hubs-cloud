@@ -4,6 +4,21 @@ defmodule Ret.BotRunnerLeaseTest do
   alias Ret.BotRunnerLease
   alias RetWeb.HubChannel
 
+  test "revocation fences every lease in a room before best-effort runner shutdown" do
+    hub_sid = "lease-revoke-#{System.unique_integer([:positive])}"
+    {:ok, lease} = BotRunnerLease.register(hub_sid)
+
+    assert BotRunnerLease.authorized?(hub_sid, lease.lease_id, lease.authority_epoch)
+    assert :ok = BotRunnerLease.revoke(hub_sid)
+
+    assert_receive {:bot_runner_lease_authority, lease_id, revoked_epoch, false}
+    assert lease_id == lease.lease_id
+    assert revoked_epoch > lease.authority_epoch
+    refute BotRunnerLease.authorized?(hub_sid, lease.lease_id, lease.authority_epoch)
+    assert BotRunnerLease.snapshot(hub_sid) == nil
+    assert :ok = BotRunnerLease.unregister(hub_sid, lease.lease_id)
+  end
+
   test "a paused older registration remains authoritative before Presence publication" do
     hub_sid = "lease-probe-#{System.unique_integer([:positive])}"
     parent = self()

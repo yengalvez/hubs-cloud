@@ -3,7 +3,7 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
 
   import Ret.TestHelpers
 
-  alias Ret.Repo
+  alias Ret.{BotConfigApproval, Repo}
 
   @bot_runner_access_header "x-ret-bot-runner-access-key"
   @bot_runner_access_key "test-bot-runner-access-key-32bytes"
@@ -33,6 +33,40 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
 
   setup [:create_account, :create_owned_file, :create_scene, :create_hub]
 
+  test "valid active config is excluded without approval and after an exact-match drift", %{
+    conn: conn,
+    hub: hub
+  } do
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    assert conn
+           |> put_req_header(@bot_runner_access_header, @bot_runner_access_key)
+           |> get("/api-internal/v1/hubs/configured_with_bots")
+           |> json_response(200) == %{"hubs" => []}
+
+    approve_config!(hub)
+
+    drifted =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{"bots" => %{"enabled" => true, "count" => 2}}
+      })
+      |> Repo.update!()
+
+    refute drifted.user_data["bots"] == Repo.get!(BotConfigApproval, hub.hub_id).approved_bots
+
+    assert conn
+           |> recycle()
+           |> put_req_header(@bot_runner_access_header, @bot_runner_access_key)
+           |> get("/api-internal/v1/hubs/configured_with_bots")
+           |> json_response(200) == %{"hubs" => []}
+  end
+
   test "configured bot discovery tolerates malformed legacy JSON without unsafe casts", %{
     conn: conn,
     hub: valid_hub,
@@ -55,6 +89,8 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
         }
       })
       |> Repo.update!()
+
+    approve_config!(valid_hub)
 
     {:ok, hub: malformed_count_hub} = create_hub(%{scene: scene})
 
@@ -92,19 +128,22 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     conn: conn,
     hub: hub
   } do
-    hub
-    |> Ecto.Changeset.change(%{
-      user_data: %{
-        "bots" => %{
-          "enabled" => 1,
-          "count" => 1,
-          "mobility" => "low",
-          "chat_enabled" => false,
-          "prompt" => ""
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{
+          "bots" => %{
+            "enabled" => 1,
+            "count" => 1,
+            "mobility" => "low",
+            "chat_enabled" => false,
+            "prompt" => ""
+          }
         }
-      }
-    })
-    |> Repo.update!()
+      })
+      |> Repo.update!()
+
+    approve_config!(hub)
 
     response =
       conn
@@ -129,19 +168,22 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
         end)
 
     Enum.each(hubs, fn configured_hub ->
-      configured_hub
-      |> Ecto.Changeset.change(%{
-        user_data: %{
-          "bots" => %{
-            "enabled" => true,
-            "count" => 1,
-            "mobility" => "static",
-            "chat_enabled" => false,
-            "prompt" => ""
+      configured_hub =
+        configured_hub
+        |> Ecto.Changeset.change(%{
+          user_data: %{
+            "bots" => %{
+              "enabled" => true,
+              "count" => 1,
+              "mobility" => "static",
+              "chat_enabled" => false,
+              "prompt" => ""
+            }
           }
-        }
-      })
-      |> Repo.update!()
+        })
+        |> Repo.update!()
+
+      approve_config!(configured_hub)
     end)
 
     response =
@@ -161,21 +203,27 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     hub: hub,
     scene: scene
   } do
-    hub
-    |> Ecto.Changeset.change(%{
-      user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
-    })
-    |> Repo.update!()
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(hub)
 
     Enum.each(1..11, fn index ->
       {:ok, hub: zero_hub} = create_hub(%{scene: scene})
       count = if rem(index, 2) == 0, do: "not-an-integer", else: 0
 
-      zero_hub
-      |> Ecto.Changeset.change(%{
-        user_data: %{"bots" => %{"enabled" => true, "count" => count}}
-      })
-      |> Repo.update!()
+      zero_hub =
+        zero_hub
+        |> Ecto.Changeset.change(%{
+          user_data: %{"bots" => %{"enabled" => true, "count" => count}}
+        })
+        |> Repo.update!()
+
+      approve_config!(zero_hub)
     end)
 
     response =
@@ -193,21 +241,27 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     hub: hub,
     scene: scene
   } do
-    hub
-    |> Ecto.Changeset.change(%{
-      user_data: %{"bots" => %{"enabled" => 1, "count" => 1}}
-    })
-    |> Repo.update!()
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{"bots" => %{"enabled" => 1, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(hub)
 
     Enum.each(1..11, fn index ->
       {:ok, hub: disabled_hub} = create_hub(%{scene: scene})
       enabled = if rem(index, 2) == 0, do: 1.0, else: 1.5
 
-      disabled_hub
-      |> Ecto.Changeset.change(%{
-        user_data: %{"bots" => %{"enabled" => enabled, "count" => 1}}
-      })
-      |> Repo.update!()
+      disabled_hub =
+        disabled_hub
+        |> Ecto.Changeset.change(%{
+          user_data: %{"bots" => %{"enabled" => enabled, "count" => 1}}
+        })
+        |> Repo.update!()
+
+      approve_config!(disabled_hub)
     end)
 
     response =
@@ -224,18 +278,21 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     conn: conn,
     hub: hub
   } do
-    hub
-    |> Ecto.Changeset.change(%{
-      user_data: %{
-        "unrelated" => String.duplicate("x", 100_000),
-        "bots" => %{
-          "enabled" => true,
-          "count" => 1,
-          "prompt" => String.duplicate("p", 20_000)
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{
+          "unrelated" => String.duplicate("x", 100_000),
+          "bots" => %{
+            "enabled" => true,
+            "count" => 1,
+            "prompt" => String.duplicate("p", 20_000)
+          }
         }
-      }
-    })
-    |> Repo.update!()
+      })
+      |> Repo.update!()
+
+    approve_config!(hub)
 
     response =
       conn
@@ -254,21 +311,27 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     hub: hub,
     scene: scene
   } do
-    hub
-    |> Ecto.Changeset.change(%{
-      entry_mode: :deny,
-      user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
-    })
-    |> Repo.update!()
+    hub =
+      hub
+      |> Ecto.Changeset.change(%{
+        entry_mode: :deny,
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(hub)
 
     {:ok, hub: open_hub} = create_hub(%{scene: scene})
 
-    open_hub
-    |> Ecto.Changeset.change(%{
-      entry_mode: :allow,
-      user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
-    })
-    |> Repo.update!()
+    open_hub =
+      open_hub
+      |> Ecto.Changeset.change(%{
+        entry_mode: :allow,
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(open_hub)
 
     response =
       conn
@@ -286,21 +349,27 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
          hub: closed_hub,
          scene: scene
        } do
-    closed_hub
-    |> Ecto.Changeset.change(%{
-      entry_mode: :deny,
-      user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
-    })
-    |> Repo.update!()
+    closed_hub =
+      closed_hub
+      |> Ecto.Changeset.change(%{
+        entry_mode: :deny,
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(closed_hub)
 
     {:ok, hub: open_hub} = create_hub(%{scene: scene})
 
-    open_hub
-    |> Ecto.Changeset.change(%{
-      entry_mode: :allow,
-      user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
-    })
-    |> Repo.update!()
+    open_hub =
+      open_hub
+      |> Ecto.Changeset.change(%{
+        entry_mode: :allow,
+        user_data: %{"bots" => %{"enabled" => true, "count" => 1}}
+      })
+      |> Repo.update!()
+
+    approve_config!(open_hub)
 
     {:ok, _closed_ref} =
       RetWeb.Presence.track(self(), "ret", "closed-legacy-presence", %{
@@ -335,5 +404,19 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
            |> put_req_header("x-ret-bot-access-key", @bot_runner_access_key)
            |> post("/api/v1/hub_bindings", %{})
            |> response(401)
+  end
+
+  defp approve_config!(hub) do
+    bots = hub.user_data["bots"]
+    now = DateTime.utc_now()
+
+    Repo.insert!(%BotConfigApproval{
+      hub_id: hub.hub_id,
+      state: "approved",
+      candidate_bots: bots,
+      approved_bots: bots,
+      approved_by_account_id: 1,
+      approved_at: now
+    })
   end
 end

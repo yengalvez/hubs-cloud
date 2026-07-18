@@ -188,6 +188,15 @@ defmodule RetWeb.Router do
       resources "/accounts", Api.V1.AccountController, only: [:create, :delete]
       patch "/accounts", Api.V1.AccountController, :update
       resources "/accounts/search", Api.V1.AccountSearchController, only: [:create]
+      get "/bot_config_approvals", Api.V1.BotConfigApprovalController, :index
+
+      post "/bot_config_approvals/:hub_sid/approve",
+           Api.V1.BotConfigApprovalController,
+           :approve
+
+      post "/bot_config_approvals/:hub_sid/quarantine",
+           Api.V1.BotConfigApprovalController,
+           :quarantine
     end
   end
 

@@ -3,7 +3,7 @@ defmodule RetWeb.Api.V1.BotController do
 
   import Canada, only: [can?: 2]
 
-  alias Ret.{AppConfig, BotChatPresence, BotOrchestrator, Hub, Repo}
+  alias Ret.{AppConfig, BotChatPresence, BotConfigApproval, BotOrchestrator, Hub, Repo}
 
   @max_message_length 800
   @max_waypoints 64
@@ -44,7 +44,8 @@ defmodule RetWeb.Api.V1.BotController do
   def chat(conn, _params), do: conn |> send_resp(400, "message is required")
 
   defp chat_with_hub(conn, account, hub, bot_id, message, context) do
-    with {:ok, bots} <- validate_bots_config(hub.user_data),
+    with {:ok, approval_decision} <- validate_bot_config_approval(hub),
+         {:ok, bots} <- validate_bots_config(hub.user_data),
          :ok <- validate_bot_id(bot_id, bots["count"]),
          :ok <- validate_message(message),
          {:ok, response} <-
@@ -54,12 +55,59 @@ defmodule RetWeb.Api.V1.BotController do
              requester_id: to_string(account.account_id),
              message: String.trim(message),
              context: normalize_context(context)
-           }) do
-      reply = map_get(response, "reply") || "El bot no ha devuelto una respuesta."
-      action = normalize_action(map_get(response, "action"))
+           }),
+         {:ok, delivered_conn} <-
+           deliver_if_approval_is_current(
+             conn,
+             hub.hub_id,
+             hub.hub_sid,
+             bot_id,
+             approval_decision,
+             response
+           ) do
+      delivered_conn
+    else
+      {:error, :bots_disabled} ->
+        conn |> send_resp(403, "bots are disabled for this room")
 
+      {:error, :bot_config_unapproved} ->
+        conn |> send_resp(403, "bot configuration is not approved")
+
+      {:error, :chat_disabled} ->
+        conn |> send_resp(403, "bot chat is disabled for this room")
+
+      {:error, :invalid_bot_id} ->
+        conn |> send_resp(400, "invalid bot id")
+
+      {:error, :invalid_message} ->
+        conn |> send_resp(400, "message must be non-empty")
+
+      {:error, :message_too_long} ->
+        conn |> send_resp(400, "message too long")
+
+      {:error, _reason} ->
+        conn |> send_resp(502, "bot service unavailable")
+    end
+  end
+
+  defp validate_bot_config_approval(hub) do
+    BotConfigApproval.runtime_decision(hub)
+  end
+
+  defp deliver_if_approval_is_current(
+         conn,
+         hub_id,
+         hub_sid,
+         bot_id,
+         approval_decision,
+         response
+       ) do
+    reply = map_get(response, "reply") || "El bot no ha devuelto una respuesta."
+    action = normalize_action(map_get(response, "action"))
+
+    BotConfigApproval.with_current_runtime_decision(hub_id, approval_decision, fn ->
       if action do
-        RetWeb.Endpoint.broadcast("hub:#{hub.hub_sid}", "message", %{
+        RetWeb.Endpoint.broadcast("hub:#{hub_sid}", "message", %{
           type: "bot_command",
           body: Map.put(action, "bot_id", bot_id),
           session_id: "reticulum",
@@ -70,14 +118,7 @@ defmodule RetWeb.Api.V1.BotController do
       conn
       |> put_resp_content_type("application/json")
       |> send_resp(200, Poison.encode!(%{reply: reply, action: action}))
-    else
-      {:error, :bots_disabled} -> conn |> send_resp(403, "bots are disabled for this room")
-      {:error, :chat_disabled} -> conn |> send_resp(403, "bot chat is disabled for this room")
-      {:error, :invalid_bot_id} -> conn |> send_resp(400, "invalid bot id")
-      {:error, :invalid_message} -> conn |> send_resp(400, "message must be non-empty")
-      {:error, :message_too_long} -> conn |> send_resp(400, "message too long")
-      {:error, _reason} -> conn |> send_resp(502, "bot service unavailable")
-    end
+    end)
   end
 
   defp validate_message(message) do

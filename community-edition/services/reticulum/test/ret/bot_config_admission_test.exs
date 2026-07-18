@@ -3,7 +3,7 @@ defmodule Ret.BotConfigAdmissionTest do
 
   import Ret.TestHelpers
 
-  alias Ret.{BotConfigAdmission, Hub, Repo}
+  alias Ret.{BotConfigAdmission, BotConfigApproval, Hub, Repo}
   alias Ret.Api.{Credentials, Scopes}
 
   setup [:create_account, :create_owned_file, :create_scene]
@@ -153,6 +153,17 @@ defmodule Ret.BotConfigAdmissionTest do
 
     assert Repo.get!(Hub, hub.hub_id).user_data["bots"]["count"] == 1
 
+    raw_equivalent = put_in(preserved, ["bots", "count"], "1")
+
+    assert {:error, raw_denied} =
+             preserved_hub
+             |> Ecto.Changeset.change(user_data: raw_equivalent)
+             |> BotConfigAdmission.update(account)
+
+    assert "only a global administrator may create or modify room bot configuration" in errors_on(
+             raw_denied
+           ).user_data
+
     disabled = put_in(preserved, ["bots", "enabled"], false)
     disabled_and_modified = put_in(disabled, ["bots", "prompt"], "staged by owner")
 
@@ -171,6 +182,37 @@ defmodule Ret.BotConfigAdmissionTest do
              |> BotConfigAdmission.update(account)
 
     refute disabled_hub.user_data["bots"]["enabled"]
+  end
+
+  test "ordinary updates cannot strip future approved bot fields through normalization", %{
+    account: account,
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Future bot field")
+    future_user_data = put_in(hub.user_data, ["bots", "future_contract"], %{"version" => 2})
+
+    assert {:ok, future_hub} =
+             hub
+             |> Ecto.Changeset.change(user_data: future_user_data)
+             |> BotConfigAdmission.update(admin)
+
+    assert BotConfigApproval.runtime_enabled?(future_hub)
+
+    assert {:error, denied} =
+             future_hub
+             |> Hub.add_attrs_to_changeset(%{
+               user_data: Map.put(future_hub.user_data, "theme", "aurora")
+             })
+             |> BotConfigAdmission.update(account)
+
+    assert "only a global administrator may create or modify room bot configuration" in errors_on(
+             denied
+           ).user_data
+
+    persisted_hub = Repo.get!(Hub, hub.hub_id)
+    assert persisted_hub.user_data["bots"]["future_contract"] == %{"version" => 2}
+    assert BotConfigApproval.runtime_enabled?(persisted_hub)
   end
 
   test "the configured ceiling rejects N plus one without persisting it and reopens after disable",
