@@ -89,22 +89,26 @@ defmodule Ret.BotConfigApproval do
   def runtime_decision(%Hub{}), do: {:error, :bot_config_unapproved}
 
   @doc """
-  Registers a process-bound runner lease only while holding the same durable
-  admission lock used by approval and quarantine changes.
+  Registers a process-bound runner lease with the durable lock order used by
+  approval and quarantine changes.
 
-  Reloading the hub, checking the exact approved JSON and registering the
-  in-memory lease under one lock closes the join/quarantine race on the current
-  singleton Reticulum deployment: either the join registers first and local
-  quarantine revokes it, or quarantine commits first and the join observes the
-  quarantined state. Cross-replica fencing is provided separately by AUD-076.
+  The order is the global admission advisory lock, the Hub and approval rows,
+  then the room-specific runner authority advisory/row lock. The PostgreSQL
+  lease acquisition executes in this caller and therefore on the existing
+  admission transaction connection; the local coordinator never opens a
+  second database wait while the caller holds the global lock.
   """
-  def register_runtime_lease(hub_sid)
-      when is_binary(hub_sid) and byte_size(hub_sid) > 0 do
+  def register_runtime_lease(hub_sid),
+    do: register_runtime_lease(hub_sid, SecureRandom.uuid())
+
+  def register_runtime_lease(hub_sid, session_id)
+      when is_binary(hub_sid) and byte_size(hub_sid) > 0 and is_binary(session_id) do
     result =
       Locking.exec_after_lock(@admission_lock, fn ->
-        with %Hub{} = hub <- Repo.one(from h in Hub, where: h.hub_sid == ^hub_sid),
-             {:ok, _decision} <- runtime_decision(hub) do
-          BotRunnerLease.register(hub_sid)
+        with %Hub{} = hub <- hub_for_update(hub_sid),
+             %BotConfigApproval{} = approval <- approval_for_update(hub.hub_id),
+             true <- hub.entry_mode != :deny and runtime_approved?(hub, approval) do
+          BotRunnerLease.register_for_session(hub_sid, session_id)
         else
           _ -> {:error, :bot_config_unapproved}
         end
@@ -120,7 +124,7 @@ defmodule Ret.BotConfigApproval do
     :exit, _reason -> fail_registration_closed(hub_sid)
   end
 
-  def register_runtime_lease(_hub_sid), do: {:error, :bot_config_unapproved}
+  def register_runtime_lease(_hub_sid, _session_id), do: {:error, :bot_config_unapproved}
 
   @doc """
   Executes a bounded runtime side effect only if the exact approval decision is
@@ -134,14 +138,16 @@ defmodule Ret.BotConfigApproval do
       when is_integer(hub_id) and is_map(expected_decision) and is_function(fun, 0) do
     result =
       Locking.exec_after_lock(@admission_lock, fn ->
-        case Repo.get(Hub, hub_id) do
-          %Hub{} = current_hub ->
-            if runtime_decision(current_hub) == {:ok, expected_decision},
-              do: {:ok, fun.()},
-              else: {:error, :bot_config_unapproved}
-
-          _ ->
-            {:error, :bot_config_unapproved}
+        with %Hub{} = current_hub <- hub_for_update_by_id(hub_id),
+             %BotConfigApproval{} = approval <- approval_for_update(current_hub.hub_id),
+             {:ok, ^expected_decision} <- locked_runtime_decision(current_hub, approval) do
+          case fun.() do
+            {:ok, _value} = ok -> ok
+            {:error, _reason} = error -> error
+            value -> {:ok, value}
+          end
+        else
+          _ -> {:error, :bot_config_unapproved}
         end
       end)
 
@@ -444,8 +450,20 @@ defmodule Ret.BotConfigApproval do
     Repo.one(from h in Hub, where: h.hub_sid == ^hub_sid, lock: "FOR UPDATE")
   end
 
+  defp hub_for_update_by_id(hub_id) do
+    Repo.one(from h in Hub, where: h.hub_id == ^hub_id, lock: "FOR UPDATE")
+  end
+
   defp approval_for_update(hub_id) do
     Repo.one(from a in BotConfigApproval, where: a.hub_id == ^hub_id, lock: "FOR UPDATE")
+  end
+
+  defp locked_runtime_decision(%Hub{} = hub, %BotConfigApproval{} = approval) do
+    if hub.entry_mode != :deny and runtime_approved?(hub, approval) do
+      {:ok, %{bots: raw_bots(hub.user_data), approval_updated_at: approval.updated_at}}
+    else
+      {:error, :bot_config_unapproved}
+    end
   end
 
   defp persist_candidate(hub, candidate_bots) do

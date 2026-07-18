@@ -6,6 +6,7 @@ defmodule Ret.BotConfigApprovalTest do
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
   alias Ret.{BotConfigAdmission, BotConfigApproval, BotRunnerLease, Hub, Repo}
+  alias Ret.BotRunnerLease.PostgresStore
 
   setup [:create_account, :create_owned_file, :create_scene]
 
@@ -336,6 +337,50 @@ defmodule Ret.BotConfigApprovalTest do
 
     assert {:error, :forbidden} = BotConfigApproval.quarantine(hub.hub_sid, stale_admin)
     assert BotConfigApproval.runtime_enabled?(Repo.get!(Hub, hub.hub_id))
+  end
+
+  test "a competing replica rejection does not revoke the active database lease", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Replica overlap")
+    incumbent_lease_id = Ecto.UUID.generate()
+    incumbent_holder_id = Ecto.UUID.generate()
+    incumbent_session_id = Ecto.UUID.generate()
+
+    assert {:ok, %{epoch: incumbent_epoch}} =
+             PostgresStore.acquire(
+               Repo,
+               hub.hub_sid,
+               incumbent_lease_id,
+               incumbent_holder_id,
+               incumbent_session_id,
+               15
+             )
+
+    assert {:error, :lease_unavailable} =
+             BotConfigApproval.register_runtime_lease(hub.hub_sid, Ecto.UUID.generate())
+
+    assert {:ok, :incumbent_still_authoritative} =
+             PostgresStore.with_authority(
+               Repo,
+               hub.hub_sid,
+               incumbent_lease_id,
+               incumbent_holder_id,
+               incumbent_session_id,
+               incumbent_epoch,
+               fn -> :incumbent_still_authoritative end
+             )
+
+    assert {:ok, _fenced_epoch} =
+             PostgresStore.release(
+               Repo,
+               hub.hub_sid,
+               incumbent_lease_id,
+               incumbent_holder_id,
+               incumbent_session_id,
+               incumbent_epoch
+             )
   end
 
   @tag timeout: 15_000

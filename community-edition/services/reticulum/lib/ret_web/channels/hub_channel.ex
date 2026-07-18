@@ -221,21 +221,37 @@ defmodule RetWeb.HubChannel do
 
         payload = payload |> Map.put("data", data)
 
-        broadcast_from!(
-          socket,
-          event |> internal_naf_event_for(socket),
-          payload |> payload_with_from(socket)
-        )
-
         if template == "#remote-bot-avatar" do
-          {:reply,
-           {:ok,
-            %{
-              bot_spawn_accepted: true,
-              network_id: data["networkId"],
-              bot_runner_authority_epoch: socket.assigns.bot_runner_authority_epoch
-            }}, socket}
+          response = %{
+            bot_spawn_accepted: true,
+            network_id: data["networkId"],
+            bot_runner_authority_epoch: socket.assigns.bot_runner_authority_epoch
+          }
+
+          reply_ref = socket_ref(socket)
+
+          case with_bot_runner_authority(socket, fn ->
+                 broadcast_from!(
+                   socket,
+                   event |> internal_naf_event_for(socket),
+                   payload |> payload_with_from(socket)
+                 )
+
+                 reply(reply_ref, {:ok, response})
+               end) do
+            {:ok, :ok} ->
+              {:noreply, socket}
+
+            {:error, _reason} ->
+              {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+          end
         else
+          broadcast_from!(
+            socket,
+            event |> internal_naf_event_for(socket),
+            payload |> payload_with_from(socket)
+          )
+
           {:noreply, socket}
         end
     end
@@ -261,11 +277,11 @@ defmodule RetWeb.HubChannel do
       protected_network_id and not dedicated_shape ->
         {:reply, {:error, %{reason: "invalid_bot_spawn_payload"}}, socket}
 
-      protected_network_id and not bot_runner?(socket) ->
-        {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
-
       not protected_network_id and data["template"] == "#remote-bot-avatar" ->
         {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
+
+      protected_network_id ->
+        guarded_bot_broadcast(socket, event, payload)
 
       true ->
         broadcast_from!(
@@ -288,17 +304,7 @@ defmodule RetWeb.HubChannel do
         {:reply, {:error, %{reason: "invalid_network_id"}}, socket}
 
       bot_network_id?(network_id, socket) ->
-        if bot_runner?(socket) do
-          broadcast_from!(
-            socket,
-            event |> internal_naf_event_for(socket),
-            payload |> payload_with_from(socket)
-          )
-
-          {:noreply, socket}
-        else
-          {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
-        end
+        guarded_bot_broadcast(socket, event, payload)
 
       true ->
         broadcast_from!(
@@ -366,13 +372,17 @@ defmodule RetWeb.HubChannel do
         {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
 
       Enum.all?(updates, &multi_update_permitted?(&1, socket)) ->
-        broadcast_from!(
-          socket,
-          event |> internal_naf_event_for(socket),
-          payload |> payload_with_from(socket)
-        )
+        if Enum.any?(updates, &bot_network_update?(&1, socket)) do
+          guarded_bot_broadcast(socket, event, payload)
+        else
+          broadcast_from!(
+            socket,
+            event |> internal_naf_event_for(socket),
+            payload |> payload_with_from(socket)
+          )
 
-        {:noreply, socket}
+          {:noreply, socket}
+        end
 
       Enum.any?(updates, &bot_sensitive_update?(&1, socket)) ->
         {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
@@ -1319,13 +1329,49 @@ defmodule RetWeb.HubChannel do
   end
 
   defp bot_runner?(socket) do
-    authenticated_bot_runner?(socket) and
-      is_binary(socket.assigns[:bot_runner_lease_id]) and
-      BotRunnerLease.authorized?(
-        socket.assigns.hub_sid,
-        socket.assigns.bot_runner_lease_id,
-        socket.assigns[:bot_runner_authority_epoch]
-      ) and bot_runner_presence_reflects_authority?(socket)
+    match?({:ok, true}, with_bot_runner_authority(socket, fn -> true end))
+  end
+
+  defp with_bot_runner_authority(socket, fun) when is_function(fun, 0) do
+    if authenticated_bot_runner?(socket) and
+         is_binary(socket.assigns[:bot_runner_lease_id]) and
+         is_integer(socket.assigns[:bot_runner_authority_epoch]) and
+         bot_runner_presence_reflects_authority?(socket) do
+      case BotRunnerLease.with_authority(
+             socket.assigns.hub_sid,
+             socket.assigns.bot_runner_lease_id,
+             socket.assigns.bot_runner_authority_epoch,
+             fun
+           ) do
+        {:ok, _value} = ok ->
+          ok
+
+        {:error, :database_unavailable} = error ->
+          send(self(), :close_channel)
+          error
+
+        {:error, :not_authoritative} = error ->
+          error
+      end
+    else
+      {:error, :not_authoritative}
+    end
+  end
+
+  defp guarded_bot_broadcast(socket, event, payload) do
+    case with_bot_runner_authority(socket, fn ->
+           broadcast_from!(
+             socket,
+             event |> internal_naf_event_for(socket),
+             payload |> payload_with_from(socket)
+           )
+         end) do
+      {:ok, :ok} ->
+        {:noreply, socket}
+
+      {:error, _reason} ->
+        {:reply, {:error, %{reason: bot_runner_rejection_reason(socket)}}, socket}
+    end
   end
 
   defp bot_runner_presence_reflects_authority?(socket) do
@@ -1471,6 +1517,14 @@ defmodule RetWeb.HubChannel do
     else
       {:noreply, socket}
     end
+  end
+
+  def handle_info({:bot_runner_lease_database_unavailable, lease_id}, socket) do
+    if socket.assigns[:bot_runner_lease_id] == lease_id do
+      GenServer.cast(self(), :close)
+    end
+
+    {:noreply, socket}
   end
 
   def handle_info({:waypoint_reservation_states, states}, socket) do
@@ -1881,15 +1935,29 @@ defmodule RetWeb.HubChannel do
   end
 
   defp assign_bot_runner_lease(socket, true, %Hub{} = hub) do
-    case BotConfigApproval.register_runtime_lease(hub.hub_sid) do
+    case BotConfigApproval.register_runtime_lease(hub.hub_sid, socket.assigns.session_id) do
       {:ok, lease} ->
         {:ok, assign_registered_bot_runner_lease(socket, lease)}
 
-      {:error, _reason} ->
+      {:error, :bot_config_unapproved} ->
         {:error,
          %{
            message: "Bot configuration is not approved",
            reason: "bot_config_unapproved"
+         }}
+
+      {:error, reason} when reason in [:lease_unavailable, :lease_database_unavailable] ->
+        {:error,
+         %{
+           message: "Bot runner authority is unavailable",
+           reason: "bot_runner_lease_unavailable"
+         }}
+
+      {:error, _reason} ->
+        {:error,
+         %{
+           message: "Bot configuration is unavailable",
+           reason: "bot_config_unavailable"
          }}
     end
   end

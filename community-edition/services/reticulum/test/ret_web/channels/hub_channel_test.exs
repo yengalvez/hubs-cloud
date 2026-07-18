@@ -403,7 +403,7 @@ defmodule RetWeb.HubChannelTest do
                join_hub(second_transport, Repo.get!(Hub, hub.hub_id), params)
     end
 
-    test "keeps the first registered lease authoritative during runner overlap", %{
+    test "rejects runner overlap and a later reconnect receives a newer fence", %{
       socket: first_transport,
       hub: hub,
       bot_access_key: bot_access_key
@@ -421,31 +421,11 @@ defmodule RetWeb.HubChannelTest do
       assert presence_context(first_socket, first_join.session_id)["bot_runner"] === true
 
       {:ok, second_transport} = connect(SessionSocket, %{})
-      {:ok, second_join, second_socket} = join_hub(second_transport, hub, params)
-      assert is_binary(second_join.bot_runner_lease_id)
-      refute second_join.bot_runner_lease_id == first_join.bot_runner_lease_id
-      refute second_join.bot_runner_authoritative
-      assert second_join.bot_runner_authority_epoch == first_join.bot_runner_authority_epoch
-      assert presence_context(second_socket, second_join.session_id)["bot_runner"] === true
 
-      assert RetWeb.HubChannel.authoritative_bot_runner_lease_id(Presence.list(second_socket)) ==
-               first_join.bot_runner_lease_id
+      assert {:error, %{reason: "bot_runner_lease_unavailable"}} =
+               join_hub(second_transport, hub, params)
 
       network_id = bot_network_id(hub, 1)
-
-      assert_reply push(second_socket, "naf", bot_spawn_payload(network_id)), :error, %{
-        reason: "bot_runner_not_authoritative"
-      }
-
-      assert_reply push(second_socket, "naf", bot_update_payload(network_id)), :error, %{
-        reason: "bot_runner_not_authoritative"
-      }
-
-      remove = %{"dataType" => "r", "data" => %{"networkId" => network_id}}
-
-      assert_reply push(second_socket, "naf", remove), :error, %{
-        reason: "bot_runner_not_authoritative"
-      }
 
       assert_reply push(first_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
         bot_spawn_accepted: true,
@@ -453,30 +433,25 @@ defmodule RetWeb.HubChannelTest do
       }
 
       Process.unlink(first_socket.channel_pid)
-      Process.exit(first_socket.channel_pid, :kill)
-      assert wait_for_runner_lease(second_socket, second_join.bot_runner_lease_id)
+      GenServer.stop(first_socket.channel_pid, :normal)
 
-      promoted_epoch =
-        BotRunnerLease.snapshot(hub.hub_sid)
-        |> Map.fetch!(:authority_epoch)
+      {:ok, replacement_transport} = connect(SessionSocket, %{})
+      {:ok, replacement_join, replacement_socket} = join_hub(replacement_transport, hub, params)
 
-      assert promoted_epoch > first_join.bot_runner_authority_epoch
+      assert replacement_join.bot_runner_authoritative
+      assert replacement_join.bot_runner_authority_epoch > first_join.bot_runner_authority_epoch
+      refute replacement_join.bot_runner_lease_id == first_join.bot_runner_lease_id
 
-      refute BotRunnerLease.authorized?(
-               hub.hub_sid,
-               second_join.bot_runner_lease_id,
-               first_join.bot_runner_authority_epoch
-             )
-
-      assert_reply push(second_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
+      assert_reply push(replacement_socket, "naf", bot_spawn_payload(network_id)), :ok, %{
         bot_spawn_accepted: true,
         network_id: ^network_id,
-        bot_runner_authority_epoch: ^promoted_epoch
+        bot_runner_authority_epoch: replacement_epoch
       }
 
-      :ok = Presence.untrack(second_socket, second_join.session_id)
+      assert replacement_epoch == replacement_join.bot_runner_authority_epoch
+      :ok = Presence.untrack(replacement_socket, replacement_join.session_id)
 
-      assert_reply push(second_socket, "naf", bot_update_payload(network_id)), :error, %{
+      assert_reply push(replacement_socket, "naf", bot_update_payload(network_id)), :error, %{
         reason: "bot_runner_not_authoritative"
       }
     end
@@ -951,18 +926,6 @@ defmodule RetWeb.HubChannelTest do
     |> Map.fetch!(:metas)
     |> List.first()
     |> Map.fetch!(:context)
-  end
-
-  defp wait_for_runner_lease(socket, expected, attempts \\ 25)
-  defp wait_for_runner_lease(_socket, _expected, 0), do: false
-
-  defp wait_for_runner_lease(socket, expected, attempts) do
-    if RetWeb.HubChannel.authoritative_bot_runner_lease_id(Presence.list(socket)) == expected do
-      true
-    else
-      :timer.sleep(20)
-      wait_for_runner_lease(socket, expected, attempts - 1)
-    end
   end
 
   defp bot_spawn_payload(network_id) do

@@ -36,18 +36,36 @@ MIX_ENV=turkey mix release --overwrite
 2.18.0. Remove those acknowledgements as soon as a fixed cowlib release is
 available; any additional advisory remains a CI failure.
 
-### YenHubs singleton and reservation protocol
+### YenHubs fencing and reservation protocol
 
-`Ret.BotRunnerLease` arbitrates authenticated bot runners inside one Reticulum
-VM. Until that authority moves to a database lease with a fencing token, the
-complete Hubs CE profile must run exactly one Reticulum replica with a
-`Recreate` strategy and no Reticulum HorizontalPodAutoscaler. The manifest
-generator and verifier enforce this fail-closed boundary; rollouts therefore
-have a controlled Reticulum downtime window. `Recreate` reduces overlap during
-the standard rollout but is not a fencing primitive for node partitions or a
-stuck old VM. Abort readiness/deployment when more than one Reticulum pod or
-Endpoint exists. A database lease with fencing remains required for a complete
-cross-process exclusivity guarantee.
+`Ret.BotRunnerLease` uses `ret0.bot_runner_leases` as the shared authority for
+authenticated bot runners. Each active row contains an exact UUID lease,
+Reticulum holder instance and channel session plus an authority epoch from the
+global `bot_runner_authority_epoch_seq`. That sequence is bounded by
+JavaScript's maximum safe integer and cannot cycle. Acquisition takes the
+room-specific PostgreSQL advisory lock and row lock, uses `clock_timestamp()`
+and grants a 15-second lease; the holder renews every 5 seconds. Renew and
+release are compare-and-swap operations over the complete tuple, takeover after
+expiry consumes a new epoch, and revoke always consumes a new epoch. There is
+no process-local or database-error fallback.
+
+The lock order for bot configuration changes is the global admission advisory,
+Hub and approval rows, then the room authority advisory and lease row. Runner
+registration performs its database acquisition in the channel caller so the
+local coordinator never opens a second database wait while that caller holds
+the global admission lock. Bot spawn, update, remove, multi-update and decoded
+raw NAF side effects validate the exact live fence and execute the broadcast
+and spawn ACK while the lease row remains locked. Final bot-chat delivery takes
+the same authority lock and attaches the exact lease and epoch to `bot_command`;
+the ghost runner discards missing or stale command fences.
+
+The database fence makes authority safe across Reticulum processes, but it does
+not by itself make the current storage topology highly available. The tracked
+Hubs CE generator and live verifier therefore continue to require exactly one
+Reticulum replica with `Recreate` and no Reticulum HPA until a separate staged
+change adapts readiness/endpoints and the `ret-pvc` RWO placement constraint,
+proves two cold replicas, and updates the deployment gates. Do not remove that
+singleton deployment boundary merely because database fencing is present.
 
 Bot credentials are separated by authority. `bot_access_key` remains for the
 legacy `BotHeaderAuthorization` integration route and never reaches a runner.
@@ -82,14 +100,12 @@ counts and prompt length metadata, never prompt text or configuration JSON.
 The public `/health/capabilities` contract advertises protocol 1 so Admin can
 refuse mixed-version operation. A durable approval means the database config
 is eligible; bot-orchestrator readiness remains a separate rollout gate.
-Authenticated runner joins reload the exact decision and register their local
-lease while holding the same PostgreSQL admission lock as quarantine. Thus a
-join that wins first is revoked by quarantine, while a join that waits observes
-the committed quarantine and is rejected on the current singleton Reticulum
-deployment. Multi-replica lease fencing remains a deployment blocker tracked
-separately by AUD-076. Final bot chat delivery is revalidated and emitted under
-the same lock, after the provider call, so quarantine and delivery have one
-linear order.
+Authenticated runner joins reload and lock the exact decision before acquiring
+the room's durable fencing lease. Thus a join that wins first is fenced by a
+later quarantine, while a join that waits observes the committed quarantine and
+is rejected. Final bot chat delivery is revalidated after the provider call and
+then emitted under the exact current room fence, so quarantine, takeover and
+delivery have one linear order.
 
 Waypoint reservations use protocol 2. State-changing transactions allocate one
 global PostgreSQL `state_version` for their whole broadcast batch. Joins take a
