@@ -3,6 +3,7 @@ const path = require("path");
 const YAML = require("yaml");
 const pemJwk = require("pem-jwk");
 const utils = require("../utils");
+const { verifyDockerConfigCredentials } = require("./verify-manifest-contracts");
 
 function generationOverrides() {
   const hasInput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_INPUT_VALUES_PATH");
@@ -307,6 +308,21 @@ function main() {
         : 5
     );
     processedConfig.MAX_BOTS_PER_ROOM = "10";
+    processedConfig.BOT_RUNNER_IMAGE =
+      processedConfig.OVERRIDE_BOT_RUNNER_IMAGE ||
+      `${processedConfig.Container_Dockerhub_Username}/bot-runner:${processedConfig.Container_Tag}`;
+    const botOrchestratorImage =
+      processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE ||
+      `${processedConfig.Container_Dockerhub_Username}/bot-orchestrator:${processedConfig.Container_Tag}`;
+    const pullConfigBase64 = String(processedConfig.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 || "").trim();
+    try {
+      verifyDockerConfigCredentials(pullConfigBase64, [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]);
+    } catch (_error) {
+      throw new Error(
+        "BOT_IMAGE_PULL_CONFIG_JSON_BASE64 must contain canonical usable credentials for both bot image registries"
+      );
+    }
+    processedConfig.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 = pullConfigBase64;
 
     // Keep PERMS_KEY stable across runs. Rotate only when missing.
     let privateKey = normalizePemPrivateKey(processedConfig.PERMS_KEY);

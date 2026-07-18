@@ -665,6 +665,40 @@ test("accepts only managed configs whose fingerprint matches and then ignores hu
   assert.equal(internals.shouldApplyHubRefreshConfig(true), false);
 });
 
+test("managed config delivery is monotonic and idempotent across delayed polls", () => {
+  const revisionTwo = {
+    revision: 2,
+    fingerprint: internals.managedRunnerConfigFingerprint({ enabled: true, count: 2, mobility: "high" })
+  };
+  const state = {
+    appliedRevision: 1,
+    appliedFingerprint: internals.managedRunnerConfigFingerprint({
+      enabled: true,
+      count: 1,
+      mobility: "static"
+    }),
+    pendingRevision: 0,
+    pendingFingerprint: ""
+  };
+
+  assert.equal(internals.managedConfigDeliveryDecision(state, revisionTwo), "accept");
+  state.pendingRevision = revisionTwo.revision;
+  state.pendingFingerprint = revisionTwo.fingerprint;
+
+  assert.equal(
+    internals.managedConfigDeliveryDecision(state, {
+      revision: 1,
+      fingerprint: state.appliedFingerprint
+    }),
+    "stale"
+  );
+  assert.equal(internals.managedConfigDeliveryDecision(state, revisionTwo), "duplicate");
+  assert.equal(
+    internals.managedConfigDeliveryDecision(state, { revision: 2, fingerprint: "different" }),
+    "conflict"
+  );
+});
+
 test("hub_refresh invalidates stale scene geometry before reconcile and requests a clean reload", () => {
   const policy = internals.createSceneFetchPolicy("https://meta-hubs.org");
   let waypointData = {

@@ -5,14 +5,14 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
 
   alias Ret.{BotConfigApproval, Repo}
 
-  @bot_runner_access_header "x-ret-bot-runner-access-key"
-  @bot_runner_access_key "test-bot-runner-access-key-32bytes"
+  @bot_runner_access_header "x-ret-bot-orchestrator-access-key"
+  @bot_runner_access_key "test-bot-orchestrator-access-key-32bytes"
   @dashboard_access_header "x-ret-dashboard-access-key"
   @dashboard_access_key "test-dashboard-access-key-32bytes"
 
   setup_all do
-    original_bot_runner_access_key = Application.get_env(:ret, :bot_runner_access_key)
-    Application.put_env(:ret, :bot_runner_access_key, @bot_runner_access_key)
+    original_bot_runner_access_key = Application.get_env(:ret, :bot_orchestrator_access_key)
+    Application.put_env(:ret, :bot_orchestrator_access_key, @bot_runner_access_key)
 
     merge_module_config(:ret, RetWeb.Plugs.DashboardHeaderAuthorization, %{
       dashboard_access_key: @dashboard_access_key
@@ -20,9 +20,9 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
 
     on_exit(fn ->
       if is_nil(original_bot_runner_access_key) do
-        Application.delete_env(:ret, :bot_runner_access_key)
+        Application.delete_env(:ret, :bot_orchestrator_access_key)
       else
-        Application.put_env(:ret, :bot_runner_access_key, original_bot_runner_access_key)
+        Application.put_env(:ret, :bot_orchestrator_access_key, original_bot_runner_access_key)
       end
 
       Ret.TestHelpers.merge_module_config(:ret, RetWeb.Plugs.DashboardHeaderAuthorization, %{
@@ -389,7 +389,7 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
     assert hub_sid == open_hub.hub_sid
   end
 
-  test "bot runner access is restricted to bot snapshots", %{conn: conn} do
+  test "bot orchestrator access is restricted to bot snapshots", %{conn: conn} do
     assert conn
            |> put_req_header(@dashboard_access_header, @dashboard_access_key)
            |> get("/api-internal/v1/hubs/configured_with_bots")

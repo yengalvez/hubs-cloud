@@ -21,8 +21,8 @@ function runNode(script, env) {
 
 test("generator and verifier support dynamic and retained manual storage only", () => {
   for (const [storageClass, expectedResources] of [
-    ["do-block-storage", 44],
-    ["manual", 46]
+    ["do-block-storage", 50],
+    ["manual", 52]
   ]) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-storage-contract-"));
     const inputPath = path.join(directory, "input-values.yaml");
@@ -168,6 +168,10 @@ test("verifier binds every Reticulum access-key environment and TOML mapping to 
     ],
     ['bot_access_key = "<BOT_ACCESS_KEY>"', 'bot_access_key = "<BOT_RUNNER_ACCESS_KEY>"'],
     ['bot_runner_access_key = "<BOT_RUNNER_ACCESS_KEY>"', 'bot_runner_access_key = "<DASHBOARD_ACCESS_KEY>"'],
+    [
+      'bot_orchestrator_access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"',
+      'bot_orchestrator_access_key = "<BOT_RUNNER_ACCESS_KEY>"'
+    ],
     [
       'access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"',
       'access_key = "<BOT_ACCESS_KEY>"'
