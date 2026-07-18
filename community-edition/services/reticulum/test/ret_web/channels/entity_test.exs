@@ -46,6 +46,9 @@ defmodule RetWeb.EntityTest do
       assert entity_state.create_message["networkId"] === @payload_save_entity_state["nid"]
       assert entity_state.create_message === @payload_save_entity_state["create_message"]
 
+      assert length(entity_state.update_messages) ===
+               length(@payload_save_entity_state["updates"])
+
       Enum.zip(entity_state.update_messages, @payload_save_entity_state["updates"])
       |> Enum.each(fn {update_message, update_from_payload} ->
         assert update_message === update_from_payload["update_message"]
@@ -154,16 +157,15 @@ defmodule RetWeb.EntityTest do
     {:ok, _, socket} =
       subscribe_and_join(socket, "hub:#{hub.hub_sid}", join_params_for_account(account))
 
-    push(socket, "save_entity_state", @payload_save_entity_state)
+    assert_reply push(socket, "save_entity_state", @payload_save_entity_state), :ok
     assert_reply push(socket, "list_entities", %{}), :ok, %{data: [entity_state]}
     # The page starts at 2
-    2 = Enum.at(entity_state.update_messages, 1)["data"]["networked-pdf"]["data"]["pageNumber"]
+    assert pdf_page_number(entity_state.update_messages) === 2
 
-    push(socket, "update_entity_state", @payload_update_entity_state)
+    assert_reply push(socket, "update_entity_state", @payload_update_entity_state), :ok
     assert_reply push(socket, "list_entities", %{}), :ok, %{data: [entity_state]}
     # The page was updated to 1
-    assert Enum.at(entity_state.update_messages, 1)["data"]["networked-pdf"]["data"]["pageNumber"] ===
-             1
+    assert pdf_page_number(entity_state.update_messages) === 1
   end
 
   test "entity updates are isolated by hub", %{hub: hub} do
@@ -297,5 +299,13 @@ defmodule RetWeb.EntityTest do
 
   defp join_params(%{} = params) do
     Map.merge(@default_join_params, params)
+  end
+
+  defp pdf_page_number(update_messages) do
+    pdf_nid = @payload_update_entity_state["nid"]
+
+    update_messages
+    |> Enum.find(&(&1["nid"] === pdf_nid))
+    |> get_in(["data", "networked-pdf", "data", "pageNumber"])
   end
 end
