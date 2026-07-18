@@ -3,7 +3,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
 
   import Ecto.Query
 
-  alias Ret.{BotConfig, Hub, Repo}
+  alias Ret.{BotConfig, BotConfigApproval, Hub, Repo}
 
   @max_configured_bot_hubs 10
   @max_bot_config_bytes 16_384
@@ -15,6 +15,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     |> where([h], h.hub_sid != "admin")
     |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
     |> BotConfig.with_active_bot_config()
+    |> BotConfigApproval.with_runtime_approval()
     |> send_bot_snapshot(conn)
   end
 
@@ -34,6 +35,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     |> where([h], h.hub_sid != "admin")
     |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
     |> BotConfig.with_active_bot_config()
+    |> BotConfigApproval.with_runtime_approval()
     |> send_bot_snapshot(conn)
   end
 
