@@ -216,10 +216,34 @@ defmodule Ret.BotRunnerLease do
 
   def unregister(_server, _hub_sid, _lease_id), do: :ok
 
-  def revoke(hub_sid), do: revoke(@name, hub_sid)
+  def revoke(hub_sid) do
+    case revoke_with_epoch(@name, hub_sid) do
+      {:ok, _epoch} -> :ok
+      {:error, :lease_database_unavailable} = error -> error
+    end
+  end
 
   @doc false
-  def revoke(server, hub_sid) when is_binary(hub_sid) and byte_size(hub_sid) > 0 do
+  def revoke(server, hub_sid) do
+    case revoke_with_epoch(server, hub_sid) do
+      {:ok, _epoch} -> :ok
+      {:error, :lease_database_unavailable} = error -> error
+    end
+  end
+
+  @doc """
+  Revokes room authority and returns the durable fencing epoch.
+
+  When called inside an existing Repo transaction, the store mutation belongs
+  to that transaction. The local coordinator is invalidated immediately; if a
+  later database operation rolls the transaction back, that conservative local
+  invalidation cannot grant stale authority.
+  """
+  def revoke_with_epoch(hub_sid), do: revoke_with_epoch(@name, hub_sid)
+
+  @doc false
+  def revoke_with_epoch(server, hub_sid)
+      when is_binary(hub_sid) and byte_size(hub_sid) > 0 do
     context = GenServer.call(server, :store_context)
     result = context.store.revoke(context.repo, hub_sid)
 
@@ -235,14 +259,14 @@ defmodule Ret.BotRunnerLease do
     )
 
     case result do
-      {:ok, _epoch} -> :ok
+      {:ok, epoch} -> {:ok, epoch}
       {:error, :database_unavailable} -> {:error, :lease_database_unavailable}
     end
   catch
     :exit, _reason -> {:error, :lease_database_unavailable}
   end
 
-  def revoke(_server, _hub_sid), do: :ok
+  def revoke_with_epoch(_server, _hub_sid), do: {:ok, nil}
 
   @doc false
   def snapshot(hub_sid), do: snapshot(@name, hub_sid)

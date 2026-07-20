@@ -11,6 +11,7 @@ defmodule RetWeb.HubChannelTest do
     BotChatPresence,
     BotConfigAdmission,
     BotConfigApproval,
+    BotRuntimeOutbox,
     BotRunnerLease,
     Repo,
     Hub,
@@ -159,11 +160,11 @@ defmodule RetWeb.HubChannelTest do
       refute closed.user_data["bots"]["enabled"]
       assert closed.user_data["bots"]["count"] == 1
 
-      assert_receive {:bot_orchestrator_request, :post,
-                      "http://bot-orchestrator.test/internal/bots/room-stop", body, _headers,
-                      _options}
-
-      assert Poison.decode!(body) == %{"hub_sid" => active_hub.hub_sid}
+      stop = Repo.get_by!(BotRuntimeOutbox, hub_id: active_hub.hub_id, runtime_revision: 2)
+      assert stop.event_kind == "stop"
+      assert stop.hub_sid == active_hub.hub_sid
+      assert is_integer(stop.revoke_epoch) and stop.revoke_epoch > 0
+      refute_receive {:bot_orchestrator_request, _, _, _, _, _}
     end
   end
 

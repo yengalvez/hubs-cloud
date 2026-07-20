@@ -1,6 +1,13 @@
 const express = require("express");
 const crypto = require("crypto");
-const { KubernetesRunnerManager, RUNNER_NAMESPACE } = require("./kubernetes-runner-manager");
+const {
+  GUARD_CAPACITY_WARNING_THRESHOLD,
+  KubernetesRunnerManager,
+  MAX_GUARD_PODS,
+  MAX_GUARD_START_COUNT,
+  MIN_GUARD_FENCE_RESERVE,
+  RUNNER_NAMESPACE
+} = require("./kubernetes-runner-manager");
 const {
   createRunnerGenerationToken,
   verifyRunnerGenerationToken
@@ -45,6 +52,14 @@ const OPENAI_MODERATION_MODEL = process.env.OPENAI_MODERATION_MODEL || "omni-mod
 // input moderation, the model and output moderation, leaving response margin.
 const OPENAI_TOTAL_BUDGET_MS = Math.min(parsePositiveInt(process.env.OPENAI_TOTAL_BUDGET_MS, 4_000), 4_000);
 const HARD_MAX_ACTIVE_ROOMS = 10;
+const BOT_RUNTIME_PROTOCOL = "yenhubs-bot-runtime-v2";
+// Do not evict live per-room revisions or terminal stop tombstones: eviction
+// could let a stale/legacy config cross the fence. The internal authenticated
+// producer fails closed instead if one parent lifetime reaches this bound.
+const MAX_RUNTIME_OPERATION_HISTORY = 2_048;
+const MAX_RUNTIME_TRACKED_ROOMS = 2_048;
+const MAX_RUNTIME_CONFIG_BYTES = 16_384;
+const MAX_RUNTIME_JSON_DEPTH = 64;
 const RET_SNAPSHOT_MAX_BYTES = 128 * 1024;
 const MAX_ACTIVE_ROOMS = Math.min(parsePositiveInt(process.env.MAX_ACTIVE_ROOMS, 5), HARD_MAX_ACTIVE_ROOMS);
 const RUNNER_HEALTH_TTL_MS = Math.min(parsePositiveInt(process.env.RUNNER_HEALTH_TTL_MS, 15_000), 60_000);
@@ -160,6 +175,8 @@ const GHOST_RUNNER_ENV_KEYS = Object.freeze([
 
 const roomConfigs = new Map();
 const roomRunners = new Map();
+const roomRuntimeOperations = new Map();
+const runtimeOperationIds = new Map();
 const queuedRunnerHubs = [];
 const chatRateLimits = new Map();
 const runnerRestartBackoff = new Map();
@@ -175,6 +192,24 @@ let desiredStateEpoch = 0;
 let authoritativeResyncRequested = false;
 let runnerPodManager = null;
 let runnerPodManagerReady = !RUNNER_AUTOSTART;
+let roomStopProofOverride = null;
+
+function runnerGuardCapacitySnapshot() {
+  if (RUNNER_AUTOSTART && runnerPodManager?.guardCapacitySnapshot) {
+    return runnerPodManager.guardCapacitySnapshot();
+  }
+  return {
+    observed: false,
+    intents: 0,
+    fences: 0,
+    total: 0,
+    warning: false,
+    warning_threshold: GUARD_CAPACITY_WARNING_THRESHOLD,
+    start_limit: MAX_GUARD_START_COUNT,
+    reserve: MIN_GUARD_FENCE_RESERVE,
+    quota: MAX_GUARD_PODS
+  };
+}
 
 function parsePositiveInt(raw, fallback) {
   const parsed = Number(raw);
@@ -550,15 +585,44 @@ function normalizeMobility(value) {
   return "medium";
 }
 
+function normalizeBotBoolean(value) {
+  return value === true || value === "true" || value === 1;
+}
+
+// Legacy Reticulum did not transmit the JSON numeric kind separately. Treat a
+// numeric 1 as false for chat because JSON.parse cannot distinguish 1 from 1.0,
+// while Reticulum deliberately accepts only the integer form. Runtime v2 sends
+// the durable decision as a real boolean, so this conservative bridge does not
+// change the approved v2 behavior.
+function normalizeChatBoolean(value) {
+  return value === true || value === "true";
+}
+
+function normalizeBotCount(value) {
+  let parsed;
+  if (Number.isInteger(value)) {
+    parsed = value;
+  } else if (
+    typeof value === "string" &&
+    Buffer.byteLength(value, "utf8") <= 64 &&
+    /^[+-]?[0-9]+$/.test(value)
+  ) {
+    parsed = Number(value);
+  } else {
+    return 0;
+  }
+
+  return clamp(parsed, 0, MAX_BOTS_PER_ROOM);
+}
+
 function normalizeConfig(input) {
   const source = input || {};
-  const count = Number(source.count || 0);
 
   return {
-    enabled: !!source.enabled,
-    count: Number.isFinite(count) ? clamp(Math.floor(count), 0, MAX_BOTS_PER_ROOM) : 0,
+    enabled: normalizeBotBoolean(source.enabled),
+    count: normalizeBotCount(source.count),
     mobility: normalizeMobility(source.mobility),
-    chat_enabled: !!source.chat_enabled,
+    chat_enabled: normalizeChatBoolean(source.chat_enabled),
     prompt: sanitizeRoomPrompt(source.prompt)
   };
 }
@@ -580,6 +644,304 @@ function validHubSid(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
 }
 
+function isExactDataObject(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every(key => hasOwnDataProperty(value, key));
+}
+
+function isRuntimeRequestBody(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return ["protocol", "operation_id", "runtime_revision", "revoke_epoch"]
+    .some(key => Object.hasOwn(value, key));
+}
+
+function validRuntimeRevision(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function validRuntimeOperationId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+function canonicalJsonValue(value, depth = 1) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (
+      !Number.isFinite(value) ||
+      (Number.isInteger(value) && !Number.isSafeInteger(value))
+    ) {
+      throw new Error("invalid_runtime_request");
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    if (depth > MAX_RUNTIME_JSON_DEPTH) throw new Error("invalid_runtime_request");
+    return `[${value.map(entry => canonicalJsonValue(entry, depth + 1)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    if (depth > MAX_RUNTIME_JSON_DEPTH) throw new Error("invalid_runtime_request");
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error("invalid_runtime_request");
+    }
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJsonValue(value[key], depth + 1)}`)
+      .join(",")}}`;
+  }
+  throw new Error("invalid_runtime_request");
+}
+
+function exactRuntimeBotConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  let canonical;
+  try {
+    canonical = canonicalJsonValue(value);
+  } catch (_error) {
+    return null;
+  }
+  if (Buffer.byteLength(canonical, "utf8") > MAX_RUNTIME_CONFIG_BYTES) return null;
+  const bots = normalizeConfig(value);
+  return {
+    approvedBots: JSON.parse(canonical),
+    bots,
+    canonical
+  };
+}
+
+function parseRuntimeOperation(body, type) {
+  const expectedKeys = type === "config"
+    ? ["protocol", "operation_id", "hub_sid", "runtime_revision", "bots", "runtime_chat_enabled"]
+    : ["protocol", "operation_id", "hub_sid", "runtime_revision", "revoke_epoch"];
+  if (!isExactDataObject(body, expectedKeys)) throw new Error("invalid_runtime_request");
+  if (
+    body.protocol !== BOT_RUNTIME_PROTOCOL ||
+    !validRuntimeOperationId(body.operation_id) ||
+    !validHubSid(body.hub_sid) ||
+    !validRuntimeRevision(body.runtime_revision)
+  ) {
+    throw new Error("invalid_runtime_request");
+  }
+
+  if (type === "config") {
+    const config = exactRuntimeBotConfig(body.bots);
+    if (
+      !config ||
+      typeof body.runtime_chat_enabled !== "boolean" ||
+      !Object.hasOwn(body.bots, "chat_enabled") ||
+      body.bots.chat_enabled !== body.runtime_chat_enabled ||
+      config.bots.chat_enabled !== body.runtime_chat_enabled
+    ) {
+      throw new Error("invalid_runtime_request");
+    }
+    return {
+      type,
+      protocol: BOT_RUNTIME_PROTOCOL,
+      operationId: body.operation_id,
+      hubSid: body.hub_sid,
+      runtimeRevision: body.runtime_revision,
+      runtimeChatEnabled: body.runtime_chat_enabled,
+      approvedBots: config.approvedBots,
+      bots: config.bots,
+      botsCanonical: config.canonical
+    };
+  }
+
+  if (!validRuntimeRevision(body.revoke_epoch)) throw new Error("invalid_runtime_request");
+  return {
+    type,
+    protocol: BOT_RUNTIME_PROTOCOL,
+    operationId: body.operation_id,
+    hubSid: body.hub_sid,
+    runtimeRevision: body.runtime_revision,
+    revokeEpoch: body.revoke_epoch
+  };
+}
+
+function runtimeOperationSignature(operation) {
+  return operation.type === "config"
+    ? `config\n${operation.hubSid}\n${operation.runtimeRevision}\n${operation.runtimeChatEnabled}\n${operation.botsCanonical}`
+    : `stop\n${operation.hubSid}\n${operation.runtimeRevision}\n${operation.revokeEpoch}`;
+}
+
+function pruneRuntimeOperationHistory() {
+  if (runtimeOperationIds.size <= MAX_RUNTIME_OPERATION_HISTORY) return;
+  for (const [operationId, record] of runtimeOperationIds) {
+    if (roomRuntimeOperations.get(record.hubSid) === record) continue;
+    if (record.state !== "applied" && record.state !== "stopped") continue;
+    runtimeOperationIds.delete(operationId);
+    if (runtimeOperationIds.size <= MAX_RUNTIME_OPERATION_HISTORY) return;
+  }
+}
+
+function runtimeOperationIsTerminal(record) {
+  return record?.state === "applied" || record?.state === "stopped";
+}
+
+function registerRuntimeOperation(operation) {
+  const signature = runtimeOperationSignature(operation);
+  const known = runtimeOperationIds.get(operation.operationId);
+  if (known) {
+    if (known.signature !== signature) throw new Error("runtime_operation_conflict");
+    return { record: known, replay: true, previous: roomRuntimeOperations.get(operation.hubSid) };
+  }
+
+  const current = roomRuntimeOperations.get(operation.hubSid);
+  if (!current && roomRuntimeOperations.size >= MAX_RUNTIME_TRACKED_ROOMS) {
+    throw new Error("runtime_state_capacity_exceeded");
+  }
+  if (current && operation.runtimeRevision <= current.runtimeRevision) {
+    throw new Error("runtime_operation_conflict");
+  }
+  for (const candidate of runtimeOperationIds.values()) {
+    if (
+      candidate.hubSid === operation.hubSid &&
+      candidate.runtimeRevision === operation.runtimeRevision
+    ) {
+      throw new Error("runtime_operation_conflict");
+    }
+  }
+
+  const record = {
+    ...operation,
+    signature,
+    state: operation.type === "stop" ? "pending" : "new",
+    targets: operation.type === "stop" || !desiredBotConfig({ bots: operation.bots })
+      ? new Map()
+      : null
+  };
+  runtimeOperationIds.set(record.operationId, record);
+
+  if (
+    (current && !runtimeOperationIsTerminal(current)) ||
+    hasEarlierUndeliveredRuntimeOperation(record)
+  ) {
+    record.state = "blocked";
+  } else {
+    roomRuntimeOperations.set(operation.hubSid, record);
+  }
+  pruneRuntimeOperationHistory();
+  if (runtimeOperationIds.size > MAX_RUNTIME_OPERATION_HISTORY) {
+    runtimeOperationIds.delete(record.operationId);
+    if (roomRuntimeOperations.get(operation.hubSid) === record) {
+      if (current) roomRuntimeOperations.set(operation.hubSid, current);
+      else roomRuntimeOperations.delete(operation.hubSid);
+    }
+    throw new Error("runtime_state_capacity_exceeded");
+  }
+  return { record, replay: false, previous: current };
+}
+
+function hasEarlierUndeliveredRuntimeOperation(record) {
+  for (const candidate of runtimeOperationIds.values()) {
+    if (
+      candidate !== record &&
+      candidate.hubSid === record.hubSid &&
+      candidate.runtimeRevision < record.runtimeRevision &&
+      !runtimeOperationIsTerminal(candidate)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasUndeliveredRuntimeOperationThrough(hubSid, runtimeRevision) {
+  for (const candidate of runtimeOperationIds.values()) {
+    if (
+      candidate.hubSid === hubSid &&
+      candidate.runtimeRevision <= runtimeRevision &&
+      !runtimeOperationIsTerminal(candidate)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function runtimeConfigIsApplied(record) {
+  const room = roomConfigs.get(record.hubSid);
+  if (
+    !room ||
+    room.runtimeRevision !== record.runtimeRevision ||
+    !room.approvedBots
+  ) {
+    return false;
+  }
+  try {
+    return canonicalJsonValue(room.approvedBots) === record.botsCanonical &&
+      canonicalJsonValue(room.bots) === canonicalJsonValue(record.bots);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function activateRuntimeConfig(record) {
+  if (record.type !== "config") throw new Error("runtime_operation_conflict");
+  const current = roomRuntimeOperations.get(record.hubSid);
+  if (record.state === "applied") {
+    if (current !== record) return "applied";
+    if (!desiredBotConfig({ bots: record.bots })) return "ready";
+    return runtimeConfigIsApplied(record) ? "applied" : "ready";
+  }
+  if (current === record) return "ready";
+  if (current && !runtimeOperationIsTerminal(current)) return "pending";
+  if (hasEarlierUndeliveredRuntimeOperation(record)) return "pending";
+  if (!current || record.runtimeRevision > current.runtimeRevision) {
+    roomRuntimeOperations.set(record.hubSid, record);
+    record.state = "new";
+    return "ready";
+  }
+  throw new Error("runtime_operation_conflict");
+}
+
+function activateRuntimeStop(record) {
+  if (record.type !== "stop") throw new Error("runtime_operation_conflict");
+  const current = roomRuntimeOperations.get(record.hubSid);
+  if (current === record) return "ready";
+  if (current && !runtimeOperationIsTerminal(current)) return "pending";
+  if (hasEarlierUndeliveredRuntimeOperation(record)) return "pending";
+  if (!current || record.runtimeRevision > current.runtimeRevision) {
+    roomRuntimeOperations.set(record.hubSid, record);
+    record.state = "pending";
+    return "ready";
+  }
+  throw new Error("runtime_operation_conflict");
+}
+
+function runtimeConfigResponse(record, state) {
+  return {
+    protocol: BOT_RUNTIME_PROTOCOL,
+    operation_id: record.operationId,
+    hub_sid: record.hubSid,
+    runtime_revision: record.runtimeRevision,
+    state
+  };
+}
+
+function runtimeStopResponse(record, state) {
+  const response = {
+    protocol: BOT_RUNTIME_PROTOCOL,
+    operation_id: record.operationId,
+    hub_sid: record.hubSid,
+    runtime_revision: record.runtimeRevision,
+    revoke_epoch: record.revokeEpoch,
+    state
+  };
+  if (state === "stopped") {
+    response.target_absent = true;
+    response.managed_room_pods = 0;
+  }
+  return response;
+}
+
 function parseRoomSnapshot(payload, receivedAt = Date.now()) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Array.isArray(payload.hubs)) {
     throw new Error("invalid_room_snapshot_shape");
@@ -590,7 +952,13 @@ function parseRoomSnapshot(payload, receivedAt = Date.now()) {
 
   const parsed = new Map();
   for (const entry of payload.hubs) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || !validHubSid(entry.hub_sid)) {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      !validHubSid(entry.hub_sid) ||
+      !validRuntimeRevision(entry.runtime_revision)
+    ) {
       throw new Error("invalid_room_snapshot_entry");
     }
     if (parsed.has(entry.hub_sid)) throw new Error("duplicate_room_snapshot_entry");
@@ -615,6 +983,7 @@ function parseRoomSnapshot(payload, receivedAt = Date.now()) {
 
     parsed.set(entry.hub_sid, {
       bots: normalizeConfig(bots),
+      runtimeRevision: entry.runtime_revision,
       updatedAt: receivedAt
     });
   }
@@ -626,13 +995,75 @@ function applyRoomSnapshot(parsed, { authoritative = false, receivedAt = Date.no
   if (!(parsed instanceof Map)) throw new Error("invalid_parsed_room_snapshot");
   let reconciliationFailed = false;
 
+  const acceptsSnapshotRoom = (hubSid, room) => {
+    if (!validRuntimeRevision(room?.runtimeRevision)) return false;
+    if (hasUndeliveredRuntimeOperationThrough(hubSid, room.runtimeRevision)) return false;
+    const current = roomRuntimeOperations.get(hubSid);
+    if (!current) return true;
+    if (!runtimeOperationIsTerminal(current)) return false;
+    if (room.runtimeRevision < current.runtimeRevision) return false;
+    if (current.type === "stop" && room.runtimeRevision === current.runtimeRevision) return false;
+    if (current.type === "config" && room.runtimeRevision === current.runtimeRevision) {
+      return canonicalJsonValue(room.bots) === canonicalJsonValue(current.bots);
+    }
+    return true;
+  };
+
+  const recordAcceptedSnapshotRevision = (hubSid, room) => {
+    const current = roomRuntimeOperations.get(hubSid);
+    if (current && room.runtimeRevision <= current.runtimeRevision) return;
+    roomRuntimeOperations.set(hubSid, {
+      type: "config",
+      operationId: null,
+      hubSid,
+      runtimeRevision: room.runtimeRevision,
+      bots: room.bots,
+      signature: null,
+      state: "applied",
+      targets: null,
+      source: "snapshot"
+    });
+  };
+
+  let newRuntimeRooms = 0;
+  parsed.forEach((room, hubSid) => {
+    if (!roomRuntimeOperations.has(hubSid) && acceptsSnapshotRoom(hubSid, room)) {
+      newRuntimeRooms += 1;
+    }
+  });
+  if (roomRuntimeOperations.size + newRuntimeRooms > MAX_RUNTIME_TRACKED_ROOMS) {
+    throw new Error("runtime_state_capacity_exceeded");
+  }
+
   if (authoritative) {
-    const removedHubSids = Array.from(roomConfigs.keys()).filter(hubSid => !parsed.has(hubSid));
+    const nextConfigs = new Map();
+    parsed.forEach((room, hubSid) => {
+      if (acceptsSnapshotRoom(hubSid, room)) {
+        nextConfigs.set(hubSid, room);
+        recordAcceptedSnapshotRevision(hubSid, room);
+        return;
+      }
+      const current = roomRuntimeOperations.get(hubSid);
+      if (current?.type === "config" && roomConfigs.has(hubSid)) {
+        nextConfigs.set(hubSid, roomConfigs.get(hubSid));
+      }
+    });
+
+    // There is deliberately no global snapshot watermark. An omission cannot
+    // erase a room protected by a newer per-room v2 operation; Reticulum must
+    // deliver the corresponding room-stop operation instead.
+    roomConfigs.forEach((room, hubSid) => {
+      if (!nextConfigs.has(hubSid) && roomRuntimeOperations.get(hubSid)?.type === "config") {
+        nextConfigs.set(hubSid, room);
+      }
+    });
+
+    const removedHubSids = Array.from(roomConfigs.keys()).filter(hubSid => !nextConfigs.has(hubSid));
 
     // Replace desired state synchronously only after the complete payload has
     // validated. No request can observe a partially parsed full snapshot.
     roomConfigs.clear();
-    parsed.forEach((room, hubSid) => roomConfigs.set(hubSid, room));
+    nextConfigs.forEach((room, hubSid) => roomConfigs.set(hubSid, room));
 
     removedHubSids.forEach(hubSid => {
       try {
@@ -642,7 +1073,7 @@ function applyRoomSnapshot(parsed, { authoritative = false, receivedAt = Date.no
         console.warn(`Failed to transition removed runner hub=${hubSid} to stopping.`);
       }
     });
-    parsed.forEach((_room, hubSid) => {
+    nextConfigs.forEach((_room, hubSid) => {
       try {
         ensureRunnerState(hubSid);
       } catch (_error) {
@@ -655,7 +1086,9 @@ function applyRoomSnapshot(parsed, { authoritative = false, receivedAt = Date.no
     // it cannot prove that omitted rooms are disabled and never establishes
     // global readiness.
     parsed.forEach((room, hubSid) => {
+      if (!acceptsSnapshotRoom(hubSid, room)) return;
       roomConfigs.set(hubSid, room);
+      recordAcceptedSnapshotRevision(hubSid, room);
       try {
         ensureRunnerState(hubSid);
       } catch (_error) {
@@ -681,7 +1114,7 @@ function applyRoomSnapshot(parsed, { authoritative = false, receivedAt = Date.no
       : "ready";
   }
 
-  return parsed.size;
+  return authoritative ? roomConfigs.size : parsed.size;
 }
 
 function invalidateAuthoritativeSnapshot(reason = "authoritative_snapshot_sync_failed") {
@@ -703,6 +1136,63 @@ function scheduleAuthoritativeResync() {
     console.warn("Requested authoritative room sync failed unexpectedly.", error.name || "Error");
   });
   return pending;
+}
+
+function clearRoomRateLimits(hubSid) {
+  for (const key of chatRateLimits.keys()) {
+    if (key.startsWith(`${hubSid}:`)) chatRateLimits.delete(key);
+  }
+}
+
+function captureRoomStopTarget(record) {
+  if (!record || !(record.targets instanceof Map)) return;
+  const processHandle = roomRunners.get(record.hubSid)?.process;
+  const name = processHandle?.name;
+  const uid = processHandle?.podUid;
+  if (typeof name !== "string" || !/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(name)) return;
+  if (!((typeof uid === "string" && uid.length > 0) || uid === null || uid === undefined)) return;
+  const previous = record.targets.get(name);
+  record.targets.set(name, typeof uid === "string" && uid ? uid : (previous || null));
+}
+
+async function observeRoomStop(record) {
+  const pending = {
+    terminal: false,
+    targetAbsent: false,
+    managedRoomPods: null,
+    pendingCreate: true
+  };
+  try {
+    const result = roomStopProofOverride
+      ? await roomStopProofOverride(record)
+      : RUNNER_AUTOSTART && runnerPodManagerReady
+        ? await getRunnerPodManager().confirmRoomStopped(
+            record.hubSid,
+            Array.from(record.targets, ([name, uid]) => ({ name, uid }))
+          )
+        : pending;
+    if (!result || typeof result !== "object") return pending;
+    return {
+      terminal: result.terminal === true,
+      targetAbsent: result.targetAbsent === true,
+      managedRoomPods: Number.isSafeInteger(result.managedRoomPods)
+        ? result.managedRoomPods
+        : null,
+      pendingCreate: result.pendingCreate === true
+    };
+  } catch (_error) {
+    return pending;
+  }
+}
+
+function applyRoomStopSideEffect(hubSid) {
+  registerDesiredStateMutation();
+  roomConfigs.delete(hubSid);
+  clearRoomRateLimits(hubSid);
+  const runnerState = stopRunner(hubSid, { intentional: true, reason: "configuration_removed" });
+  fillQueuedRunnerSlots();
+  scheduleAuthoritativeResync();
+  return runnerState;
 }
 
 function runnerConfigPayload(input) {
@@ -2583,7 +3073,10 @@ app.post("/internal/runner/v1/status", runnerControlMiddleware, (req, res) => {
 // /ready true. This gate opens only after startup orphan cleanup.
 app.get("/transport-ready", (_req, res) => {
   const ready = !RUNNER_AUTOSTART || runnerPodManagerReady;
-  res.status(ready ? 200 : 503).json({ ok: ready });
+  res.status(ready ? 200 : 503).json({
+    ok: ready,
+    runner_guard_capacity: runnerGuardCapacitySnapshot()
+  });
 });
 
 app.get("/health", (_req, res) => {
@@ -2613,6 +3106,7 @@ app.get("/health", (_req, res) => {
     runner_backend_canary_room_count: CANARY_HUB_SET.size,
     ghost_navigation_mode: GHOST_NAVIGATION_MODE,
     ghost_navigation_require_navmesh: GHOST_NAVIGATION_REQUIRE_NAVMESH,
+    runner_guard_capacity: runnerGuardCapacitySnapshot(),
     runner_backends: publicHubRecord(runner_backends),
     runner_navigation: publicHubRecord(runner_navigation),
     runner_bots: publicHubRecord(runner_bots),
@@ -2631,6 +3125,7 @@ app.get("/ready", (_req, res) => {
     capacity_exceeded: readiness.capacity_exceeded,
     configured_room_count: readiness.configured_room_count,
     max_active_rooms: readiness.max_active_rooms,
+    runner_guard_capacity: runnerGuardCapacitySnapshot(),
     expected_hubs: publicHubList(readiness.expected_hubs),
     unready_hubs: publicHubList(readiness.unready_hubs),
     process_hubs: publicHubList(readiness.process_hubs),
@@ -2644,11 +3139,105 @@ app.get("/ready", (_req, res) => {
 });
 
 app.post("/internal/bots/room-config", authMiddleware, (req, res) => {
+  if (isRuntimeRequestBody(req.body)) {
+    let operation;
+    let registration;
+    try {
+      operation = parseRuntimeOperation(req.body, "config");
+      registration = registerRuntimeOperation(operation);
+    } catch (error) {
+      const conflict = error?.message === "runtime_operation_conflict";
+      const capacity = error?.message === "runtime_state_capacity_exceeded";
+      res.status(capacity ? 503 : conflict ? 409 : 400).json({
+        error: capacity
+          ? "runtime_state_capacity_exceeded"
+          : conflict ? "runtime_operation_conflict" : "invalid_runtime_request"
+      });
+      return;
+    }
+
+    const { record } = registration;
+    let activation;
+    try {
+      activation = activateRuntimeConfig(record);
+    } catch (_error) {
+      res.status(409).json({ error: "runtime_operation_conflict" });
+      return;
+    }
+    if (activation === "pending") {
+      res.status(202).json(runtimeConfigResponse(record, "pending"));
+      return;
+    }
+    if (activation === "applied") {
+      res.status(200).json(runtimeConfigResponse(record, "applied"));
+      return;
+    }
+
+    const existingRoom = roomConfigs.get(record.hubSid);
+    if (
+      desiredBotConfig({ bots: record.bots }) &&
+      !desiredBotConfig(existingRoom) &&
+      configuredDesiredRoomCount() >= MAX_ACTIVE_ROOMS
+    ) {
+      if (roomRuntimeOperations.get(record.hubSid) === record) {
+        if (registration.previous) roomRuntimeOperations.set(record.hubSid, registration.previous);
+        else roomRuntimeOperations.delete(record.hubSid);
+      }
+      if (!registration.replay) runtimeOperationIds.delete(record.operationId);
+      res.status(409).json({
+        error: "configured_room_limit_exceeded",
+        max_configured_rooms: MAX_ACTIVE_ROOMS
+      });
+      return;
+    }
+
+    const inactiveConfig = !desiredBotConfig({ bots: record.bots });
+    if (inactiveConfig) captureRoomStopTarget(record);
+    registerDesiredStateMutation();
+    roomConfigs.set(record.hubSid, {
+      bots: record.bots,
+      approvedBots: record.approvedBots,
+      runtimeRevision: record.runtimeRevision,
+      updatedAt: Date.now()
+    });
+    ensureRunnerState(record.hubSid);
+    fillQueuedRunnerSlots();
+    scheduleAuthoritativeResync();
+    if (inactiveConfig) {
+      record.state = "pending";
+      captureRoomStopTarget(record);
+      void observeRoomStop(record).then(proof => {
+        if (
+          proof.terminal === true &&
+          proof.targetAbsent === true &&
+          proof.managedRoomPods === 0 &&
+          proof.pendingCreate === false
+        ) {
+          record.state = "applied";
+          res.status(200).json(runtimeConfigResponse(record, "applied"));
+          return;
+        }
+        res.status(202).json(runtimeConfigResponse(record, "pending"));
+      }).catch(() => {
+        if (!res.headersSent) res.status(503).json({ error: "runtime_config_unavailable" });
+      });
+      return;
+    }
+    record.state = "applied";
+    res.status(200).json(runtimeConfigResponse(record, "applied"));
+    return;
+  }
+
   const hubSid = sanitizeIdentifier(req.body && req.body.hub_sid);
   const bots = normalizeConfig(req.body && req.body.bots);
 
   if (!validHubSid(hubSid)) {
     res.status(400).json({ error: "hub_sid is required" });
+    return;
+  }
+
+  if (roomRuntimeOperations.has(hubSid)) {
+    res.status(409).json({ error: "runtime_revision_required" });
     return;
   }
 
@@ -2681,6 +3270,60 @@ app.post("/internal/bots/room-config", authMiddleware, (req, res) => {
 });
 
 app.post("/internal/bots/room-stop", authMiddleware, (req, res) => {
+  if (isRuntimeRequestBody(req.body)) {
+    void (async () => {
+      let operation;
+      let registration;
+      try {
+        operation = parseRuntimeOperation(req.body, "stop");
+        registration = registerRuntimeOperation(operation);
+      } catch (error) {
+        const conflict = error?.message === "runtime_operation_conflict";
+        const capacity = error?.message === "runtime_state_capacity_exceeded";
+        res.status(capacity ? 503 : conflict ? 409 : 400).json({
+          error: capacity
+            ? "runtime_state_capacity_exceeded"
+            : conflict ? "runtime_operation_conflict" : "invalid_runtime_request"
+        });
+        return;
+      }
+
+      const { record } = registration;
+      let activation;
+      try {
+        activation = activateRuntimeStop(record);
+      } catch (_error) {
+        res.status(409).json({ error: "runtime_operation_conflict" });
+        return;
+      }
+      if (activation === "pending") {
+        res.status(202).json(runtimeStopResponse(record, "pending"));
+        return;
+      }
+
+      captureRoomStopTarget(record);
+      applyRoomStopSideEffect(record.hubSid);
+      captureRoomStopTarget(record);
+      const proof = await observeRoomStop(record);
+      if (
+        proof.terminal === true &&
+        proof.targetAbsent === true &&
+        proof.managedRoomPods === 0 &&
+        proof.pendingCreate === false
+      ) {
+        record.state = "stopped";
+        res.status(200).json(runtimeStopResponse(record, "stopped"));
+        return;
+      }
+
+      record.state = "pending";
+      res.status(202).json(runtimeStopResponse(record, "pending"));
+    })().catch(() => {
+      if (!res.headersSent) res.status(503).json({ error: "runtime_stop_unavailable" });
+    });
+    return;
+  }
+
   const hubSid = sanitizeIdentifier(req.body && req.body.hub_sid);
 
   if (!validHubSid(hubSid)) {
@@ -2688,21 +3331,14 @@ app.post("/internal/bots/room-stop", authMiddleware, (req, res) => {
     return;
   }
 
-  registerDesiredStateMutation();
+  const runnerState = applyRoomStopSideEffect(hubSid);
 
-  roomConfigs.delete(hubSid);
-  for (const key of chatRateLimits.keys()) {
-    if (key.startsWith(`${hubSid}:`)) chatRateLimits.delete(key);
-  }
-  const runnerState = stopRunner(hubSid, { intentional: true, reason: "configuration_removed" });
-  fillQueuedRunnerSlots();
-  scheduleAuthoritativeResync();
-
-  res.json({
+  res.status(202).json({
     ok: true,
     hub_sid: hubSid,
     runner_state: runnerState,
-    authoritative_sync: "pending"
+    authoritative_sync: "pending",
+    terminal: false
   });
 });
 
@@ -2842,6 +3478,7 @@ function startServer(port = PORT) {
   let watchdogTimer = null;
   let podReconcileTimer = null;
   let managerFatalHandler = null;
+  let managerGuardCapacityWarningHandler = null;
   let supervisorRestartScheduled = false;
 
   const requestSupervisorRestart = () => {
@@ -2860,7 +3497,15 @@ function startServer(port = PORT) {
         console.warn("Runner Pod manager failed closed.", error?.name || "Error");
         requestSupervisorRestart();
       };
+      managerGuardCapacityWarningHandler = snapshot => {
+        console.warn(
+          `Runner guard capacity warning total=${snapshot.total} intents=${snapshot.intents} ` +
+          `fences=${snapshot.fences} threshold=${snapshot.warning_threshold} ` +
+          `start_limit=${snapshot.start_limit} quota=${snapshot.quota}`
+        );
+      };
       manager.on("fatal", managerFatalHandler);
+      manager.on("guard-capacity-warning", managerGuardCapacityWarningHandler);
       manager.cleanupOrphans()
         .then(() => {
           runnerPodManagerReady = true;
@@ -2904,6 +3549,9 @@ function startServer(port = PORT) {
     if (podReconcileTimer) clearInterval(podReconcileTimer);
     if (runnerPodManager) {
       if (managerFatalHandler) runnerPodManager.off("fatal", managerFatalHandler);
+      if (managerGuardCapacityWarningHandler) {
+        runnerPodManager.off("guard-capacity-warning", managerGuardCapacityWarningHandler);
+      }
       runnerPodManager.close();
     }
   });
@@ -2915,6 +3563,8 @@ function resetRuntimeStateForTests() {
   runnerRestartTimers.forEach(entry => clearTimeout(entry.timer));
   roomConfigs.clear();
   roomRunners.clear();
+  roomRuntimeOperations.clear();
+  runtimeOperationIds.clear();
   queuedRunnerHubs.splice(0, queuedRunnerHubs.length);
   chatRateLimits.clear();
   runnerRestartBackoff.clear();
@@ -2928,7 +3578,14 @@ function resetRuntimeStateForTests() {
   desiredStateEpoch = 0;
   authoritativeResyncRequested = false;
   runnerPodManagerReady = !RUNNER_AUTOSTART;
+  roomStopProofOverride = null;
   lastRateLimitPruneAt = 0;
+}
+
+function setRoomStopProofForTests(proof) {
+  if (proof !== null && typeof proof !== "function") return false;
+  roomStopProofOverride = proof;
+  return true;
 }
 
 function setRunnerStateForTests(hubSid, info) {
@@ -2946,7 +3603,7 @@ function seedReadyRoomForTests(hubSid, inputBots, nowMs = Date.now()) {
   const bots = normalizeConfig(inputBots);
   if (!bots.enabled || bots.count <= 0) return false;
 
-  applyRoomSnapshot(new Map([[hubSid, { bots, updatedAt: nowMs }]]), {
+  applyRoomSnapshot(new Map([[hubSid, { bots, runtimeRevision: 1, updatedAt: nowMs }]]), {
     authoritative: true,
     receivedAt: nowMs
   });
@@ -3011,11 +3668,13 @@ module.exports = {
     nextRunnerProcessGeneration,
     nextRunnerRestartDelay,
     parseRoomSnapshot,
+    parseRuntimeOperation,
     parseOpenAIResponsePayload,
     parseStructuredReply,
     publicHubIdentifier,
     recoverUnsignalableRunner,
     registerDesiredStateMutation,
+    registerRuntimeOperation,
     runnerConfigFingerprint,
     deriveRunnerBotReadiness,
     runnerHealthSnapshot,
@@ -3025,6 +3684,7 @@ module.exports = {
     sendRunnerConfigToProcess,
     seedReadyRoomForTests,
     setRunnerStateForTests,
+    setRoomStopProofForTests,
     startRunner,
     stopRunner,
     superviseRunners,
@@ -3037,6 +3697,8 @@ module.exports = {
     resetRunnerRestartBackoff,
     resetRuntimeStateForTests,
     validateRuntimeConfiguration,
+    BOT_RUNTIME_PROTOCOL,
+    MAX_RUNTIME_TRACKED_ROOMS,
     GHOST_RUNNER_ENV_KEYS
   }
 };

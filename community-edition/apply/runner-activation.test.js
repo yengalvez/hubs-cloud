@@ -15,6 +15,9 @@ const {
   exactDeploymentDesiredState,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
+  parentIsQuiesced,
+  parentFencePolicyProtectsLiveOrTarget,
+  policySpecForFenceAwareDeployment,
   podIsRecoveryConsumer,
   recoveryConsumersAreQuiesced,
   retryBestEffortFenceAttempt,
@@ -23,10 +26,69 @@ const {
 const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
+  forbiddenPod,
   podWatchRawPath,
   replicaSetWatchRawPath
 } = require("./pod-quiescence-watch");
+
+test("legacy default-ServiceAccount parent Pods remain physically visible until their Deployment UID chain is absent", () => {
+  const deployment = {
+    metadata: { name: "bot-orchestrator", namespace: "hcce", uid: "deployment-uid" },
+    spec: { replicas: 0 },
+    status: { replicas: 0, readyReplicas: 0 }
+  };
+  const replicaSets = {
+    kind: "ReplicaSetList",
+    metadata: { resourceVersion: "20" },
+    items: [{
+      metadata: {
+        name: "bot-orchestrator-old",
+        uid: "replicaset-uid",
+        ownerReferences: [{
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          name: "bot-orchestrator",
+          uid: "deployment-uid",
+          controller: true
+        }]
+      }
+    }]
+  };
+  const legacyPod = {
+    metadata: {
+      name: "bot-orchestrator-old-abc",
+      uid: "legacy-pod-uid",
+      labels: { app: "bot-orchestrator" },
+      ownerReferences: [{ kind: "ReplicaSet", uid: "replicaset-uid", controller: true }]
+    },
+    spec: {
+      serviceAccountName: "default",
+      automountServiceAccountToken: false,
+      containers: [{ name: "bot-orchestrator" }]
+    }
+  };
+  const pods = {
+    kind: "PodList",
+    metadata: { resourceVersion: "30" },
+    items: [legacyPod]
+  };
+  assert.equal(parentIsQuiesced(deployment, pods, replicaSets, "deployment-uid"), false);
+  assert.equal(forbiddenPod("hcce", "hcce", legacyPod), true);
+  const terminating = structuredClone(pods);
+  terminating.items[0].metadata.deletionTimestamp = "2026-07-19T12:00:00Z";
+  assert.equal(parentIsQuiesced(deployment, terminating, replicaSets, "deployment-uid"), false);
+  assert.equal(parentIsQuiesced(
+    deployment,
+    { ...pods, items: [] },
+    replicaSets,
+    "deployment-uid"
+  ), true);
+});
 const { operationalDriftErrors } = require("./live-runner-control-plane");
+const {
+  guardPodDocumentForIdentity,
+  runnerPodName
+} = require("../services/bot-orchestrator/kubernetes-runner-manager");
 
 const epoch = "44444444-4444-4444-8444-444444444444";
 const sourceEpoch = "33333333-3333-4333-8333-333333333333";
@@ -109,6 +171,91 @@ test("requires the exact admission binding matchResources with no selector bypas
   const excluded = structuredClone(binding);
   excluded.spec.matchResources.excludeResourceRules = [];
   assert.equal(exactAdmissionBinding(excluded), false);
+});
+
+function fenceAwareDeployment(parentImage, runnerImage) {
+  return {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: "bot-orchestrator",
+      namespace: "hcce",
+      annotations: { "yenhubs.org/runner-fence-protocol": "intent-fence-v1" }
+    },
+    spec: {
+      template: {
+        metadata: { annotations: { "yenhubs.org/runner-fence-protocol": "intent-fence-v1" } },
+        spec: {
+          containers: [{
+            name: "bot-orchestrator",
+            image: parentImage,
+            env: [{ name: "BOT_RUNNER_IMAGE", value: runnerImage }]
+          }]
+        }
+      }
+    }
+  };
+}
+
+function parentFencePolicy(parentImage, runnerImage) {
+  return {
+    spec: {
+      failurePolicy: "Fail",
+      validations: [{
+        expression: `object.spec.template.spec.containers[0].image == '${parentImage}' && ` +
+          `object.spec.template.spec.containers[0].env.exists(e, e.value == '${runnerImage}')`
+      }]
+    }
+  };
+}
+
+test("durable parent policy accepts current or staged target images across update and rollback", () => {
+  const oldDeployment = fenceAwareDeployment(
+    "ghcr.io/example/parent@sha256:" + "a".repeat(64),
+    "ghcr.io/example/runner@sha256:" + "b".repeat(64)
+  );
+  const newDeployment = fenceAwareDeployment(
+    "ghcr.io/example/parent@sha256:" + "c".repeat(64),
+    "ghcr.io/example/runner@sha256:" + "d".repeat(64)
+  );
+  const targetPolicy = parentFencePolicy(
+    newDeployment.spec.template.spec.containers[0].image,
+    newDeployment.spec.template.spec.containers[0].env[0].value
+  );
+  const oldPolicy = {
+    spec: policySpecForFenceAwareDeployment(targetPolicy, newDeployment, oldDeployment)
+  };
+  assert.equal(parentFencePolicyProtectsLiveOrTarget({
+    livePolicy: oldPolicy,
+    targetPolicy,
+    liveDeployment: oldDeployment,
+    targetDeployment: newDeployment
+  }), true, "live old policy permits staging a new target");
+  assert.equal(parentFencePolicyProtectsLiveOrTarget({
+    livePolicy: targetPolicy,
+    targetPolicy,
+    liveDeployment: oldDeployment,
+    targetDeployment: newDeployment
+  }), true, "a staged target policy survives retry before Deployment update");
+
+  const rollbackPolicy = parentFencePolicy(
+    oldDeployment.spec.template.spec.containers[0].image,
+    oldDeployment.spec.template.spec.containers[0].env[0].value
+  );
+  assert.equal(parentFencePolicyProtectsLiveOrTarget({
+    livePolicy: targetPolicy,
+    targetPolicy: rollbackPolicy,
+    liveDeployment: newDeployment,
+    targetDeployment: oldDeployment
+  }), true, "a fence-aware new release can roll back to a fence-aware old release");
+  const oldShape = structuredClone(oldDeployment);
+  delete oldShape.metadata.annotations["yenhubs.org/runner-fence-protocol"];
+  assert.equal(parentFencePolicyProtectsLiveOrTarget({
+    livePolicy: oldPolicy,
+    targetPolicy,
+    liveDeployment: oldShape,
+    targetDeployment: newDeployment
+  }), false, "pre-fence Deployment shape is never accepted as current protection");
 });
 
 test("recovery lock binds exact state, epoch, checkpoint inventory, namespace UID, and PVC UID", () => {
@@ -404,6 +551,41 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   const runnerWatch = new PodWatchEvidence(RUNNER_NAMESPACE, "hcce", "200");
   runnerWatch.ingest({ type: "ERROR", object: { code: 410 } });
   assert.equal(runnerWatch.error, "watch_resource_version_expired");
+
+  const fenceIdentity = {
+    roomKey: "abcabcabcabcabcabcab",
+    processGeneration: "11111111-1111-4111-8111-111111111111"
+  };
+  fenceIdentity.name = runnerPodName(
+    fenceIdentity.roomKey,
+    fenceIdentity.processGeneration
+  );
+  const fence = guardPodDocumentForIdentity(fenceIdentity, "fence", RUNNER_NAMESPACE);
+  fence.metadata.uid = "fence-uid";
+  fence.metadata.resourceVersion = "201";
+  fence.status = { phase: "Pending" };
+  const fenceAdded = new PodWatchEvidence(RUNNER_NAMESPACE, "hcce", "200");
+  fenceAdded.ingest({ type: "ADDED", object: structuredClone(fence) });
+  fenceAdded.ingest({ type: "MODIFIED", object: structuredClone(fence) });
+  assert.equal(fenceAdded.violation, false, "an exact permanent fence is safe evidence");
+  fenceAdded.ingest({
+    type: "BOOKMARK",
+    object: {
+      metadata: {
+        resourceVersion: "202",
+        annotations: { "k8s.io/initial-events-end": "true" }
+      }
+    }
+  });
+  fenceAdded.ingest({ type: "DELETED", object: structuredClone(fence) });
+  assert.equal(fenceAdded.violation, true, "deleting a permanent fence breaks causal absence");
+
+  const terminatingFence = structuredClone(fence);
+  terminatingFence.metadata.deletionTimestamp = "2026-07-19T12:00:00Z";
+  terminatingFence.metadata.resourceVersion = "203";
+  const fenceTerminating = new PodWatchEvidence(RUNNER_NAMESPACE, "hcce", "202");
+  fenceTerminating.ingest({ type: "MODIFIED", object: terminatingFence });
+  assert.equal(fenceTerminating.violation, true, "a terminating fence is never safe evidence");
 
   const recoveryWatch = new PodWatchEvidence("hcce", "hcce", "300", {
     includeRecoveryConsumers: true

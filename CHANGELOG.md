@@ -1,3 +1,31 @@
+## 2026-07-20 - YenHubs AUD078 source candidate
+
+YenHubs:
+
+- Add a transactional PostgreSQL bot-runtime outbox with per-room
+  `runtime_revision`, recoverable ordered claims and exact terminal config/stop
+  acknowledgements. Raw approved bot JSON and its normalized runtime projection
+  are each bounded to 16,384 encoded bytes; legacy projected overflow is
+  quarantined and stopped durably.
+- Add durable unarmed/armed runner intents, same-name permanent fences, guarded
+  capacity, and separately protected runner, parent and first-cutover admission
+  contracts. The parent contract also denies `deployments/scale`, closing
+  `kubectl scale` and HPA bypasses; runner policies deny eviction, executable
+  access, ephemeral-container and resize subresources while preserving status,
+  binding and logs. The authenticated cutover journal makes the first
+  process-local/clean transition crash-resumable without making a pre-AUD078
+  rollback ordinary or safe.
+- Tighten the YenHubs operator documentation: generated manifests remain
+  immutable build output, cluster writes use the verified/redacted guarded apply
+  path, and a valid checkpoint includes both PostgreSQL and Reticulum storage.
+- Record AUD078 as an update-preservation surface on the accepted Hubs CE 2.1.0
+  baseline. Future stable releases and dependency upgrades remain separate
+  campaigns and must revalidate the persisted schema, runtime protocol,
+  intent/fence control plane, cutover journal and live bot behavior.
+
+This entry describes source-candidate work only. It does not claim an image
+build, checkpoint, Kubernetes mutation, deployment or production acceptance.
+
 ## 2023-03-02
 
 youtube-dl-api-server: 

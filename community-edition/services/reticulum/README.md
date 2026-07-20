@@ -115,8 +115,8 @@ Global administrators review the redacted, paginated inventory at
 `GET /api/v1/bot_config_approvals` and act on one room at a time through the
 `approve` and `quarantine` endpoints. Approval requires the current exact
 `v1:<sha256>` candidate fingerprint, revalidates capacity and administrator
-status transactionally, and rejects bot objects over 16 KiB. Inventory and
-decision responses use `Cache-Control: no-store`; they expose fingerprints,
+status transactionally, and rejects raw candidate JSON over 16 KiB. Inventory
+and decision responses use `Cache-Control: no-store`; they expose fingerprints,
 counts and prompt length metadata, never prompt text or configuration JSON.
 The public `/health/capabilities` contract advertises protocol 1 so Admin can
 refuse mixed-version operation. A durable approval means the database config
@@ -127,6 +127,35 @@ later quarantine, while a join that waits observes the committed quarantine and
 is rejected. Final bot chat delivery is revalidated after the provider call and
 then emitted under the exact current room fence, so quarantine, takeover and
 delivery have one linear order.
+
+Approved runtime changes use the durable `ret0.bot_runtime_outbox`. Each room
+gets monotonic JavaScript-safe `runtime_revision` values and immutable config or
+stop events with one canonical UUIDv4 operation ID. Config rows preserve the
+raw approved JSON exactly and separately persist normalized
+`runtime_chat_enabled`; the transmitted projection overwrites only
+`chat_enabled` with that boolean. Both the raw stored object and this runtime
+projection must independently fit within 16 KiB. A raw legacy object over the
+bound makes migration fail closed. A raw object that fits but whose persisted
+`chat_enabled` projection crosses the bound is atomically quarantined without
+rewriting or logging its payload, records the exact reason
+`runtime_payload_too_large_migration`, and enqueues a STOP.
+
+The dispatcher claims due rows with bounded leases and retries the same
+operation ID/revision until bot-orchestrator returns the exact terminal ACK:
+`200`/`state=applied` for config or `200`/`state=stopped` with
+`target_absent=true` and `managed_room_pods=0` for stop. Before emitting that
+wire ACK, bot-orchestrator must also prove its internal
+`pendingCreate=false`. `202` remains pending and never marks delivery. Pending
+rows cannot be deleted; Hub cleanup is allowed only after the matching terminal
+stop and no active runner authority remains.
+
+The runtime-outbox migration down is intentionally refused unless every stored
+bot configuration is disabled, every approval is quarantined, the outbox has no
+pending event, and there is zero active bot-runner lease. Restoring an old
+Reticulum image alone is insufficient and must not be used to bypass these
+database preconditions. CI runs the dedicated migration verifier on PostgreSQL
+12 and 14, including raw/projection bounds, oversize quarantine, retry/terminal
+ACK behavior, deletion guards and the guarded downgrade.
 
 Waypoint reservations use protocol 2. State-changing transactions allocate one
 global PostgreSQL `state_version` for their whole broadcast batch. Joins take a

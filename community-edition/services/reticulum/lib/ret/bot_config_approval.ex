@@ -19,6 +19,7 @@ defmodule Ret.BotConfigApproval do
     Account,
     BotConfig,
     BotConfigApproval,
+    BotRuntimeOutbox,
     BotRunnerGenerationToken,
     BotRunnerLease,
     Hub,
@@ -32,6 +33,8 @@ defmodule Ret.BotConfigApproval do
   @protocol 1
   @admission_lock "bot-config-admission:v1"
   @max_config_bytes 16_384
+  @max_runtime_revision 9_007_199_254_740_991
+  @runtime_hub_sid ~r/\A[A-Za-z0-9_-]{1,64}\z/
   @default_page_size 50
   @max_page_size 100
 
@@ -44,6 +47,7 @@ defmodule Ret.BotConfigApproval do
     field :last_quarantined_by_account_id, :integer
     field :last_quarantined_at, :utc_datetime_usec
     field :last_quarantine_reason, :string
+    field :runtime_revision, :integer
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -83,6 +87,13 @@ defmodule Ret.BotConfigApproval do
   end
 
   def fingerprint(_bots), do: {:error, :invalid_config}
+
+  @doc false
+  def exact_json_equal?(left, right) do
+    canonical_json(left) == canonical_json(right)
+  rescue
+    _ -> false
+  end
 
   def runtime_approved?(%Hub{} = hub) do
     match?({:ok, _decision}, approved_decision(hub))
@@ -184,6 +195,11 @@ defmodule Ret.BotConfigApproval do
     do: {:error, :bot_config_unapproved}
 
   defp fail_registration_closed(hub_sid) do
+    # This is a conservative authority fence, not a desired-state stop. The
+    # exact approved config remains desired, so advancing runtime_revision or
+    # enqueueing a terminal stop here would let a transient registration error
+    # contradict durable approval. Quarantine/close are the only paths that pair
+    # a revoke epoch with an ordered stop event.
     _ = BotRunnerLease.revoke(hub_sid)
     {:error, :bot_config_unavailable}
   catch
@@ -193,7 +209,8 @@ defmodule Ret.BotConfigApproval do
   def runtime_approved?(%Hub{} = hub, %BotConfigApproval{} = approval) do
     bots = raw_bots(hub.user_data)
 
-    is_map(bots) and approval.state == "approved" and approval.approved_bots == bots and
+    is_map(bots) and approval.state == "approved" and
+      exact_json_equal?(approval.approved_bots, bots) and
       valid_runtime_config?(bots)
   end
 
@@ -210,11 +227,48 @@ defmodule Ret.BotConfigApproval do
           FROM ret0.bot_config_approvals AS bca
           WHERE bca.hub_id = ?
             AND bca.state = 'approved'
-            AND bca.approved_bots = ?->'bots'
+            AND bca.approved_bots::text = (?->'bots')::text
         )
         """,
         h.hub_id,
         h.user_data
+      )
+    )
+  end
+
+  @doc """
+  Joins the exact approved revision that is safe to expose in a runtime
+  snapshot.
+
+  A polling snapshot must never overtake its own config event or any earlier
+  stop/config for the room. The dispatcher is the only path that can make all
+  revisions through the selected revision terminal.
+  """
+  def with_runtime_snapshot_approval(query) do
+    query
+    |> join(:inner, [h], approval in BotConfigApproval,
+      as: :runtime_approval,
+      on: approval.hub_id == h.hub_id
+    )
+    |> where(
+      [h, runtime_approval: approval],
+      approval.state == "approved" and
+        fragment("?::text = (?->'bots')::text", approval.approved_bots, h.user_data)
+    )
+    |> where(
+      [h, runtime_approval: approval],
+      fragment(
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM ret0.bot_runtime_outbox AS pending_runtime
+          WHERE pending_runtime.hub_id = ?
+            AND pending_runtime.runtime_revision <= ?
+            AND pending_runtime.delivered_at IS NULL
+        )
+        """,
+        h.hub_id,
+        approval.runtime_revision
       )
     )
   end
@@ -233,7 +287,7 @@ defmodule Ret.BotConfigApproval do
     current_bots = current_hub && raw_bots(current_hub.user_data)
     intended_bots = raw_bots(intended_user_data)
 
-    if current_bots != intended_bots and is_map(intended_bots) and
+    if not exact_json_equal?(current_bots, intended_bots) and is_map(intended_bots) and
          BotConfig.active?(%{"bots" => intended_bots}) and fresh_admin?(actor) do
       case validate_persisted_size(intended_bots) do
         :ok ->
@@ -265,9 +319,10 @@ defmodule Ret.BotConfigApproval do
           "room_closed"
         )
 
-      current_bots != persisted_bots ->
+      not exact_json_equal?(current_bots, persisted_bots) ->
         cond do
-          is_map(persisted_bots) and BotConfig.active?(%{"bots" => persisted_bots}) and
+          persisted_hub.entry_mode != :deny and is_map(persisted_bots) and
+            BotConfig.active?(%{"bots" => persisted_bots}) and
               fresh_admin?(actor) ->
             approve_exact!(persisted_hub, persisted_bots, actor)
 
@@ -292,6 +347,7 @@ defmodule Ret.BotConfigApproval do
     run_locked(fn ->
       with {:ok, current_actor} <- current_admin(actor),
            %Hub{} = hub <- hub_for_update(hub_sid),
+           :ok <- ensure_room_open(hub),
            %BotConfigApproval{} = approval <- approval_for_update(hub.hub_id),
            {:ok, actual_fingerprint} <- fingerprint(approval.candidate_bots),
            :ok <- verify_fingerprint(expected_fingerprint, actual_fingerprint),
@@ -404,25 +460,46 @@ defmodule Ret.BotConfigApproval do
     }
   end
 
-  defp approve_exact!(hub, bots, %Account{} = actor) do
+  defp approve_exact!(%Hub{entry_mode: entry_mode} = hub, bots, %Account{} = actor)
+       when entry_mode != :deny do
+    validate_runtime_hub_sid!(hub.hub_sid)
     now = DateTime.utc_now()
-
-    hub.hub_id
-    |> approval_changeset(%{
-      state: "approved",
-      candidate_bots: bots,
-      approved_bots: bots,
-      approved_by_account_id: actor.account_id,
-      approved_at: now
-    })
-    |> Repo.insert_or_update!()
-  end
-
-  defp quarantine_exact!(hub, candidate_bots, actor, reason) do
-    now = DateTime.utc_now()
+    approval = approval_for_mutation(hub.hub_id)
+    runtime_revision = next_runtime_revision!(approval.runtime_revision)
 
     approval =
-      hub.hub_id
+      approval
+      |> approval_changeset(%{
+        state: "approved",
+        candidate_bots: bots,
+        approved_bots: bots,
+        approved_by_account_id: actor.account_id,
+        approved_at: now,
+        runtime_revision: runtime_revision
+      })
+      |> Repo.insert_or_update!()
+
+    %BotRuntimeOutbox{} =
+      enqueue_config!(%{
+        hub_id: hub.hub_id,
+        hub_sid: hub.hub_sid,
+        runtime_revision: runtime_revision,
+        bots: bots
+      })
+
+    approval
+  end
+
+  defp approve_exact!(%Hub{entry_mode: :deny}, _bots, _actor), do: Repo.rollback(:room_closed)
+
+  defp quarantine_exact!(hub, candidate_bots, actor, reason) do
+    validate_runtime_hub_sid!(hub.hub_sid)
+    now = DateTime.utc_now()
+    approval = approval_for_mutation(hub.hub_id)
+    runtime_revision = next_runtime_revision!(approval.runtime_revision)
+
+    approval =
+      approval
       |> approval_changeset(%{
         state: "quarantined",
         candidate_bots: stringify_keys(candidate_bots),
@@ -431,17 +508,25 @@ defmodule Ret.BotConfigApproval do
         approved_at: nil,
         last_quarantined_by_account_id: actor_account_id(actor),
         last_quarantined_at: now,
-        last_quarantine_reason: reason
+        last_quarantine_reason: reason,
+        runtime_revision: runtime_revision
       })
       |> Repo.insert_or_update!()
 
-    :ok = BotRunnerLease.revoke(hub.hub_sid)
+    revoke_epoch = revoke_with_epoch!(hub.hub_sid)
+
+    %BotRuntimeOutbox{} =
+      enqueue_stop!(%{
+        hub_id: hub.hub_id,
+        hub_sid: hub.hub_sid,
+        runtime_revision: runtime_revision,
+        revoke_epoch: revoke_epoch
+      })
+
     approval
   end
 
-  defp approval_changeset(hub_id, attrs) do
-    approval = Repo.get(BotConfigApproval, hub_id) || %BotConfigApproval{hub_id: hub_id}
-
+  defp approval_changeset(%BotConfigApproval{} = approval, attrs) do
     approval
     |> cast(attrs, [
       :state,
@@ -451,11 +536,74 @@ defmodule Ret.BotConfigApproval do
       :approved_at,
       :last_quarantined_by_account_id,
       :last_quarantined_at,
-      :last_quarantine_reason
+      :last_quarantine_reason,
+      :runtime_revision
     ])
-    |> validate_required([:state, :candidate_bots])
+    |> force_canonical_json_change(:candidate_bots, attrs)
+    |> force_canonical_json_change(:approved_bots, attrs)
+    |> validate_required([:state, :candidate_bots, :runtime_revision])
     |> validate_inclusion(:state, ["quarantined", "approved"])
     |> validate_length(:last_quarantine_reason, max: 128)
+    |> validate_number(:runtime_revision,
+      greater_than: 0,
+      less_than_or_equal_to: @max_runtime_revision
+    )
+  end
+
+  defp force_canonical_json_change(changeset, field, attrs) do
+    case Map.fetch(attrs, field) do
+      {:ok, value} ->
+        if exact_json_equal?(Map.get(changeset.data, field), value) do
+          changeset
+        else
+          force_change(changeset, field, value)
+        end
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp approval_for_mutation(hub_id) do
+    Repo.get(BotConfigApproval, hub_id) || %BotConfigApproval{hub_id: hub_id, runtime_revision: 0}
+  end
+
+  defp next_runtime_revision!(revision)
+       when is_integer(revision) and revision >= 0 and
+              revision < @max_runtime_revision,
+       do: revision + 1
+
+  defp next_runtime_revision!(_revision), do: Repo.rollback(:runtime_revision_exhausted)
+
+  defp validate_runtime_hub_sid!(hub_sid) when is_binary(hub_sid) do
+    if Regex.match?(@runtime_hub_sid, hub_sid) do
+      :ok
+    else
+      Repo.rollback(:invalid_runtime_hub_sid)
+    end
+  end
+
+  defp validate_runtime_hub_sid!(_hub_sid), do: Repo.rollback(:invalid_runtime_hub_sid)
+
+  defp revoke_with_epoch!(hub_sid) do
+    case BotRunnerLease.revoke_with_epoch(hub_sid) do
+      {:ok, epoch} when is_integer(epoch) and epoch > 0 -> epoch
+      _error -> Repo.rollback(:runtime_revoke_epoch_unavailable)
+    end
+  end
+
+  defp enqueue_config!(attrs) do
+    case Ret.BotRuntimeOutbox.Store.enqueue_config(attrs) do
+      {:ok, %BotRuntimeOutbox{} = event} -> event
+      {:error, _changeset} -> Repo.rollback(:runtime_outbox_unavailable)
+    end
+  end
+
+  defp enqueue_stop!(attrs) do
+    case Ret.BotRuntimeOutbox.Store.enqueue_stop(attrs) do
+      {:ok, %BotRuntimeOutbox{} = event} -> event
+      {:error, _changeset} -> Repo.rollback(:runtime_outbox_unavailable)
+    end
   end
 
   defp current_admin(%Account{account_id: account_id}) do
@@ -533,6 +681,9 @@ defmodule Ret.BotConfigApproval do
     if expected == actual, do: :ok, else: {:error, :fingerprint_mismatch}
   end
 
+  defp ensure_room_open(%Hub{entry_mode: :deny}), do: {:error, :room_closed}
+  defp ensure_room_open(%Hub{}), do: :ok
+
   defp run_locked(fun) do
     case Locking.exec_after_lock(@admission_lock, fun) do
       {:ok, result} -> result
@@ -560,7 +711,7 @@ defmodule Ret.BotConfigApproval do
         from a in BotConfigApproval,
           where:
             a.hub_id == ^hub.hub_id and a.state == "approved" and
-              fragment("? = ?::jsonb", a.approved_bots, ^bots) and
+              fragment("?::text = ?::jsonb::text", a.approved_bots, ^bots) and
               fragment("octet_length(?::text) <= ?", a.approved_bots, ^@max_config_bytes),
           select: a.updated_at
 
@@ -615,12 +766,12 @@ defmodule Ret.BotConfigApproval do
   defp actor_account_id(%Account{account_id: account_id}), do: account_id
   defp actor_account_id(_actor), do: nil
 
-  defp quarantine_reason(current_hub, persisted_hub, persisted_bots) do
+  defp quarantine_reason(_current_hub, persisted_hub, persisted_bots) do
     cond do
       is_nil(persisted_bots) ->
         "bots_removed"
 
-      current_hub && current_hub.entry_mode != :deny && persisted_hub.entry_mode == :deny ->
+      persisted_hub.entry_mode == :deny ->
         "room_closed"
 
       not BotConfig.active?(%{"bots" => persisted_bots}) ->

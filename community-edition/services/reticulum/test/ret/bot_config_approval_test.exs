@@ -5,7 +5,16 @@ defmodule Ret.BotConfigApprovalTest do
 
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
-  alias Ret.{BotConfigAdmission, BotConfigApproval, BotRunnerLease, Hub, Repo}
+
+  alias Ret.{
+    BotConfigAdmission,
+    BotConfigApproval,
+    BotRunnerLease,
+    BotRuntimeOutbox,
+    Hub,
+    Repo
+  }
+
   alias Ret.BotRunnerLease.PostgresStore
 
   setup [:create_account, :create_owned_file, :create_scene]
@@ -40,6 +49,7 @@ defmodule Ret.BotConfigApprovalTest do
 
     assert {:ok, "v1:" <> digest} = BotConfigApproval.fingerprint(exact)
     assert byte_size(digest) == 64
+    assert BotConfigApproval.exact_json_equal?(same_exact_json, exact)
     assert BotConfigApproval.fingerprint(same_exact_json) == BotConfigApproval.fingerprint(exact)
 
     refute BotConfigApproval.fingerprint(Map.put(exact, "future_field", true)) ==
@@ -47,6 +57,14 @@ defmodule Ret.BotConfigApprovalTest do
 
     refute BotConfigApproval.fingerprint(Map.put(exact, "count", "1")) ==
              BotConfigApproval.fingerprint(exact)
+
+    refute BotConfigApproval.fingerprint(Map.put(exact, "future_number", 1.0)) ==
+             BotConfigApproval.fingerprint(Map.put(exact, "future_number", 1))
+
+    refute BotConfigApproval.exact_json_equal?(
+             Map.put(exact, "future_number", 1.0),
+             Map.put(exact, "future_number", 1)
+           )
 
     assert {:error, :config_too_large} =
              BotConfigApproval.fingerprint(%{
@@ -86,6 +104,7 @@ defmodule Ret.BotConfigApprovalTest do
       hub_id: hub.hub_id,
       state: "quarantined",
       candidate_bots: candidate,
+      runtime_revision: 1,
       last_quarantined_at: DateTime.utc_now(),
       last_quarantine_reason: "legacy_migration"
     })
@@ -125,6 +144,50 @@ defmodule Ret.BotConfigApprovalTest do
       |> Repo.update!()
 
     refute BotConfigApproval.runtime_enabled?(mismatched_hub)
+  end
+
+  test "integer-to-float drift invalidates runtime approval, capacity and lease registration", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Type-sensitive approval")
+    bots = Map.put(hub.user_data["bots"], "future_number", 1)
+
+    assert {:ok, hub} =
+             hub
+             |> Ecto.Changeset.change()
+             |> Ecto.Changeset.force_change(:user_data, %{"bots" => bots})
+             |> BotConfigAdmission.update(admin)
+
+    approval = Repo.get!(BotConfigApproval, hub.hub_id)
+
+    assert BotConfigApproval.runtime_approved?(hub, approval)
+    assert BotConfigApproval.runtime_enabled?(hub)
+    assert {:ok, %{bots: ^bots}} = BotConfigApproval.runtime_decision(hub)
+    assert BotConfigApproval.configured_active_room_count() == 1
+
+    drifted_user_data = put_in(hub.user_data, ["bots", "future_number"], 1.0)
+
+    drifted_hub =
+      hub
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.force_change(:user_data, drifted_user_data)
+      |> Repo.update!()
+
+    assert drifted_hub.user_data["bots"]["future_number"] === 1.0
+    refute BotConfigApproval.runtime_approved?(drifted_hub, approval)
+    refute BotConfigApproval.runtime_enabled?(drifted_hub)
+    assert {:error, :bot_config_unapproved} = BotConfigApproval.runtime_decision(drifted_hub)
+    assert BotConfigApproval.configured_active_room_count() == 0
+
+    assert {:error, :bot_config_unapproved} =
+             BotConfigApproval.register_runtime_lease(
+               hub.hub_sid,
+               Ecto.UUID.generate(),
+               generation_claims(hub.hub_sid)
+             )
+
+    assert BotRunnerLease.snapshot(hub.hub_sid) == nil
   end
 
   test "an oversized admin auto-approval rolls back the hub and approval together", %{
@@ -196,6 +259,50 @@ defmodule Ret.BotConfigApprovalTest do
     assert reopened.entry_mode == :allow
     assert Repo.get!(BotConfigApproval, hub.hub_id).state == "quarantined"
     refute BotConfigApproval.runtime_enabled?(reopened)
+  end
+
+  test "explicit approval rejects a closed room without changing revision or durable events", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Closed explicit approval")
+
+    assert {:ok, closed} =
+             hub
+             |> Ecto.Changeset.change(entry_mode: :deny)
+             |> BotConfigAdmission.update(admin)
+
+    before_hub = Repo.get!(Hub, hub.hub_id)
+    before_approval = Repo.get!(BotConfigApproval, hub.hub_id)
+
+    before_events =
+      BotRuntimeOutbox
+      |> where([o], o.hub_id == ^hub.hub_id)
+      |> order_by([o], asc: o.runtime_revision)
+      |> Repo.all()
+
+    assert closed.entry_mode == :deny
+    assert before_approval.state == "quarantined"
+    assert before_approval.runtime_revision == 2
+
+    assert Enum.map(before_events, &{&1.runtime_revision, &1.event_kind}) == [
+             {1, "config"},
+             {2, "stop"}
+           ]
+
+    assert {:ok, fingerprint} =
+             BotConfigApproval.fingerprint(before_approval.candidate_bots)
+
+    assert {:error, :room_closed} =
+             BotConfigApproval.approve_candidate(closed.hub_sid, fingerprint, admin)
+
+    assert Repo.get!(Hub, hub.hub_id) == before_hub
+    assert Repo.get!(BotConfigApproval, hub.hub_id) == before_approval
+
+    assert BotRuntimeOutbox
+           |> where([o], o.hub_id == ^hub.hub_id)
+           |> order_by([o], asc: o.runtime_revision)
+           |> Repo.all() == before_events
   end
 
   test "disabling quarantines and does not retain an approved runtime match", %{
@@ -275,6 +382,121 @@ defmodule Ret.BotConfigApprovalTest do
     assert BotConfigApproval.runtime_enabled?(approved_hub)
   end
 
+  test "quarantine rolls back hub, approval and revoke epoch if stop enqueue cannot commit", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Atomic stop enqueue")
+    bots = hub.user_data["bots"]
+
+    assert {:ok, %BotRuntimeOutbox{}} =
+             Ret.BotRuntimeOutbox.Store.enqueue_config(%{
+               hub_id: hub.hub_id,
+               hub_sid: hub.hub_sid,
+               runtime_revision: 2,
+               bots: bots
+             })
+
+    assert {:error, :approval_unavailable} = BotConfigApproval.quarantine(hub.hub_sid, admin)
+
+    persisted_hub = Repo.get!(Hub, hub.hub_id)
+    persisted_approval = Repo.get!(BotConfigApproval, hub.hub_id)
+    assert persisted_hub.user_data["bots"]["enabled"]
+    assert persisted_approval.state == "approved"
+    assert persisted_approval.runtime_revision == 1
+
+    assert %{rows: [[0]]} =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM ret0.bot_runner_leases WHERE hub_id = $1",
+               [hub.hub_id]
+             )
+
+    assert ["config", "config"] ==
+             BotRuntimeOutbox
+             |> where([o], o.hub_id == ^hub.hub_id)
+             |> order_by([o], asc: o.runtime_revision)
+             |> select([o], o.event_kind)
+             |> Repo.all()
+  end
+
+  test "approval rolls back the enabled Hub and approval row if config enqueue cannot commit", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Atomic config enqueue")
+    assert {:ok, _quarantined_hub} = BotConfigApproval.quarantine(hub.hub_sid, admin)
+    approval = Repo.get!(BotConfigApproval, hub.hub_id)
+    assert approval.runtime_revision == 2
+    assert {:ok, fingerprint} = BotConfigApproval.fingerprint(approval.candidate_bots)
+
+    assert {:ok, %BotRuntimeOutbox{}} =
+             Ret.BotRuntimeOutbox.Store.enqueue_config(%{
+               hub_id: hub.hub_id,
+               hub_sid: hub.hub_sid,
+               runtime_revision: 3,
+               bots: approval.candidate_bots
+             })
+
+    assert {:error, :approval_unavailable} =
+             BotConfigApproval.approve_candidate(hub.hub_sid, fingerprint, admin)
+
+    persisted_hub = Repo.get!(Hub, hub.hub_id)
+    persisted_approval = Repo.get!(BotConfigApproval, hub.hub_id)
+    refute persisted_hub.user_data["bots"]["enabled"]
+    assert persisted_approval.state == "quarantined"
+    assert persisted_approval.runtime_revision == 2
+
+    assert ["config", "stop", "config"] ==
+             BotRuntimeOutbox
+             |> where([o], o.hub_id == ^hub.hub_id)
+             |> order_by([o], asc: o.runtime_revision)
+             |> select([o], o.event_kind)
+             |> Repo.all()
+  end
+
+  test "runtime producers reject a hub sid outside the orchestrator contract", %{
+    admin: admin,
+    scene: scene
+  } do
+    bots = active_bots()
+
+    # Seed a synthetic pre-outbox approval so this test can corrupt the Hub SID
+    # deliberately. Once an outbox event exists, the composite identity FK must
+    # (and does) reject changing the Hub side of that durable event identity.
+    hub =
+      %Hub{}
+      |> Hub.changeset(scene, %{
+        name: "Invalid runtime sid",
+        user_data: %{"bots" => bots}
+      })
+      |> Hub.add_account_to_changeset(admin)
+      |> Repo.insert!()
+
+    Repo.insert!(%BotConfigApproval{
+      hub_id: hub.hub_id,
+      state: "approved",
+      candidate_bots: bots,
+      approved_bots: bots,
+      approved_by_account_id: admin.account_id,
+      approved_at: DateTime.utc_now(),
+      runtime_revision: 1
+    })
+
+    invalid_sid = String.duplicate("a", 65)
+
+    hub = hub |> Ecto.Changeset.change(hub_sid: invalid_sid) |> Repo.update!()
+
+    assert {:error, :approval_unavailable} = BotConfigApproval.quarantine(invalid_sid, admin)
+    assert Repo.get!(Hub, hub.hub_id).user_data["bots"]["enabled"]
+    assert Repo.get!(BotConfigApproval, hub.hub_id).runtime_revision == 1
+
+    assert Repo.aggregate(
+             from(o in BotRuntimeOutbox, where: o.hub_id == ^hub.hub_id),
+             :count
+           ) == 0
+  end
+
   test "the approved fingerprint identifies the exact JSONB that becomes active", %{
     admin: admin,
     scene: scene
@@ -305,6 +527,7 @@ defmodule Ret.BotConfigApprovalTest do
       hub_id: hub.hub_id,
       state: "quarantined",
       candidate_bots: candidate,
+      runtime_revision: 1,
       last_quarantined_at: DateTime.utc_now(),
       last_quarantine_reason: "legacy_migration"
     })
@@ -519,6 +742,18 @@ defmodule Ret.BotConfigApprovalTest do
         send(row_gate_pid, :release)
         Enum.each([delivery, registration, quarantine, row_gate], &shutdown_task/1)
         _ = BotRunnerLease.revoke(hub.hub_sid)
+        matching_outbox = from o in BotRuntimeOutbox, where: o.hub_id == ^hub.hub_id
+
+        Repo.update_all(matching_outbox,
+          set: [
+            delivered_at: DateTime.utc_now(),
+            claim_owner: nil,
+            claim_token: nil,
+            claim_expires_at: nil
+          ]
+        )
+
+        Repo.delete_all(matching_outbox)
         Repo.delete_all(from h in Hub, where: h.hub_id == ^hub.hub_id)
         Repo.delete_all(from a in Ret.Account, where: a.account_id == ^admin.account_id)
       end

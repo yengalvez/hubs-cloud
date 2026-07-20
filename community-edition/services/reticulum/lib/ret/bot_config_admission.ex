@@ -116,7 +116,8 @@ defmodule Ret.BotConfigAdmission do
         {:error, :bot_admin_required,
          "only a global administrator may create or modify room bot configuration"}
 
-      current_state == intended_state or exact_disable?(current_state, intended_state) ->
+      exact_bot_config_state?(current_state, intended_state) or
+          exact_disable?(current_state, intended_state) ->
         :ok
 
       true ->
@@ -207,10 +208,23 @@ defmodule Ret.BotConfigAdmission do
   defp bot_config_state(_user_data), do: :absent
 
   defp exact_disable?({:present, current}, {:present, intended}) do
-    current["enabled"] && intended == Map.put(current, "enabled", false)
+    explicitly_enabled?(current["enabled"]) and
+      BotConfigApproval.exact_json_equal?(intended, Map.put(current, "enabled", false))
   end
 
   defp exact_disable?(_current, _intended), do: false
+
+  defp exact_bot_config_state?(:absent, :absent), do: true
+
+  defp exact_bot_config_state?({:present, current}, {:present, intended}),
+    do: BotConfigApproval.exact_json_equal?(current, intended)
+
+  defp exact_bot_config_state?(_current, _intended), do: false
+
+  defp explicitly_enabled?(true), do: true
+  defp explicitly_enabled?("true"), do: true
+  defp explicitly_enabled?(1), do: true
+  defp explicitly_enabled?(_value), do: false
 
   defp effective_active?(user_data, entry_mode) do
     entry_mode != :deny && BotConfig.active?(user_data)

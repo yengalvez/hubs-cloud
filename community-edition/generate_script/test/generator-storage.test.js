@@ -21,8 +21,8 @@ function runNode(script, env) {
 
 test("generator and verifier support dynamic and retained manual storage only", () => {
   for (const [storageClass, expectedResources] of [
-    ["do-block-storage", 58],
-    ["manual", 60]
+    ["do-block-storage", 66],
+    ["manual", 68]
   ]) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-storage-contract-"));
     const inputPath = path.join(directory, "input-values.yaml");

@@ -11,11 +11,9 @@ defmodule RetWeb.HubChannel do
     HubInvite,
     Account,
     AccountFavorite,
-    BotConfig,
     BotConfigAdmission,
     BotConfigApproval,
     BotChatPresence,
-    BotOrchestrator,
     BotRunnerLease,
     Identity,
     Repo,
@@ -818,7 +816,6 @@ defmodule RetWeb.HubChannel do
       case BotConfigAdmission.update(update_changeset, account) do
         {:ok, updated_hub} ->
           updated_hub = Repo.preload(updated_hub, Hub.hub_preloads())
-          sync_bot_orchestrator(updated_hub)
           broadcast_hub_refresh!(updated_hub, socket, stale_fields)
           {:noreply, socket}
 
@@ -1272,7 +1269,6 @@ defmodule RetWeb.HubChannel do
       case result do
         {:ok, updated_hub} ->
           updated_hub = Repo.preload(updated_hub, Hub.hub_preloads())
-          sync_bot_orchestrator(updated_hub)
           broadcast_hub_refresh!(updated_hub, socket, ["entry_mode", "user_data"])
           {:noreply, socket}
 
@@ -2277,25 +2273,6 @@ defmodule RetWeb.HubChannel do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  defp sync_bot_orchestrator(%Hub{} = hub) do
-    bots = BotConfig.normalize(hub.user_data)
-
-    if BotConfigApproval.runtime_enabled?(hub) do
-      _ =
-        BotOrchestrator.room_config(%{
-          hub_sid: hub.hub_sid,
-          bots: bots
-        })
-    else
-      _ =
-        BotOrchestrator.room_stop(%{
-          hub_sid: hub.hub_sid
-        })
-    end
-
-    :ok
   end
 
   defp reply_error(socket, reason) do

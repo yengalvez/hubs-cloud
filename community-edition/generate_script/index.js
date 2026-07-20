@@ -223,6 +223,12 @@ function handleRunnerActivation(processedConfig, replacedContent) {
     if (kind === "Namespace" && name !== "hcce-bot-runners") return 0;
     if (kind === "Namespace" && name === "hcce-bot-runners") return 1;
     if (kind === "Secret") return 2;
+    if (kind === "ValidatingAdmissionPolicy" && name === "yenhubs-runner-cutover-journal-v2") return 2;
+    if (kind === "ValidatingAdmissionPolicyBinding" && name === "yenhubs-runner-cutover-journal-v2") return 3;
+    if (kind === "ValidatingAdmissionPolicy" && name === "bot-orchestrator-fence-protocol.yenhubs.org") return 4;
+    if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-orchestrator-fence-protocol.yenhubs.org") return 5;
+    if (kind === "ValidatingAdmissionPolicy" && name === "bot-runner-durable-protocol.yenhubs.org") return 8;
+    if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-runner-durable-protocol.yenhubs.org") return 9;
     if (kind === "ValidatingAdmissionPolicy" && name === "bot-runner-pods.yenhubs.org") return 10;
     if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-runner-pods.yenhubs.org") return 11;
     if (["ServiceAccount", "ResourceQuota", "NetworkPolicy"].includes(kind) &&
@@ -381,6 +387,7 @@ function main() {
     const botOrchestratorImage =
       processedConfig.OVERRIDE_BOT_ORCHESTRATOR_IMAGE ||
       `${processedConfig.Container_Dockerhub_Username}/bot-orchestrator:${processedConfig.Container_Tag}`;
+    processedConfig.BOT_ORCHESTRATOR_IMAGE = botOrchestratorImage;
     const pullConfigBase64 = String(processedConfig.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 || "").trim();
     try {
       verifyDockerConfigCredentials(pullConfigBase64, [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]);

@@ -25,6 +25,7 @@ const { createRunnerGenerationToken } = require("../runner-generation-token");
 let server;
 let baseUrl;
 let nextTestPid = 10_000;
+const runtimeProtocol = "yenhubs-bot-runtime-v2";
 
 function validRunningGhostProcessState() {
   nextTestPid += 1;
@@ -81,6 +82,33 @@ async function post(path, body, accessKey = process.env.BOT_ORCHESTRATOR_ACCESS_
     },
     body: JSON.stringify(body)
   });
+}
+
+function runtimeConfigBody({
+  operationId = randomUUID(),
+  hubSid,
+  runtimeRevision,
+  bots,
+  runtimeChatEnabled = bots?.chat_enabled === true || bots?.chat_enabled === "true" || bots?.chat_enabled === 1
+}) {
+  return {
+    protocol: runtimeProtocol,
+    operation_id: operationId,
+    hub_sid: hubSid,
+    runtime_revision: runtimeRevision,
+    bots: { ...bots, chat_enabled: runtimeChatEnabled },
+    runtime_chat_enabled: runtimeChatEnabled
+  };
+}
+
+function runtimeStopBody({ operationId = randomUUID(), hubSid, runtimeRevision, revokeEpoch }) {
+  return {
+    protocol: runtimeProtocol,
+    operation_id: operationId,
+    hub_sid: hubSid,
+    runtime_revision: runtimeRevision,
+    revoke_epoch: revokeEpoch
+  };
 }
 
 function rawStatus(pathname, headers) {
@@ -290,6 +318,19 @@ test("protects internal endpoints and does not expose Express", async () => {
   const healthBody = await health.json();
   assert.equal(healthBody.runner_backend_default, "ghost");
   assert.equal(healthBody.ghost_navigation_require_navmesh, true);
+  assert.deepEqual(healthBody.runner_guard_capacity, {
+    observed: false,
+    intents: 0,
+    fences: 0,
+    total: 0,
+    warning: false,
+    warning_threshold: 60,
+    start_limit: 80,
+    reserve: 20,
+    quota: 100
+  });
+  const transportReady = await (await fetch(`${baseUrl}/transport-ready`)).json();
+  assert.deepEqual(transportReady.runner_guard_capacity, healthBody.runner_guard_capacity);
 });
 
 test("runner control is bearer-authenticated, Pod-UID-bound, and generation-scoped", async () => {
@@ -1086,7 +1127,7 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
     fetchImpl: async () => ({
       ok: true,
       status: 200,
-      json: async () => ({ hubs: [{ hub_sid: hubSid, bots }] })
+      json: async () => ({ hubs: [{ hub_sid: hubSid, runtime_revision: 1, bots }] })
     })
   });
 
@@ -1150,6 +1191,7 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
       "ok",
       "process_hubs",
       "runner_bots",
+      "runner_guard_capacity",
       "runner_health_ttl_ms",
       "snapshot_age_ms",
       "snapshot_reason",
@@ -1157,6 +1199,17 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
       "unready_hubs"
     ]);
     assert.equal(body.authoritative_snapshot_ready, true);
+    assert.deepEqual(body.runner_guard_capacity, {
+      observed: false,
+      intents: 0,
+      fences: 0,
+      total: 0,
+      warning: false,
+      warning_threshold: 60,
+      start_limit: 80,
+      reserve: 20,
+      quota: 100
+    });
     assert.equal(body.snapshot_reason, "ready");
     assert.equal(typeof body.snapshot_age_ms, "number");
     assert.ok(body.snapshot_age_ms >= 0);
@@ -1334,7 +1387,7 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
       fetchImpl: async () => ({
         ok: true,
         status: 200,
-        json: async () => ({ hubs: [{ hub_sid: hubSid, bots: { ...bots, mobility: "high" } }] })
+        json: async () => ({ hubs: [{ hub_sid: hubSid, runtime_revision: 2, bots: { ...bots, mobility: "high" } }] })
       })
     });
     Object.assign(configMutationRunner, authoritativeRunner, {
@@ -1349,7 +1402,7 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
       fetchImpl: async () => ({
         ok: true,
         status: 200,
-        json: async () => ({ hubs: [{ hub_sid: hubSid, bots }] })
+        json: async () => ({ hubs: [{ hub_sid: hubSid, runtime_revision: 3, bots }] })
       })
     });
 
@@ -2368,7 +2421,7 @@ test("room-config admission is atomic at the deployed room ceiling and reopens a
   });
 
   const stopped = await post("/internal/bots/room-stop", { hub_sid: "admission-room-1" });
-  assert.equal(stopped.status, 200);
+  assert.equal(stopped.status, 202);
 
   const replacement = await post("/internal/bots/room-config", {
     hub_sid: "admission-room-6",
@@ -2376,6 +2429,626 @@ test("room-config admission is atomic at the deployed room ceiling and reopens a
   });
   assert.equal(replacement.status, 200);
   internals.resetRuntimeStateForTests();
+});
+
+test("runtime v2 config is exact, canonical, idempotent and monotonic", async () => {
+  internals.resetRuntimeStateForTests();
+  const hubSid = "runtime-config-room";
+  const operationId = randomUUID();
+  const approvedBots = {
+    enabled: true,
+    count: 1,
+    mobility: "static",
+    chat_enabled: false,
+    prompt: "",
+    future_contract: { z: 2, a: ["kept", { nested: true }] }
+  };
+  const request = runtimeConfigBody({
+    operationId,
+    hubSid,
+    runtimeRevision: 1,
+    bots: approvedBots
+  });
+  const expectedAck = {
+    protocol: runtimeProtocol,
+    operation_id: operationId,
+    hub_sid: hubSid,
+    runtime_revision: 1,
+    state: "applied"
+  };
+  const nestedContainers = count => {
+    let value = true;
+    for (let index = 0; index < count; index += 1) value = [value];
+    return value;
+  };
+
+  try {
+    assert.doesNotThrow(() => internals.parseRuntimeOperation(runtimeConfigBody({
+      hubSid: "depth-64-room",
+      runtimeRevision: 1,
+      bots: { depth: nestedContainers(63) }
+    }), "config"));
+    assert.throws(
+      () => internals.parseRuntimeOperation(runtimeConfigBody({
+        hubSid: "depth-65-room",
+        runtimeRevision: 1,
+        bots: { depth: nestedContainers(64) }
+      }), "config"),
+      /invalid_runtime_request/
+    );
+    assert.throws(
+      () => internals.parseRuntimeOperation(runtimeConfigBody({
+        hubSid: "unsafe-integer-room",
+        runtimeRevision: 1,
+        bots: { unsafe_integer: Number.MAX_SAFE_INTEGER + 1 }
+      }), "config"),
+      /invalid_runtime_request/
+    );
+    assert.doesNotThrow(() => internals.parseRuntimeOperation(runtimeConfigBody({
+      hubSid: "finite-number-room",
+      runtimeRevision: 1,
+      bots: {
+        finite_float: 1.5,
+        finite_subnormal: Number.MIN_VALUE,
+        largest_safe_integer: Number.MAX_SAFE_INTEGER
+      }
+    }), "config"));
+
+    const applied = await post("/internal/bots/room-config", request);
+    assert.equal(applied.status, 200);
+    assert.deepEqual(await applied.json(), expectedAck);
+
+    const reordered = runtimeConfigBody({
+      operationId,
+      hubSid,
+      runtimeRevision: 1,
+      bots: {
+        future_contract: { a: ["kept", { nested: true }], z: 2 },
+        prompt: "",
+        chat_enabled: false,
+        mobility: "static",
+        count: 1,
+        enabled: true
+      }
+    });
+    const retry = await post("/internal/bots/room-config", reordered);
+    assert.equal(retry.status, 200);
+    assert.deepEqual(await retry.json(), expectedAck);
+
+    const legacyStop = await post("/internal/bots/room-stop", { hub_sid: hubSid });
+    assert.equal(legacyStop.status, 202);
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 0);
+    const repairedRetry = await post("/internal/bots/room-config", reordered);
+    assert.equal(repairedRetry.status, 200);
+    assert.deepEqual(await repairedRetry.json(), expectedAck);
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 1);
+
+    const changedPayload = structuredClone(request);
+    changedPayload.bots.future_contract.z = 3;
+    assert.equal((await post("/internal/bots/room-config", changedPayload)).status, 409);
+
+    assert.equal(
+      (await post("/internal/bots/room-config", runtimeConfigBody({
+        hubSid,
+        runtimeRevision: 1,
+        bots: approvedBots
+      }))).status,
+      409
+    );
+    assert.equal(
+      (await post("/internal/bots/room-config", {
+        ...runtimeConfigBody({ hubSid: "uppercase-op-room", runtimeRevision: 1, bots: approvedBots }),
+        operation_id: randomUUID().toUpperCase()
+      })).status,
+      400
+    );
+    assert.equal(
+      (await post("/internal/bots/room-config", { ...request, extra: true })).status,
+      400
+    );
+    const missingRuntimeChatDecision = structuredClone(request);
+    delete missingRuntimeChatDecision.runtime_chat_enabled;
+    assert.equal((await post("/internal/bots/room-config", missingRuntimeChatDecision)).status, 400);
+    const mismatchedRuntimeChatDecision = structuredClone(request);
+    mismatchedRuntimeChatDecision.runtime_chat_enabled = true;
+    mismatchedRuntimeChatDecision.bots.chat_enabled = false;
+    assert.equal((await post("/internal/bots/room-config", mismatchedRuntimeChatDecision)).status, 400);
+    const disabledOperationId = randomUUID();
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: false
+    }));
+    const disabledRequest = runtimeConfigBody({
+      operationId: disabledOperationId,
+      hubSid: "runtime-disabled-room",
+      runtimeRevision: 1,
+      bots: {}
+    });
+    const disabled = await post("/internal/bots/room-config", disabledRequest);
+    assert.equal(disabled.status, 200);
+    assert.deepEqual(await disabled.json(), {
+      protocol: runtimeProtocol,
+      operation_id: disabledOperationId,
+      hub_sid: "runtime-disabled-room",
+      runtime_revision: 1,
+      state: "applied"
+    });
+    assert.equal(
+      (await post("/internal/bots/chat", {
+        hub_sid: "runtime-disabled-room",
+        bot_id: "bot-1",
+        requester_id: "runtime-user",
+        message: "hola"
+      })).status,
+      403
+    );
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: true
+    }));
+    assert.equal((await post("/internal/bots/room-config", disabledRequest)).status, 202);
+    internals.setRoomStopProofForTests(() => ({
+      terminal: false,
+      targetAbsent: false,
+      managedRoomPods: 1,
+      pendingCreate: false
+    }));
+    const disabledReappearance = await post("/internal/bots/room-config", disabledRequest);
+    assert.equal(disabledReappearance.status, 202);
+    assert.deepEqual(await disabledReappearance.json(), {
+      protocol: runtimeProtocol,
+      operation_id: disabledOperationId,
+      hub_sid: "runtime-disabled-room",
+      runtime_revision: 1,
+      state: "pending"
+    });
+    const missingProtocol = structuredClone(request);
+    delete missingProtocol.protocol;
+    missingProtocol.operation_id = randomUUID();
+    missingProtocol.hub_sid = "missing-protocol-room";
+    assert.equal((await post("/internal/bots/room-config", missingProtocol)).status, 400);
+    assert.equal(
+      (await post("/internal/bots/room-config", { hub_sid: hubSid, bots: approvedBots })).status,
+      409
+    );
+  } finally {
+    internals.resetRuntimeStateForTests();
+  }
+});
+
+test("runtime v2 persists Reticulum chat normalization and keeps the legacy bridge fail-closed", async () => {
+  internals.resetRuntimeStateForTests();
+  const hubSid = "runtime-legacy-normalization-room";
+  const legacyBots = {
+    enabled: "true",
+    count: "+1",
+    mobility: "static",
+    chat_enabled: 1.0,
+    prompt: ""
+  };
+  const snapshotBots = {
+    enabled: true,
+    count: 1,
+    mobility: "static",
+    chat_enabled: false,
+    prompt: ""
+  };
+
+  try {
+    for (const accepted of [true, "true", 1]) {
+      assert.equal(internals.normalizeConfig({ enabled: accepted }).enabled, true);
+    }
+    for (const rejected of [false, "false", "1", 0, 1.5, null, undefined, [], {}]) {
+      assert.equal(internals.normalizeConfig({ enabled: rejected }).enabled, false);
+    }
+    for (const accepted of [true, "true"]) {
+      assert.equal(internals.normalizeConfig({ chat_enabled: accepted }).chat_enabled, true);
+    }
+    for (const rejected of [false, "false", 0, 1, 1.0, 1.5, null, undefined, [], {}]) {
+      assert.equal(internals.normalizeConfig({ chat_enabled: rejected }).chat_enabled, false);
+    }
+
+    assert.deepEqual(internals.normalizeConfig(legacyBots), snapshotBots);
+    assert.equal(internals.normalizeConfig({ count: 0 }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: 1 }).count, 1);
+    assert.equal(internals.normalizeConfig({ count: 10 }).count, 10);
+    assert.equal(internals.normalizeConfig({ count: 11 }).count, 10);
+    assert.equal(internals.normalizeConfig({ count: -1 }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: "01" }).count, 1);
+    assert.equal(internals.normalizeConfig({ count: "-1" }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: "-0" }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: "1.0" }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: 1.5 }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: true }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: " 1" }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: "1e1" }).count, 0);
+    assert.equal(internals.normalizeConfig({ count: "9".repeat(64) }).count, 10);
+    assert.equal(internals.normalizeConfig({ count: "9".repeat(65) }).count, 0);
+
+    const operationId = randomUUID();
+    const request = runtimeConfigBody({
+      operationId,
+      hubSid,
+      runtimeRevision: 1,
+      bots: legacyBots,
+      runtimeChatEnabled: false
+    });
+    assert.equal(request.bots.chat_enabled, false);
+    assert.equal(request.runtime_chat_enabled, false);
+    const applied = await post("/internal/bots/room-config", request);
+    assert.equal(applied.status, 200);
+    assert.deepEqual(await applied.json(), {
+      protocol: runtimeProtocol,
+      operation_id: operationId,
+      hub_sid: hubSid,
+      runtime_revision: 1,
+      state: "applied"
+    });
+
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          hubs: [{ hub_sid: hubSid, runtime_revision: 1, bots: snapshotBots }]
+        })
+      })
+    });
+
+    const now = Date.now();
+    assert.equal(
+      internals.setRunnerStateForTests(
+        hubSid,
+        validAuthoritativeRunnerState(snapshotBots, now)
+      ),
+      true
+    );
+    assert.equal((await fetch(`${baseUrl}/ready`)).status, 200);
+
+    const chat = await post("/internal/bots/chat", {
+      hub_sid: hubSid,
+      bot_id: "bot-1",
+      requester_id: "runtime-legacy-user",
+      message: "hola"
+    });
+    assert.equal(chat.status, 403);
+    assert.deepEqual(await chat.json(), { error: "bot chat is disabled for this room" });
+
+    const legacyHubSid = "runtime-legacy-parent-bridge";
+    const legacyConfig = await post("/internal/bots/room-config", {
+      hub_sid: legacyHubSid,
+      bots: { enabled: true, count: 1, mobility: "static", chat_enabled: 1, prompt: "" }
+    });
+    assert.equal(legacyConfig.status, 200);
+    assert.equal((await legacyConfig.json()).bots.chat_enabled, false);
+    assert.equal(internals.seedReadyRoomForTests(legacyHubSid, {
+      enabled: true,
+      count: 1,
+      mobility: "static",
+      chat_enabled: 1,
+      prompt: ""
+    }), true);
+    const legacyChat = await post("/internal/bots/chat", {
+      hub_sid: legacyHubSid,
+      bot_id: "bot-1",
+      requester_id: "runtime-legacy-bridge-user",
+      message: "hola"
+    });
+    assert.equal(legacyChat.status, 403);
+    assert.deepEqual(await legacyChat.json(), { error: "bot chat is disabled for this room" });
+  } finally {
+    internals.resetRuntimeStateForTests();
+  }
+});
+
+test("runtime v2 state tracking is bounded and fails closed for a new room", () => {
+  internals.resetRuntimeStateForTests();
+  const bots = {
+    enabled: true,
+    count: 1,
+    mobility: "static",
+    chat_enabled: false,
+    prompt: ""
+  };
+
+  try {
+    for (let index = 0; index < internals.MAX_RUNTIME_TRACKED_ROOMS; index += 1) {
+      const parsed = internals.parseRuntimeOperation(runtimeConfigBody({
+        hubSid: `tracked-${index}`,
+        runtimeRevision: 1,
+        bots
+      }), "config");
+      internals.registerRuntimeOperation(parsed);
+    }
+    assert.throws(
+      () => internals.registerRuntimeOperation(
+        internals.parseRuntimeOperation(runtimeConfigBody({
+          hubSid: "tracked-overflow",
+          runtimeRevision: 1,
+          bots
+        }), "config")
+      ),
+      /runtime_state_capacity_exceeded/
+    );
+  } finally {
+    internals.resetRuntimeStateForTests();
+  }
+});
+
+test("runtime v2 stop stays pending until fresh absence proof and fences config and snapshots", async () => {
+  internals.resetRuntimeStateForTests();
+  const hubSid = "runtime-stop-room";
+  const configOperationId = randomUUID();
+  const stopOperationId = randomUUID();
+  const nextConfigOperationId = randomUUID();
+  const bots = {
+    enabled: true,
+    count: 1,
+    mobility: "static",
+    chat_enabled: false,
+    prompt: ""
+  };
+  const config = runtimeConfigBody({
+    operationId: configOperationId,
+    hubSid,
+    runtimeRevision: 1,
+    bots
+  });
+  const stop = runtimeStopBody({
+    operationId: stopOperationId,
+    hubSid,
+    runtimeRevision: 2,
+    revokeEpoch: 7
+  });
+  const nextConfig = runtimeConfigBody({
+    operationId: nextConfigOperationId,
+    hubSid,
+    runtimeRevision: 3,
+    bots
+  });
+  const expectedPendingStop = {
+    protocol: runtimeProtocol,
+    operation_id: stopOperationId,
+    hub_sid: hubSid,
+    runtime_revision: 2,
+    revoke_epoch: 7,
+    state: "pending"
+  };
+  const expectedStopped = {
+    ...expectedPendingStop,
+    state: "stopped",
+    target_absent: true,
+    managed_room_pods: 0
+  };
+  const target = {
+    name: "bot-runner-abcdef0123456789-deadbeef",
+    uid: "11111111-1111-4111-8111-111111111111"
+  };
+  const observedTargets = [];
+
+  try {
+    assert.equal((await post("/internal/bots/room-config", config)).status, 200);
+    const runner = validRunningGhostProcessState();
+    runner.process = {
+      ...runner.process,
+      name: target.name,
+      podUid: target.uid,
+      kill: () => true
+    };
+    assert.equal(internals.setRunnerStateForTests(hubSid, runner), true);
+    internals.setRoomStopProofForTests(record => {
+      observedTargets.push(Array.from(record.targets, ([name, uid]) => ({ name, uid })));
+      return { terminal: false, targetAbsent: false, managedRoomPods: 1, pendingCreate: false };
+    });
+
+    const pendingStop = await post("/internal/bots/room-stop", stop);
+    assert.equal(pendingStop.status, 202);
+    assert.deepEqual(await pendingStop.json(), expectedPendingStop);
+    assert.deepEqual(observedTargets.at(-1), [target]);
+
+    const blockedConfig = await post("/internal/bots/room-config", nextConfig);
+    assert.equal(blockedConfig.status, 202);
+    assert.deepEqual(await blockedConfig.json(), {
+      protocol: runtimeProtocol,
+      operation_id: nextConfigOperationId,
+      hub_sid: hubSid,
+      runtime_revision: 3,
+      state: "pending"
+    });
+
+    const laterStop = runtimeStopBody({
+      operationId: randomUUID(),
+      hubSid,
+      runtimeRevision: 4,
+      revokeEpoch: 9
+    });
+    const blockedLaterStop = await post("/internal/bots/room-stop", laterStop);
+    assert.equal(blockedLaterStop.status, 202);
+    assert.deepEqual(await blockedLaterStop.json(), {
+      protocol: runtimeProtocol,
+      operation_id: laterStop.operation_id,
+      hub_sid: hubSid,
+      runtime_revision: 4,
+      revoke_epoch: 9,
+      state: "pending"
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 0);
+
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ hubs: [{ hub_sid: hubSid, runtime_revision: 3, bots }] })
+      })
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 0);
+    assert.equal((await post("/internal/bots/room-config", { hub_sid: hubSid, bots })).status, 409);
+
+    const conflictingStop = structuredClone(stop);
+    conflictingStop.revoke_epoch = 8;
+    assert.equal((await post("/internal/bots/room-stop", conflictingStop)).status, 409);
+    assert.equal(
+      (await post("/internal/bots/room-config", runtimeConfigBody({
+        operationId: stopOperationId,
+        hubSid,
+        runtimeRevision: 2,
+        bots
+      }))).status,
+      409
+    );
+
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: true
+    }));
+    assert.equal((await post("/internal/bots/room-stop", stop)).status, 202);
+
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: false
+    }));
+    const stopped = await post("/internal/bots/room-stop", stop);
+    assert.equal(stopped.status, 200);
+    assert.deepEqual(await stopped.json(), expectedStopped);
+
+    const outOfOrderConfig = runtimeConfigBody({
+      operationId: randomUUID(),
+      hubSid,
+      runtimeRevision: 5,
+      bots
+    });
+    const blockedOutOfOrderConfig = await post("/internal/bots/room-config", outOfOrderConfig);
+    assert.equal(blockedOutOfOrderConfig.status, 202);
+    assert.deepEqual(await blockedOutOfOrderConfig.json(), {
+      protocol: runtimeProtocol,
+      operation_id: outOfOrderConfig.operation_id,
+      hub_sid: hubSid,
+      runtime_revision: 5,
+      state: "pending"
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 0);
+
+    internals.setRoomStopProofForTests(() => ({
+      terminal: false,
+      targetAbsent: false,
+      managedRoomPods: 1,
+      pendingCreate: false
+    }));
+    const reobserved = await post("/internal/bots/room-stop", stop);
+    assert.equal(reobserved.status, 202);
+    assert.deepEqual(await reobserved.json(), expectedPendingStop);
+
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: false
+    }));
+    assert.equal((await post("/internal/bots/room-stop", stop)).status, 200);
+
+    const appliedNext = await post("/internal/bots/room-config", nextConfig);
+    assert.equal(appliedNext.status, 200);
+    assert.deepEqual(await appliedNext.json(), {
+      protocol: runtimeProtocol,
+      operation_id: nextConfigOperationId,
+      hub_sid: hubSid,
+      runtime_revision: 3,
+      state: "applied"
+    });
+
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ hubs: [] }) })
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 1);
+
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          hubs: [{
+            hub_sid: hubSid,
+            runtime_revision: 2,
+            bots: { ...bots, chat_enabled: true }
+          }]
+        })
+      })
+    });
+    const staleChat = await post("/internal/bots/chat", {
+      hub_sid: hubSid,
+      bot_id: "bot-1",
+      requester_id: "runtime-user",
+      message: "hola"
+    });
+    assert.equal(staleChat.status, 403);
+  } finally {
+    internals.resetRuntimeStateForTests();
+  }
+});
+
+test("a versioned restart snapshot is not erased by an unversioned omission", async () => {
+  internals.resetRuntimeStateForTests();
+  const hubSid = "restart-snapshot-room";
+  const bots = {
+    enabled: true,
+    count: 1,
+    mobility: "static",
+    chat_enabled: false,
+    prompt: ""
+  };
+
+  try {
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ hubs: [{ hub_sid: hubSid, runtime_revision: 5, bots }] })
+      })
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 1);
+
+    await internals.syncActiveRoomsFromReticulum({
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ hubs: [] }) })
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 1);
+    assert.equal((await post("/internal/bots/room-config", { hub_sid: hubSid, bots })).status, 409);
+
+    internals.setRoomStopProofForTests(() => ({
+      terminal: true,
+      targetAbsent: true,
+      managedRoomPods: 0,
+      pendingCreate: false
+    }));
+    const stopOperationId = randomUUID();
+    const stopped = await post("/internal/bots/room-stop", runtimeStopBody({
+      operationId: stopOperationId,
+      hubSid,
+      runtimeRevision: 6,
+      revokeEpoch: 8
+    }));
+    assert.equal(stopped.status, 200);
+    assert.deepEqual(await stopped.json(), {
+      protocol: runtimeProtocol,
+      operation_id: stopOperationId,
+      hub_sid: hubSid,
+      runtime_revision: 6,
+      revoke_epoch: 8,
+      state: "stopped",
+      target_absent: true,
+      managed_room_pods: 0
+    });
+    assert.equal((await (await fetch(`${baseUrl}/health`)).json()).rooms, 0);
+  } finally {
+    internals.resetRuntimeStateForTests();
+  }
 });
 
 test("preserves static mobility and never emits navigation actions for static bots", async () => {
@@ -2551,6 +3224,7 @@ test("full snapshots validate atomically and malformed payloads preserve prior s
   internals.resetRuntimeStateForTests();
   const validRoom = {
     hub_sid: "room-existing",
+    runtime_revision: 1,
     bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
   };
 
@@ -2571,9 +3245,10 @@ test("full snapshots validate atomically and malformed payloads preserve prior s
                 hubs: [
                   {
                     hub_sid: "room-new",
+                    runtime_revision: 2,
                     bots: { enabled: true, count: 1, mobility: "medium", chat_enabled: false, prompt: "" }
                   },
-                  { hub_sid: "broken", bots: { enabled: true, count: "many" } }
+                  { hub_sid: "broken", runtime_revision: 2, bots: { enabled: true, count: "many" } }
                 ]
               }
             : { hubs: [] }
@@ -2594,6 +3269,7 @@ test("full snapshots validate atomically and malformed payloads preserve prior s
 test("configured-room snapshots are byte-bounded and reject more than ten rooms atomically", async () => {
   const room = index => ({
     hub_sid: `bounded-room-${index}`,
+    runtime_revision: 1,
     bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
   });
   assert.throws(
@@ -2662,10 +3338,12 @@ test("a newer POST supersedes an in-flight snapshot and coalesces one trailing f
   const finalRooms = [
     {
       hub_sid: "room-new-a",
+      runtime_revision: 1,
       bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
     },
     {
       hub_sid: "room-new-b",
+      runtime_revision: 1,
       bots: { enabled: true, count: 2, mobility: "medium", chat_enabled: false, prompt: "" }
     }
   ];
@@ -2720,6 +3398,7 @@ test("room-stop during an in-flight snapshot cannot be resurrected by the stale 
   internals.resetRuntimeStateForTests();
   const configured = {
     hub_sid: "room-to-stop",
+    runtime_revision: 1,
     bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
   };
   await internals.syncActiveRoomsFromReticulum({
@@ -2746,7 +3425,7 @@ test("room-stop during an in-flight snapshot cannot be resurrected by the stale 
   while (!resolveFirstJson) await new Promise(resolve => setImmediate(resolve));
 
   const stopped = await post("/internal/bots/room-stop", { hub_sid: "room-to-stop" });
-  assert.equal(stopped.status, 200);
+  assert.equal(stopped.status, 202);
   resolveFirstJson({ hubs: [configured] });
   await sync;
 
@@ -2761,6 +3440,7 @@ test("a fallback cannot overwrite a newer POST and readiness waits for the trail
   internals.resetRuntimeStateForTests();
   const room = {
     hub_sid: "fallback-race-room",
+    runtime_revision: 1,
     bots: { enabled: true, count: 3, mobility: "high", chat_enabled: false, prompt: "" }
   };
   let resolveFallbackJson;
@@ -2802,10 +3482,30 @@ test("a fallback cannot overwrite a newer POST and readiness waits for the trail
 
 test("room prompt validation uses the same Unicode codepoint and UTF-8 byte bounds", () => {
   const acceptedPrompt = "😀".repeat(1000);
+  assert.throws(
+    () => internals.parseRoomSnapshot({
+      hubs: [{
+        hub_sid: "missing-revision-room",
+        bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
+      }]
+    }),
+    /invalid_room_snapshot_entry/
+  );
+  assert.throws(
+    () => internals.parseRoomSnapshot({
+      hubs: [{
+        hub_sid: "unsafe-revision-room",
+        runtime_revision: Number.MAX_SAFE_INTEGER + 1,
+        bots: { enabled: true, count: 1, mobility: "static", chat_enabled: false, prompt: "" }
+      }]
+    }),
+    /invalid_room_snapshot_entry/
+  );
   const parsed = internals.parseRoomSnapshot({
     hubs: [
       {
         hub_sid: "unicode-room",
+        runtime_revision: 1,
         bots: {
           enabled: true,
           count: 1,
@@ -2823,6 +3523,7 @@ test("room prompt validation uses the same Unicode codepoint and UTF-8 byte boun
       hubs: [
         {
           hub_sid: "unicode-room",
+          runtime_revision: 1,
           bots: {
             enabled: true,
             count: 1,
