@@ -14,7 +14,8 @@ YenHubs:
   access, ephemeral-container and resize subresources while preserving status,
   binding and logs. The authenticated cutover journal makes the first
   process-local/clean transition crash-resumable without making a pre-AUD078
-  rollback ordinary or safe.
+  rollback ordinary or safe. Recovery-lock adoption is additionally bound to
+  the checkpoint journal-evidence hash and explicit runtime generation.
 - Tighten the YenHubs operator documentation: generated manifests remain
   immutable build output, cluster writes use the verified/redacted guarded apply
   path, and a valid checkpoint includes both PostgreSQL and Reticulum storage.

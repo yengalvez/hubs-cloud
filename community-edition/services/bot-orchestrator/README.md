@@ -277,6 +277,14 @@ ordinary fence-aware releases no longer need that private key, do not depend on
 the historical kube-context alias, and may change images and manifest hashes;
 the protected journal remains durable evidence of the first cutover.
 
+Every root recovery lock binds the exact checkpoint-evidence SHA-256 and an
+explicit `legacy-absent` or `durable-v2` runtime generation. That generation
+must agree with the pre-fence epoch, so a legacy checkpoint cannot be relabelled
+as a durable restore (or vice versa) while retaining the same database, storage
+or deployment-inventory hashes. Cloud's `restore-fence` consumer adopts only a
+`durable-v2` lock with a UUID pre-fence epoch; legacy in-place restoration stays
+entirely in the root workflow and never creates or adopts this control plane.
+
 The Cloud repository defines and tests the consumer contract only. The root
 producer must still be implemented: it must rerun
 `verify-redacted-rollout.mjs` over the private AUD-065 operation artifacts,

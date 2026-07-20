@@ -114,6 +114,8 @@ function recoveryLock(state = "restore-complete-awaiting-reactivation") {
         "yenhubs.org/pre-fence-epoch": sourceEpoch,
         "yenhubs.org/restore-fence-epoch": epoch,
         "yenhubs.org/deployment-inventory-sha256": "e".repeat(64),
+        "yenhubs.org/runner-cutover-evidence-sha256": "f".repeat(64),
+        "yenhubs.org/runner-runtime-generation": "durable-v2",
         "yenhubs.org/recovery-state": state
       }
     },
@@ -258,7 +260,7 @@ test("durable parent policy accepts current or staged target images across updat
   }), false, "pre-fence Deployment shape is never accepted as current protection");
 });
 
-test("recovery lock binds exact state, epoch, checkpoint inventory, namespace UID, and PVC UID", () => {
+test("recovery lock binds state, epoch, checkpoint inventory, journal evidence, generation, and storage identities", () => {
   const lock = recoveryLock();
   const options = { namespaceUid: "namespace-uid", pvcUid: "pvc-uid" };
   assert.equal(exactRecoveryOperationLock(
@@ -272,6 +274,8 @@ test("recovery lock binds exact state, epoch, checkpoint inventory, namespace UI
   for (const mutate of [
     value => { value.metadata.annotations["yenhubs.org/recovery-state"] = "restore-fence-prepared"; },
     value => { value.metadata.annotations["yenhubs.org/restore-fence-epoch"] = sourceEpoch; },
+    value => { value.metadata.annotations["yenhubs.org/runner-cutover-evidence-sha256"] = "invalid"; },
+    value => { value.metadata.annotations["yenhubs.org/runner-runtime-generation"] = "legacy-absent"; },
     value => { value.metadata.annotations["yenhubs.org/extra"] = "bypass"; },
     value => { value.metadata.labels["yenhubs.org/recovery-owner"] = "other"; },
     value => { value.immutable = false; },
@@ -324,6 +328,17 @@ test("recovery lock binds exact state, epoch, checkpoint inventory, namespace UI
     "restore-complete-awaiting-reactivation",
     { ...options, lockUid: "lock-uid", lockResourceVersion: "17" }
   ), false, "metadata mutation and restoration cannot cross the pinned RV boundary");
+
+  const legacy = recoveryLock();
+  legacy.metadata.annotations["yenhubs.org/pre-fence-epoch"] = "legacy-absent";
+  legacy.metadata.annotations["yenhubs.org/runner-runtime-generation"] = "legacy-absent";
+  assert.equal(exactRecoveryOperationLock(
+    legacy,
+    "hcce",
+    epoch,
+    "restore-complete-awaiting-reactivation",
+    options
+  ), false, "a legacy checkpoint cannot cross into the durable restore protocol");
 });
 
 test("recovery quiescence rejects old-ReplicaSet, standalone, and bot-SA consumer Pods", () => {

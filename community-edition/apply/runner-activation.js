@@ -616,6 +616,8 @@ function exactRecoveryOperationLock(
     "yenhubs.org/pre-fence-epoch",
     "yenhubs.org/restore-fence-epoch",
     "yenhubs.org/deployment-inventory-sha256",
+    "yenhubs.org/runner-cutover-evidence-sha256",
+    "yenhubs.org/runner-runtime-generation",
     "yenhubs.org/recovery-state"
   ];
   const exactKeys = value => value && typeof value === "object" && !Array.isArray(value) &&
@@ -623,6 +625,7 @@ function exactRecoveryOperationLock(
   const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const hash = /^[0-9a-f]{64}$/;
   const sourceEpoch = annotations?.["yenhubs.org/pre-fence-epoch"];
+  const runtimeGeneration = annotations?.["yenhubs.org/runner-runtime-generation"];
   return lock?.apiVersion === "v1" &&
     lock?.kind === "ConfigMap" &&
     lock?.metadata?.name === RECOVERY_LOCK_NAME &&
@@ -645,7 +648,9 @@ function exactRecoveryOperationLock(
     hash.test(annotations["yenhubs.org/dump-sha256"] || "") &&
     hash.test(annotations["yenhubs.org/storage-sha256"] || "") &&
     hash.test(annotations["yenhubs.org/deployment-inventory-sha256"] || "") &&
-    (sourceEpoch === "legacy-absent" || uuidV4.test(sourceEpoch || "")) &&
+    hash.test(annotations["yenhubs.org/runner-cutover-evidence-sha256"] || "") &&
+    runtimeGeneration === "durable-v2" &&
+    uuidV4.test(sourceEpoch || "") &&
     sourceEpoch !== recoveryEpoch &&
     annotations["yenhubs.org/restore-fence-epoch"] === recoveryEpoch &&
     annotations["yenhubs.org/recovery-state"] === expectedState &&

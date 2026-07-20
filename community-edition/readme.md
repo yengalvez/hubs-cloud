@@ -359,7 +359,8 @@ If you just need to get the external IP address of your load balancer, run
 > [!IMPORTANT]
 > A valid YenHubs checkpoint always contains both PostgreSQL metadata and the
 > Reticulum media bytes from `ret-pvc`, plus exact commits/image digests,
-> non-secret inventory and `SHA256SUMS`. From the YenHubs root, create it with
+> non-secret inventory, the generation-bound cutover-journal evidence and
+> `SHA256SUMS`. From the YenHubs root, create it with
 > `./deployment/create-checkpoint.sh` and validate the documented restore
 > dry-run before any production mutation. Follow
 > `deployment/client-instance-lifecycle.md` for freeze, restore or client
