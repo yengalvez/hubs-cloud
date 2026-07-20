@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const YAML = require("yaml");
-const { readActivationPlan } = require("./runner-activation");
+const { readActivationPlan, readActivationPlanText } = require("./runner-activation");
 const {
   verifyActivePlanAndConfig,
   verifyManifestAgainstInputValues
@@ -14,6 +14,10 @@ const {
 
 const communityEditionDir = path.resolve(__dirname, "..");
 const generatorPath = path.resolve(communityEditionDir, "generate_script/index.js");
+const generatedManifestVerifierPath = path.resolve(
+  communityEditionDir,
+  "generate_script/verify-generated-manifest.js"
+);
 const ciInput = YAML.parse(fs.readFileSync(
   path.resolve(communityEditionDir, "input-values.ci.yaml"),
   "utf8"
@@ -136,6 +140,47 @@ test("active plan guard rejects a stale manifest epoch versus config", t => {
   );
 });
 
+test("activation planning rejects scale and Pod-subresource bypasses of durable fences", t => {
+  const fixture = generatedFixture(t);
+  const resources = YAML.parseAllDocuments(fs.readFileSync(fixture.manifestPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const policy = resources.find(resource =>
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === "bot-orchestrator-fence-protocol.yenhubs.org"
+  );
+  assert.deepEqual(
+    policy.spec.matchConstraints.resourceRules[0].resources,
+    ["deployments", "deployments/scale"]
+  );
+  assert.equal(
+    policy.spec.validations.some(validation =>
+      validation.expression === "request.subResource != 'scale'"
+    ),
+    true
+  );
+  policy.spec.matchConstraints.resourceRules[0].resources = ["deployments"];
+  assert.throws(
+    () => readActivationPlanText(resources.map(resource => YAML.stringify(resource)).join("---\n")),
+    /generated_manifest_fence_aware_parent_contract_invalid/
+  );
+
+  policy.spec.matchConstraints.resourceRules[0].resources = ["deployments", "deployments/scale"];
+  const runnerPolicy = resources.find(resource =>
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === "bot-runner-durable-protocol.yenhubs.org"
+  );
+  assert.deepEqual(
+    runnerPolicy.spec.matchConstraints.resourceRules[0].resources,
+    ["pods", "pods/ephemeralcontainers", "pods/eviction", "pods/resize"]
+  );
+  runnerPolicy.spec.matchConstraints.resourceRules[0].resources = ["pods"];
+  assert.throws(
+    () => readActivationPlanText(resources.map(resource => YAML.stringify(resource)).join("---\n")),
+    /generated_manifest_fence_aware_parent_contract_invalid/
+  );
+});
+
 test("standalone entrypoint completes the values contract before any kubectl read", () => {
   const source = fs.readFileSync(
     path.resolve(__dirname, "verify-live-runner-control-plane.js"),
@@ -145,4 +190,41 @@ test("standalone entrypoint completes the values contract before any kubectl rea
   const kubectlIndex = source.indexOf('execFileSync("kubectl"');
   assert.ok(contractIndex >= 0 && contractIndex < kubectlIndex);
   assert.match(source, /const runnerAuthorityEnabled = true/);
+});
+
+test("apply verification and planning consume one immutable manifest byte snapshot", t => {
+  const fixture = generatedFixture(t);
+  const captured = fs.readFileSync(fixture.manifestPath);
+  const plan = readActivationPlanText(captured.toString("utf8"));
+  assert.equal(plan.activationPhase, "active");
+
+  fs.writeFileSync(fixture.manifestPath, "apiVersion: v1\nkind: ConfigMap\n", { mode: 0o600 });
+  const verifiedSnapshot = spawnSync(
+    process.execPath,
+    [generatedManifestVerifierPath, "--stdin"],
+    {
+      cwd: communityEditionDir,
+      env: { ...process.env, HCCE_MANIFEST_PATH: fixture.manifestPath },
+      input: captured,
+      encoding: "utf8"
+    }
+  );
+  assert.equal(verifiedSnapshot.status, 0, verifiedSnapshot.stderr);
+
+  const verifiedChangedPath = spawnSync(process.execPath, [generatedManifestVerifierPath], {
+    cwd: communityEditionDir,
+    env: { ...process.env, HCCE_MANIFEST_PATH: fixture.manifestPath },
+    encoding: "utf8"
+  });
+  assert.notEqual(verifiedChangedPath.status, 0);
+
+  const applySource = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  assert.match(applySource, /const manifestBytes = readFileSync\(manifestPath\)/);
+  assert.match(applySource, /const plan = readActivationPlanText\(manifestText\)/);
+  assert.match(applySource, /\[manifestVerifierPath, "--stdin"\]/);
+  assert.equal(
+    (applySource.match(/readFileSync\(manifestPath\)/g) || []).length,
+    1,
+    "the live manifest path is captured exactly once before any cluster action"
+  );
 });

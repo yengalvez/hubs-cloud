@@ -302,6 +302,7 @@ defmodule RetWeb.BotControllerTest do
       state: "approved",
       candidate_bots: bots,
       approved_bots: bots,
+      runtime_revision: 1,
       approved_by_account_id: account.account_id,
       approved_at: DateTime.utc_now()
     })

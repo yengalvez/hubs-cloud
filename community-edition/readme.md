@@ -44,10 +44,24 @@ Before applying the configuration file to your Kubernetes cluster, you will need
 
 To deploy to your K8s cluster on your chosen hosting solution, follow these steps:
 
+> [!IMPORTANT]
+> The YenHubs production profile does not permit direct edits to generated
+> `hcce.yaml`, raw `kubectl apply -f`, `kubectl set image`, manual workload
+> deletion, or ad-hoc scaling. Generate from the tracked source and private
+> input, run the tracked verifier, review the approved redacted diff without
+> exposing Secret bodies, and mutate the cluster only through `npm run apply`.
+> Runner-control-plane changes use freshly generated complete manifests in the
+> required `bootstrap -> admission -> active` order. The YenHubs root
+> `deployment/README.md` is authoritative for the exact rollout procedure.
+
 - In `input-values.yaml` edit `HUB_DOMAIN`, `ADM_EMAIL`, `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` and optionally `SKETCHFAB_API_KEY` with the values for your site. Change `NODE_COOKIE`, `GUARDIAN_KEY`, and `PHX_KEY` to unique random values. Configure four different random values of at least 32 characters for `BOT_ACCESS_KEY` (legacy integrations only), `BOT_RUNNER_ACCESS_KEY`, `BOT_ORCHESTRATOR_ACCESS_KEY`, and `DASHBOARD_ACCESS_KEY`; the generator rejects reuse between these trust domains.
 - Keep production values in the private `0600` input selected by `HCCE_INPUT_VALUES_PATH` (YenHubs uses `deployment/input-values.local.yaml`). Set both bot image overrides to accepted immutable digests, then run `npm run set-bot-image-pull-config` with `GHCR_USERNAME` and a hidden `GHCR_TOKEN` as documented in [`services/bot-orchestrator/README.md`](services/bot-orchestrator/README.md). The generated kubelet-only pull Secret is mandatory and the generator rejects empty or wrong-registry credentials.
 - Keep `GENERATE_PERSISTENT_VOLUMES: true` and set `PERSISTENT_VOLUME_STORAGE_CLASS` explicitly. Use `default` for the cluster default or an explicit dynamic storage class supported by the cluster. Retained `manual` hostPath volumes are test-only and require the additional explicit `ALLOW_MANUAL_HOSTPATH_STORAGE: true`; omission never falls back to node-local storage.
-- Run `npm run gen-hcce && npm run apply` to generate your configuration in `hcce.yaml` and apply it to your K8s cluster. From the output read your load balancer's external IP address.
+- Generic CE installations can run `npm run gen-hcce` and then the repository's
+  apply wrapper. YenHubs operators must additionally complete the verifier,
+  redacted-diff, checkpoint and phased-rollout gates described above before
+  running `npm run apply`. From the output read your load balancer's external IP
+  address.
 - Expose the services
   - On your DNS service, create four A-records to route your domains to the external IP address of your load balancer
     - <root_domain>
@@ -61,7 +75,10 @@ To deploy to your K8s cluster on your chosen hosting solution, follow these step
   - Option #2: use Hubs' certbotbot
     - run `npm run gen-ssl` to get an SSL certificate provisioned for your domains
       - If it fails with an error like `namespaces "hcce" not found`, it's probably because the namespace hasn't finished generating from your initial application of the hcce.yaml file, so try running it again in a few seconds.
-    - Search for and comment out the `--default-ssl-certificate` line in `hcce.yaml` and then reapply `hcce.yaml` to kubernetes using `npm run apply`
+    - Generic CE installations may need to adjust their tracked generator for
+      the selected certificate setup and regenerate. For YenHubs, never comment
+      out a line in generated `hcce.yaml`; change tracked generator/input state,
+      regenerate, verify, review the redacted diff and use `npm run apply`.
 
 
 ## Managing Kubernetes
@@ -89,19 +106,16 @@ While working with Community Edition and kubernetes you will likely need to perf
 - `kubectl get pvc -n hcce` - Used to list your persistent volume claims.
 - `kubectl describe pvc <pvc-name> -n hcce` - Used to get info on a persistent volume claim.
 
-### Action Commands
-- `kubectl apply -f hcce.yaml` - Used to apply your hcce.yaml config file to your kubernetes cluster.  This will update/create deployments and pods.
-- `kubectl rollout restart deployment -n hcce` - Used to gracefully restart your deployment.
-- `kubectl delete deployment --all -n hcce` - Used to delete all the services in your deployment.
-- `kubectl delete deployment/<servicename> -n hcce` - Used to delete a specific service in your deployment.
-- `kubectl delete pods --all -n hcce` - Used to delete all of your pods.
-- `kubectl delete pod <podname> -n hcce` Used to delete a specific pod.
-- `kubectl set image deployment/<servicename> <containername>=<dockerimage> -n hcce` - Used to set a docker image to one of your pods.  You will need to restart the deployment or delete the pod afterwards.
-  - Example: `kubectl set image deployment/hubs hubs=hubsfoundation/hubs:stable-latest -n hcce`
-- `kubectl scale deployments --all --replicas=0 -n hcce` - Used to scale down your kubernetes cluster, i.e. turn it off.
-- `kubectl scale deployments --all --replicas=1 -n hcce` - Used to scale up your kubernetes cluster, i.e. turn it on.
-> [!NOTE]
-> Turning your kubernetes cluster off and on again can sometimes fix things when they're acting weird, e.g. if Spoke is displaying failed to fetch errors when uploading files.
+### Mutating commands
+
+Generic CE operators must design mutation procedures for their own topology.
+For YenHubs, do not use raw apply, image replacement, workload deletion or
+manual scaling as a repair shortcut. Those operations can bypass the generated
+manifest verifier, the global operation Lease, the durable runner fences and the
+fail-closed activation checks. Regenerate the complete manifest and use the
+guarded `npm run apply` workflow. Use the tracked lifecycle and recovery
+runbooks for shutdown, restart, restore or client deletion; stop and report the
+exact failure if that workflow cannot converge.
 
 
 ### Graphical Clients
@@ -155,16 +169,39 @@ Dashboard administration has a fourth independent key and never falls back to
 any bot key. Generated manifests use an exact environment, mount and volume
 allowlist for the secret-bearing parent process.
 
-The source candidate now creates one ephemeral Kubernetes Pod per room and
-generation instead of starting Node children in the parent container. Each Pod
-uses the dedicated digest-pinned `bot-runner` image, UID/GID 10001, its own PID
-namespace and cgroup, explicit requests/limits, read-only root, drop-ALL
-capabilities, RuntimeDefault seccomp and a bounded `/tmp`. Its ServiceAccount
-has no token or RBAC. The parent has a namespaced Role limited to create,
-get/list and UID-preconditioned delete of Pods; because Kubernetes RBAC
-cannot constrain create/list by label, the manager additionally requires exact
-owner, managed-by, room-HMAC and generation labels and deletes every unknown or
-stale managed Pod fail-closed. Room SIDs do not appear in Pod names or labels.
+The source candidate uses a durable PostgreSQL outbox and a positive
+JavaScript-safe per-room `runtime_revision` to order bot config and stop events.
+Approval, quarantine, authority revocation and the corresponding immutable
+outbox event commit in one transaction. Recoverable claims retry in strict room
+order, and Reticulum accepts only the exact terminal acknowledgement; a timeout,
+legacy 2xx or accepted Kubernetes DELETE is not proof that a stop completed.
+Both the stored approved JSON and its normalized runtime projection are limited
+to 16,384 encoded bytes. A legacy row whose raw form fits but whose runtime
+projection does not is quarantined with
+`runtime_payload_too_large_migration`, fenced and delivered as a durable stop
+instead of being truncated or retried forever.
+
+For each room generation, the parent first creates an inert `unarmed` intent
+Pod. Only an exact UID/resourceVersion JSON-Patch transition to `armed`, followed
+by an exact read, authorizes one runner POST. A lost or ambiguous POST is resolved
+by installing a permanent, non-executable same-name fence before the intent is
+removed. Ordinary successful create/stop cycles do not consume permanent
+fences. The parent Role therefore has only the exact create/get/list/patch and
+UID-preconditioned delete operations needed by this protocol. Runner, intent
+and fence shapes are constrained by admission; malformed or incomplete
+inventory fails closed. Room SIDs do not appear in Pod names or labels.
+
+Each executable Pod still uses the dedicated digest-pinned `bot-runner` image,
+UID/GID 10001, its own PID namespace and cgroup, explicit requests/limits,
+read-only root, drop-ALL capabilities, RuntimeDefault seccomp and a bounded
+`/tmp`. Its ServiceAccount has no token or RBAC. Guards use a separate no-token
+ServiceAccount, an impossible scheduler and a scheduling gate. Executable and
+guard Pods have separate quotas; new starts stop before the guard quota is
+exhausted so recovery retains reserved fence capacity. Permanent fences have no
+TTL and are never deleted by ordinary start, stop, update or rollback. Both
+runner admission policies also deny Pod eviction, exec/attach/port-forward/proxy,
+ephemeral-container injection and in-place resize subresources; status, binding
+and logs remain available to the Kubernetes system and operators.
 
 Runner ingress is denied. Egress is limited to kube-dns, the parent control
 service, and public TCP 443 needed for the Hubs/scene endpoints. The
@@ -172,17 +209,66 @@ runner polls an authenticated parent endpoint for exact configuration and
 posts generation-bound readiness status; three consecutive control failures
 terminate it. A readiness file is exposed only after authenticated Reticulum
 presence, exact config ACKs, required navmesh and authoritative bot spawn ACKs.
-The parent reconciles on startup and every five seconds, deletes orphaned Pods
-with UID preconditions, enforces the existing room ceiling, and rotates a Pod
-when its one-hour credential/active deadline expires. This source separation is
-implemented and tested but is not operationally complete until both bot images
-are built, digest-pinned, generated into a staging manifest and accepted live.
+The parent reconciles on startup and every five seconds, fences ambiguous
+creates, deletes executable or disposable orphaned Pods with UID preconditions,
+enforces the existing room ceiling, and rotates a runner when its one-hour
+credential/active deadline expires. The first transition from `process-local`
+or a clean install is guarded by an authenticated, crash-resumable cutover
+journal and separately protected admission policies before the parent
+Deployment can change. The journal and permanent fences survive ordinary
+updates. The parent policy also matches `deployments/scale` and rejects that
+subresource outright, so `kubectl scale`, an HPA or another scale client cannot
+bypass the complete guarded manifest or create a second authoritative parent.
+
+For YenHubs, the journal ConfigMap has a permanent protection finalizer and its
+admission policy denies direct deletion and ConfigMap `DeleteCollection`,
+including the collection deletion used while purging a Namespace. A request to
+delete that Namespace therefore remains `Terminating` by design. This is not a
+stuck-resource repair signal and must never trigger manual finalizer removal or
+an ordinary rollback. The separately reviewed break-glass order is documented
+only in `services/bot-orchestrator/README.md`.
+
 There is intentionally no mixed legacy/generation authority window: old
 process-local runners cannot authenticate to this Reticulum, and new runners
-cannot authenticate to older Reticulum. Rollout and rollback therefore require
-an explicit stopped-runner maintenance boundary and verification of zero runner
-authority before changing either side. A mixed version is an expected
-fail-closed incompatibility, never a reason to bypass authentication.
+cannot authenticate to older Reticulum. After the durable cutover is installed,
+an ordinary rollback may target only a fence-aware parent/runner digest that
+preserves the journal, durable admission policies, protocol markers and
+permanent fences. Returning to a pre-AUD078/process-local parent is a separate
+break-glass campaign requiring independent proof that no current or older
+control plane retains runner CREATE authority; it is never an ordinary
+rollback. A mixed version is an expected fail-closed incompatibility, never a
+reason to bypass authentication.
+
+This is still source-candidate behavior. It is not operationally complete until
+Reticulum, parent and runner are built from the accepted same commit, pinned by
+digest, generated through all three phases and accepted live. This change does
+not claim that those images were built or that any cluster or production state
+was mutated.
+
+#### AUD078 preservation contract for future updates
+
+YenHubs continues to use stable Hubs CE release `2.1.0` as its accepted upstream
+baseline. AUD078 is a local compatibility surface, not a dependency or upstream
+upgrade. A future stable release must be evaluated in its own branch and must
+preserve or explicitly migrate all of these contracts:
+
+- `bot_config_approvals.runtime_revision`, the immutable
+  `bot_runtime_outbox`, exact JSON typing/size bounds and PostgreSQL 12/14
+  migration/down guards;
+- runtime protocol `yenhubs-bot-runtime-v2`, exact terminal config/stop ACKs,
+  per-room snapshot ordering and provider-neutral privacy behavior;
+- intent/fence Pod shapes, UID/resourceVersion CAS, dedicated quotas and RBAC,
+  and all runner, parent-fence and cutover-journal admission policies;
+- the authenticated first-cutover journal, generated-manifest verifier, global
+  operation Lease and `bootstrap -> admission -> active` recovery path.
+
+Run the Reticulum migration verifier on PostgreSQL 12 and 14 plus the complete
+Reticulum, bot-orchestrator, apply and generator suites before accepting such an
+update. Revalidate navmesh extraction/routing, isolated runner startup, terminal
+stop/restart recovery, privacy, sitting and cold-browser behavior after any
+Hubs, Spoke, Three.js, networked-aframe or Hubs CE change. Do not combine that
+upstream update or a broad dependency modernization with an AUD078 feature or
+production rollout.
 
 Authenticated bot chat is private to the requesting browser and requires an
 exact random capability for that Phoenix channel and account in the same room.
@@ -223,10 +309,10 @@ and state-version semantics so rollout tooling can negotiate the server/client
 pair before enabling the Hubs client.
 
 Do not edit generated `hcce.yaml`. Change the tracked generator or the private
-input values, regenerate, inspect `kubectl diff`, and apply the generated
-manifest through the approved deployment procedure. The verifier rejects
-untracked containers, environment variables, mounts, RBAC and storage
-resources.
+input values, regenerate, run the tracked verifier, review the approved
+redacted diff without emitting Secret bodies, and apply the generated manifest
+through the guarded `npm run apply` procedure. The verifier rejects untracked
+containers, environment variables, mounts, RBAC and storage resources.
 
 #### Updating an active bot-runner control plane
 
@@ -244,17 +330,25 @@ private input selected by `HCCE_INPUT_VALUES_PATH` to regenerate, verify and
 apply these three phases in order:
 
 1. Set `BOT_RUNNER_ACTIVATION_PHASE: bootstrap`, run
-   `npm run gen-hcce`, inspect `kubectl diff`, then run `npm run apply`.
-2. Set `BOT_RUNNER_ACTIVATION_PHASE: admission`, regenerate, inspect the diff
-   and apply again. This phase proves the admission denial before authority is
-   considered usable.
-3. Set `BOT_RUNNER_ACTIVATION_PHASE: active`, regenerate, inspect the diff and
-   apply once more. Completion requires exact live resources, effective RBAC,
-   admission denial and ready Deployments.
+   `npm run gen-hcce`, verify, review the approved redacted diff, then run
+   `npm run apply`.
+2. Set `BOT_RUNNER_ACTIVATION_PHASE: admission`, regenerate, verify, review the
+   redacted diff and apply again. This phase proves the admission denial before
+   authority is considered usable.
+3. Set `BOT_RUNNER_ACTIVATION_PHASE: active`, regenerate, verify, review the
+   redacted diff and apply once more. Completion requires exact live resources,
+   effective RBAC, admission denial and ready Deployments.
 
 The stopped state intentionally retains the live `active` phase annotations so
 the next generated `bootstrap` manifest is the only supported staged recovery
 path. A repeated `active` apply will remain fail-closed.
+
+An ordinary rollback follows the same guarded phases and may use only a
+fence-aware parent/runner release that preserves the durable journal, admission
+policies, protocol markers and permanent fences. A pre-AUD078 image is not a
+normal rollback target. Removing those protections or retiring an old runner
+namespace requires a separately reviewed break-glass or namespace-epoch
+campaign after proving all older runner CREATE authority is gone.
 
 If you just need to get the external IP address of your load balancer, run
 
@@ -262,12 +356,28 @@ If you just need to get the external IP address of your load balancer, run
 
 ### Backing up and restoring your instance
 
-Use `npm run backup` to back up your instance.  The backup will be timestamped and placed in a `data_backups` folder.
+> [!IMPORTANT]
+> A valid YenHubs checkpoint always contains both PostgreSQL metadata and the
+> Reticulum media bytes from `ret-pvc`, plus exact commits/image digests,
+> non-secret inventory, the generation-bound cutover-journal evidence and
+> `SHA256SUMS`. From the YenHubs root, create it with
+> `./deployment/create-checkpoint.sh` and validate the documented restore
+> dry-run before any production mutation. Follow
+> `deployment/client-instance-lifecycle.md` for freeze, restore or client
+> deletion. A DB-only or storage-only archive cannot authorize a YenHubs
+> rollback.
 
-Use `npm run restore-backup data_backup_1234567890123` to restore a backup to your instance.  If you don't specify a backup, and just use `npm run restore-backup`, it will default to the latest backup.
-The `hcce.yaml` file in the `community-edition` directory must match your instance.
+For generic CE installations, `npm run backup` creates a timestamped archive in
+`data_backups`.
 
-If you run an external database instead of the `pgsql` pod, the scripts will only back up and restore the reticulum files.
+Generic CE installations can use
+`npm run restore-backup data_backup_1234567890123`; without an argument it uses
+the latest archive. The generated configuration must match that installation.
+This generic path is not the YenHubs coordinated restore workflow.
+
+If a generic CE installation uses an external database instead of the `pgsql`
+Pod, these npm scripts back up and restore only Reticulum files. That partial
+result is explicitly not a valid YenHubs checkpoint.
 
 ## Guides from the Hubs Team and Community
 

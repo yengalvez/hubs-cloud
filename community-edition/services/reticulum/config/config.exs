@@ -6,6 +6,14 @@ config :ret,
   ecto_repos: [Ret.Repo, Ret.SessionLockRepo],
   max_active_bot_rooms: 5
 
+config :ret, Ret.BotRuntimeOutboxDispatcher,
+  enabled: true,
+  poll_interval_ms: 250,
+  error_interval_ms: 1_000,
+  claim_ttl_seconds: 30,
+  retry_base_seconds: 1,
+  retry_max_seconds: 60
+
 config :phoenix, :format_encoders, "json-api": Jason
 config :phoenix, :json_library, Jason
 

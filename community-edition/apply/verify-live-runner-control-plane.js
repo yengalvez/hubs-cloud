@@ -4,6 +4,12 @@ const {
   collectLiveRunnerControlPlane,
   verifyLiveRunnerControlPlane
 } = require("./live-runner-control-plane");
+const {
+  CUTOVER_JOURNAL_NAME,
+  liveObjectIsUnencumbered,
+  parseStructurallyExactCutoverJournalConfigMap
+} = require("./cutover-journal");
+const { activeCutoverNamespace } = require("./process-local-cutover");
 const { verifyManifestAgainstInputValues } = require("./manifest-input-contract");
 const {
   effectiveRbacReviewSpecs,
@@ -19,6 +25,38 @@ function requiredEnvironmentPath(name) {
     throw new Error("required_path_missing");
   }
   return path.resolve(value);
+}
+
+function verifyDurableCutoverJournalLiveEvidence({
+  namespace,
+  liveNamespace,
+  journalConfigMap,
+  liveParentDeployment
+}) {
+  if (!activeCutoverNamespace(liveNamespace, namespace)) {
+    return ["parent Namespace must be exact and Active for durable runner cutover"];
+  }
+  try {
+    const journal = parseStructurallyExactCutoverJournalConfigMap(journalConfigMap, {
+      namespace,
+      namespaceUid: liveNamespace.metadata.uid,
+      allowFutureIssuedAt: true
+    });
+    if (
+      liveParentDeployment?.apiVersion !== "apps/v1" ||
+      liveParentDeployment?.kind !== "Deployment" ||
+      liveParentDeployment?.metadata?.namespace !== namespace ||
+      liveParentDeployment?.metadata?.name !== "bot-orchestrator" ||
+      !liveObjectIsUnencumbered(liveParentDeployment) ||
+      (journal.mode === "pristine-cutover" &&
+        liveParentDeployment.metadata.uid !== journal.baselineDeployment.uid)
+    ) {
+      return ["parent Deployment must preserve the durable first-cutover identity"];
+    }
+  } catch (_error) {
+    return ["first-cutover journal must be canonical, protected and bound to the live Namespace UID"];
+  }
+  return [];
 }
 
 function main() {
@@ -56,6 +94,19 @@ function main() {
   ));
   const liveResources = collectLiveRunnerControlPlane(kubectlJson, namespace);
   const errors = verifyLiveRunnerControlPlane(liveResources, plan.resources, namespace);
+  const liveNamespace = kubectlJson(["get", "namespace", namespace, "-o", "json"]);
+  const journalConfigMap = kubectlJson([
+    "-n", namespace, "get", "configmap", CUTOVER_JOURNAL_NAME, "-o", "json"
+  ]);
+  const liveParentDeployment = kubectlJson([
+    "-n", namespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ]);
+  errors.push(...verifyDurableCutoverJournalLiveEvidence({
+    namespace,
+    liveNamespace,
+    journalConfigMap,
+    liveParentDeployment
+  }));
   const runnerAuthorityEnabled = true;
   const reviews = new Map();
   for (const spec of effectiveRbacReviewSpecs(namespace, runnerAuthorityEnabled)) {
@@ -83,9 +134,13 @@ function main() {
   process.stdout.write("runner_live_control_plane_verified\n");
 }
 
-try {
-  main();
-} catch (_error) {
-  process.stderr.write("runner_live_control_plane_verification_failed\n");
-  process.exitCode = 1;
+if (require.main === module) {
+  try {
+    main();
+  } catch (_error) {
+    process.stderr.write("runner_live_control_plane_verification_failed\n");
+    process.exitCode = 1;
+  }
 }
+
+module.exports = { main, verifyDurableCutoverJournalLiveEvidence };

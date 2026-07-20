@@ -1,6 +1,10 @@
 const RUNNER_NAMESPACE = "hcce-bot-runners";
 const {
+  exactGuardRecordFromPod
+} = require("../services/bot-orchestrator/kubernetes-runner-manager");
+const {
   podIsRecoveryConsumer,
+  podIsBotOrchestratorParent,
   replicaSetIsRecoveryConsumer,
   replicaSetIsStopped
 } = require("./runner-activation");
@@ -9,12 +13,23 @@ function forbiddenPod(
   namespace,
   parentNamespace,
   pod,
-  { includeRecoveryConsumers = false, recoveryConsumerReplicaSets = [] } = {}
+  {
+    includeRecoveryConsumers = false,
+    recoveryConsumerReplicaSets = [],
+    eventType = null
+  } = {}
 ) {
   if (!pod || typeof pod !== "object") return true;
-  if (namespace === RUNNER_NAMESPACE) return true;
+  if (namespace === RUNNER_NAMESPACE) {
+    try {
+      exactGuardRecordFromPod(pod, "fence", RUNNER_NAMESPACE);
+      return eventType === "DELETED";
+    } catch (_error) {
+      return true;
+    }
+  }
   return namespace === parentNamespace && (
-    pod?.spec?.serviceAccountName === "bot-orchestrator" ||
+    podIsBotOrchestratorParent(pod) ||
     pod?.metadata?.labels?.app === "bot-runner" ||
     pod?.metadata?.labels?.component === "bot-runner" ||
     pod?.metadata?.labels?.["yenhubs.org/managed-by"] === "bot-orchestrator" ||
@@ -146,7 +161,8 @@ class PodWatchEvidence {
       ["ADDED", "MODIFIED", "DELETED"].includes(event.type) &&
       forbiddenPod(this.namespace, this.parentNamespace, event.object, {
         includeRecoveryConsumers: this.includeRecoveryConsumers,
-        recoveryConsumerReplicaSets: this.recoveryConsumerReplicaSets
+        recoveryConsumerReplicaSets: this.recoveryConsumerReplicaSets,
+        eventType: event.type
       })
     ) {
       this.violation = true;

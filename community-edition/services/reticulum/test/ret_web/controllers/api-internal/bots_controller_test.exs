@@ -1,9 +1,10 @@
 defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
   use RetWeb.ConnCase
 
+  import Ecto.Query
   import Ret.TestHelpers
 
-  alias Ret.{BotConfigApproval, Repo}
+  alias Ret.{BotConfigAdmission, BotConfigApproval, BotRuntimeOutbox, Repo}
 
   @bot_runner_access_header "x-ret-bot-orchestrator-access-key"
   @bot_runner_access_key "test-bot-orchestrator-access-key-32bytes"
@@ -65,6 +66,90 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
            |> put_req_header(@bot_runner_access_header, @bot_runner_access_key)
            |> get("/api-internal/v1/hubs/configured_with_bots")
            |> json_response(200) == %{"hubs" => []}
+  end
+
+  test "snapshot rejects an integer-to-float drift in an otherwise active config", %{
+    conn: conn,
+    hub: hub
+  } do
+    bots = %{
+      "enabled" => true,
+      "count" => 1,
+      "mobility" => "static",
+      "chat_enabled" => false,
+      "prompt" => "",
+      "future_number" => 1
+    }
+
+    hub =
+      hub
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.force_change(:user_data, %{"bots" => bots})
+      |> Repo.update!()
+
+    approve_config!(hub)
+
+    assert [%{"hub_sid" => hub_sid, "runtime_revision" => 1}] = snapshot(conn)["hubs"]
+    assert hub_sid == hub.hub_sid
+
+    drifted_user_data = put_in(hub.user_data, ["bots", "future_number"], 1.0)
+
+    drifted_hub =
+      hub
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.force_change(:user_data, drifted_user_data)
+      |> Repo.update!()
+
+    assert drifted_hub.user_data["bots"]["future_number"] === 1.0
+    assert snapshot(conn) == %{"hubs" => []}
+  end
+
+  test "snapshot exposes runtime_revision only after its event and every earlier stop are terminal",
+       %{
+         conn: conn,
+         hub: hub
+       } do
+    admin = create_account("snapshot-runtime-admin-#{System.unique_integer([:positive])}", true)
+
+    {:ok, configured_hub} =
+      hub
+      |> Ecto.Changeset.change(%{
+        user_data: %{
+          "bots" => %{
+            "enabled" => true,
+            "count" => 1,
+            "mobility" => "static",
+            "chat_enabled" => false,
+            "prompt" => ""
+          }
+        }
+      })
+      |> BotConfigAdmission.update(admin)
+
+    assert snapshot(conn) == %{"hubs" => []}
+
+    mark_delivered!(configured_hub.hub_id, 1)
+
+    assert [%{"hub_sid" => hub_sid, "runtime_revision" => 1}] = snapshot(conn)["hubs"]
+    assert hub_sid == configured_hub.hub_sid
+
+    assert {:ok, _quarantined_hub} =
+             BotConfigApproval.quarantine(configured_hub.hub_sid, admin)
+
+    approval = Repo.get!(BotConfigApproval, configured_hub.hub_id)
+    assert {:ok, fingerprint} = BotConfigApproval.fingerprint(approval.candidate_bots)
+
+    assert {:ok, _approved_hub} =
+             BotConfigApproval.approve_candidate(configured_hub.hub_sid, fingerprint, admin)
+
+    # Even an impossible out-of-order completion of config revision 3 must not
+    # let polling overtake the still-pending terminal stop revision 2.
+    mark_delivered!(configured_hub.hub_id, 3)
+    assert snapshot(conn) == %{"hubs" => []}
+
+    mark_delivered!(configured_hub.hub_id, 2)
+
+    assert [%{"hub_sid" => ^hub_sid, "runtime_revision" => 3}] = snapshot(conn)["hubs"]
   end
 
   test "configured bot discovery tolerates malformed legacy JSON without unsafe casts", %{
@@ -415,8 +500,29 @@ defmodule RetWeb.ApiInternal.V1.BotsControllerTest do
       state: "approved",
       candidate_bots: bots,
       approved_bots: bots,
+      runtime_revision: 1,
       approved_by_account_id: 1,
       approved_at: now
     })
+  end
+
+  defp snapshot(conn) do
+    conn
+    |> recycle()
+    |> put_req_header(@bot_runner_access_header, @bot_runner_access_key)
+    |> get("/api-internal/v1/hubs/configured_with_bots")
+    |> json_response(200)
+  end
+
+  defp mark_delivered!(hub_id, runtime_revision) do
+    now = DateTime.utc_now()
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(o in BotRuntimeOutbox,
+                 where: o.hub_id == ^hub_id and o.runtime_revision == ^runtime_revision
+               ),
+               set: [delivered_at: now, updated_at: now]
+             )
   end
 end

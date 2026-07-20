@@ -1,8 +1,42 @@
 const { execFileSync, spawn, spawnSync } = require("node:child_process");
-const { randomUUID } = require("node:crypto");
+const { createHash, randomUUID } = require("node:crypto");
+const { readFileSync } = require("node:fs");
 const path = require("node:path");
+const { isDeepStrictEqual } = require("node:util");
 const utils = require("../utils");
-const { KubernetesRunnerManager } = require("../services/bot-orchestrator/kubernetes-runner-manager");
+const {
+  KubernetesRunnerManager,
+  requireCompletePodList
+} = require("../services/bot-orchestrator/kubernetes-runner-manager");
+const {
+  completeRunnerNamespaceInventory,
+  reconcileRunnerNamespace
+} = require("./runner-guard-reconciliation");
+const {
+  canonicalJson,
+  activeCutoverNamespace,
+  executeCutoverPreflight,
+  executeCutoverRevalidation,
+  readPrivateCutoverAttestation,
+  readPrivateCutoverKey,
+  verifyCleanInstallCutoverGate,
+  verifyJournalCutoverIsolationGate,
+  verifyPristineLegacyCutoverGate
+} = require("./process-local-cutover");
+const {
+  CUTOVER_JOURNAL_NAME,
+  advanceCutoverJournalTransition,
+  classifyCutoverJournalPrefix,
+  createCutoverJournal,
+  cutoverJournalConfigMap,
+  liveDeploymentMatchesJournalTarget,
+  liveDeploymentMatchesNormalizedTarget,
+  liveObjectIsUnencumbered,
+  liveResourceMatchesTarget,
+  parseExactCutoverJournalConfigMap,
+  parseStructurallyExactCutoverJournalConfigMap,
+  sha256Canonical
+} = require("./cutover-journal");
 const {
   collectLiveRunnerControlPlane,
   verifyLiveRunnerControlPlane
@@ -27,6 +61,9 @@ const {
 } = require("./effective-rbac");
 const {
   ADMISSION_POLICY_NAME,
+  CUTOVER_JOURNAL_POLICY_NAME,
+  PARENT_FENCE_POLICY_NAME,
+  RUNNER_PROTOCOL_POLICY_NAME,
   RECOVERY_CONSUMERS,
   RECOVERY_EPOCH_ANNOTATION,
   RECOVERY_LOCK_NAME,
@@ -36,23 +73,30 @@ const {
   applyResourcesSequentially,
   decideApplyMode,
   exactAdmissionBinding,
+  exactCutoverJournalBinding,
+  exactParentFenceBinding,
+  exactRunnerProtocolBinding,
   exactDeploymentDesiredState,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
+  parentFencePolicyProtectsLiveOrTarget,
   parentIsQuiesced,
-  readActivationPlan,
   recoveryConsumerReplicaSets,
   recoveryConsumerReplicaSetsAreStopped,
   recoveryConsumersAreQuiesced,
   retryBestEffortFenceAttempt,
+  readActivationPlanText,
   runBestEffortFenceSteps,
   uniqueRunnerPods
 } = require("./runner-activation");
 
 const manifestPath = path.resolve(process.env.HCCE_MANIFEST_PATH || "hcce.yaml");
+const manifestBytes = readFileSync(manifestPath);
+const manifestText = manifestBytes.toString("utf8");
+const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
 const config = utils.readConfig(process.env.HCCE_INPUT_VALUES_PATH);
 const parentNamespace = config.Namespace;
-const plan = readActivationPlan(manifestPath);
+const plan = readActivationPlanText(manifestText);
 const waitTimeoutMs = 180_000;
 const kubectlReadTimeoutMs = 30_000;
 const kubectlContext = String(process.env.KUBECTL_CONTEXT || "");
@@ -61,6 +105,14 @@ const manifestVerifierPath = path.resolve(__dirname, "../generate_script/verify-
 let operationLeaseGuard = null;
 let failClosedRefenceRequired = false;
 let recoveryLockIdentityGuard = null;
+let pristineLegacyCutoverRequired = false;
+let cutoverPreflightClassification = null;
+let cutoverNamespaceUid = null;
+let cutoverFenceEvidence = null;
+let cutoverKey = null;
+let cutoverAttestation = null;
+let cutoverBaselineEvidence = null;
+let cutoverJournal = null;
 
 function requirePinnedKubectlContext() {
   if (!kubectlContext || kubectlContext !== kubectlContext.trim() || /[\u0000-\u001f\u007f]/u.test(kubectlContext)) {
@@ -82,8 +134,12 @@ function requestedCommandMode(argv) {
 function verifyManifestBeforeClusterMutation() {
   const result = spawnSync(
     process.execPath,
-    [manifestVerifierPath],
-    { stdio: "inherit", timeout: MUTATION_TIMEOUT_MS }
+    [manifestVerifierPath, "--stdin"],
+    {
+      input: manifestBytes,
+      stdio: ["pipe", "inherit", "inherit"],
+      timeout: MUTATION_TIMEOUT_MS
+    }
   );
   if (result.status !== 0) throw new Error(`generated_manifest_verification_failed:${result.status}`);
 }
@@ -221,6 +277,22 @@ function kubectlOptionalJson(args) {
   });
 }
 
+function kubectlAbsentOnlyJson(args, identity) {
+  return runLeaseGuardedRead(() => {
+    const result = spawnSync(
+      "kubectl",
+      contextArgs(args),
+      { encoding: "utf8", timeout: kubectlReadTimeoutMs }
+    );
+    if (result.status === 0) return JSON.parse(result.stdout);
+    const diagnostic = `${result.stdout || ""}\n${result.stderr || ""}`;
+    if (result.status === 1 && /\(NotFound\)|"reason"\s*:\s*"NotFound"/u.test(diagnostic)) {
+      return null;
+    }
+    throw new Error(`kubectl_absence_read_failed:${identity}:${result.status}`);
+  });
+}
+
 function foundationalNamespaceResource() {
   const resource = plan.resources.find(value =>
     value?.apiVersion === "v1" &&
@@ -248,7 +320,7 @@ async function ensureFoundationalNamespaceForLease() {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       live = kubectlOptionalJson(["get", "namespace", parentNamespace, "-o", "json"]);
-      if (exactFoundationalNamespace(live, expected)) return;
+      if (exactFoundationalNamespace(live, expected)) return live;
       await sleep(250);
     }
     throw new Error("foundational_namespace_not_exact_or_active");
@@ -261,6 +333,7 @@ async function ensureFoundationalNamespaceForLease() {
   if (!exactFoundationalNamespace(live, identityOnly)) {
     throw new Error("existing_parent_namespace_not_active");
   }
+  return live;
 }
 
 function sleep(milliseconds) {
@@ -314,7 +387,603 @@ function liveAdmissionIsObserved() {
   const binding = kubectlJson([
     "get", "validatingadmissionpolicybinding", ADMISSION_POLICY_NAME, "-o", "json"
   ]);
-  return admissionPolicyIsObserved(policy) && exactAdmissionBinding(binding);
+  return admissionPolicyIsObserved(policy) &&
+    exactAdmissionBinding(binding) &&
+    liveRunnerProtocolAdmissionIsObserved() &&
+    liveCutoverJournalAdmissionIsObserved() &&
+    liveParentFenceAdmissionIsObserved();
+}
+
+function recoveryAdmissionPolicy() {
+  const policy = structuredClone(plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === ADMISSION_POLICY_NAME
+  ));
+  if (!policy) throw new Error("generated_manifest_runner_admission_policy_missing");
+  const variables = new Map((policy.spec?.variables || []).map(variable => [variable?.name, variable]));
+  const activation = variables.get("activationPhase");
+  const recovery = variables.get("recoveryPhase");
+  if (!activation || !recovery) throw new Error("generated_manifest_runner_recovery_variables_missing");
+  activation.expression = "'bootstrap'";
+  recovery.expression = "'active'";
+  return policy;
+}
+
+function liveRecoveryAdmissionIsObserved() {
+  const policy = kubectlJson([
+    "get", "validatingadmissionpolicy", ADMISSION_POLICY_NAME, "-o", "json"
+  ]);
+  const binding = kubectlJson([
+    "get", "validatingadmissionpolicybinding", ADMISSION_POLICY_NAME, "-o", "json"
+  ]);
+  return admissionPolicyIsObserved(policy) &&
+    exactAdmissionBinding(binding) &&
+    liveRunnerProtocolAdmissionIsObserved() &&
+    liveCutoverJournalAdmissionIsObserved() &&
+    isDeepStrictEqual(policy?.spec, recoveryAdmissionPolicy().spec);
+}
+
+function generatedRunnerProtocolPolicy() {
+  const policy = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === RUNNER_PROTOCOL_POLICY_NAME
+  );
+  if (!policy) throw new Error("generated_manifest_runner_protocol_policy_missing");
+  return policy;
+}
+
+function liveRunnerProtocolAdmissionIsObserved() {
+  const policy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"
+  ], "runner-protocol-policy");
+  const binding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"
+  ], "runner-protocol-binding");
+  return policy !== null && binding !== null &&
+    admissionPolicyIsObserved(policy) &&
+    exactRunnerProtocolBinding(binding) &&
+    isDeepStrictEqual(policy?.spec, generatedRunnerProtocolPolicy().spec);
+}
+
+function generatedParentFencePolicy() {
+  const policy = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === PARENT_FENCE_POLICY_NAME
+  );
+  if (!policy) throw new Error("generated_manifest_parent_fence_policy_missing");
+  return policy;
+}
+
+function generatedCutoverJournalPolicy() {
+  const policy = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === CUTOVER_JOURNAL_POLICY_NAME
+  );
+  if (!policy) throw new Error("generated_manifest_cutover_journal_policy_missing");
+  return policy;
+}
+
+function generatedCutoverJournalBinding() {
+  const binding = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource?.metadata?.name === CUTOVER_JOURNAL_POLICY_NAME
+  );
+  if (!binding) throw new Error("generated_manifest_cutover_journal_binding_missing");
+  return binding;
+}
+
+function generatedParentFenceBinding() {
+  const binding = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource?.metadata?.name === PARENT_FENCE_POLICY_NAME
+  );
+  if (!binding) throw new Error("generated_manifest_parent_fence_binding_missing");
+  return binding;
+}
+
+function generatedBotOrchestratorDeployment() {
+  const deployment = plan.resources.find(resource =>
+    resource?.apiVersion === "apps/v1" &&
+    resource?.kind === "Deployment" &&
+    resource?.metadata?.namespace === parentNamespace &&
+    resource?.metadata?.name === "bot-orchestrator"
+  );
+  if (!deployment) throw new Error("generated_manifest_bot_orchestrator_missing");
+  return deployment;
+}
+
+function cutoverTargetResources() {
+  return {
+    journalPolicy: generatedCutoverJournalPolicy(),
+    journalBinding: generatedCutoverJournalBinding(),
+    targetPolicy: generatedParentFencePolicy(),
+    targetBinding: generatedParentFenceBinding(),
+    targetDeployment: recoveryDeployment("bot-orchestrator", 0, "active")
+  };
+}
+
+function cutoverManifestSha256() {
+  return manifestSha256;
+}
+
+function cutoverTargetHashes() {
+  const {
+    journalPolicy,
+    journalBinding,
+    targetPolicy,
+    targetBinding,
+    targetDeployment
+  } = cutoverTargetResources();
+  return {
+    journalPolicy: sha256Canonical(journalPolicy),
+    journalBinding: sha256Canonical(journalBinding),
+    parentPolicy: sha256Canonical(targetPolicy),
+    parentBinding: sha256Canonical(targetBinding),
+    parentDeployment: sha256Canonical(targetDeployment)
+  };
+}
+
+function cutoverJournalVerification(namespaceUid, key = cutoverKey) {
+  return {
+    key,
+    expectedKubeContext: kubectlContext,
+    namespace: parentNamespace,
+    namespaceUid,
+    manifestSha256: cutoverManifestSha256(),
+    targetHashes: cutoverTargetHashes()
+  };
+}
+
+function durableCutoverJournalVerification(namespaceUid) {
+  return {
+    namespace: parentNamespace,
+    namespaceUid,
+    allowFutureIssuedAt: true
+  };
+}
+
+function readCutoverJournalConfigMap() {
+  return kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "configmap", CUTOVER_JOURNAL_NAME, "-o", "json"
+  ], "runner-cutover-journal");
+}
+
+function exactCutoverJournalConfigMap(value, namespaceUid, key = cutoverKey) {
+  try {
+    parseExactCutoverJournalConfigMap(value, cutoverJournalVerification(namespaceUid, key));
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function liveParentFenceAdmissionIsObserved() {
+  const policy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ], "parent-fence-policy");
+  const binding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ], "parent-fence-binding");
+  return policy !== null && binding !== null &&
+    admissionPolicyIsObserved(policy) &&
+    exactParentFenceBinding(binding, parentNamespace) &&
+    isDeepStrictEqual(policy?.spec, generatedParentFencePolicy().spec);
+}
+
+function liveCutoverJournalAdmissionIsObserved() {
+  const policy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ], "cutover-journal-policy");
+  const binding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ], "cutover-journal-binding");
+  return policy !== null && binding !== null &&
+    admissionPolicyIsObserved(policy) &&
+    exactCutoverJournalBinding(binding, parentNamespace) &&
+    isDeepStrictEqual(policy?.spec, generatedCutoverJournalPolicy().spec);
+}
+
+function liveParentFenceAdmissionIsDurable() {
+  return durableParentFenceEvidence() !== null;
+}
+
+function resourceVersionEvidence(resource, label) {
+  const uid = resource?.metadata?.uid;
+  const resourceVersion = resource?.metadata?.resourceVersion;
+  if (typeof uid !== "string" || !uid || typeof resourceVersion !== "string" || !resourceVersion) {
+    throw new Error(`${label}_identity_unverifiable`);
+  }
+  return {
+    uid,
+    resourceVersion,
+    specSha256: createHash("sha256")
+      .update(canonicalJson(resource?.spec || null), "utf8")
+      .digest("hex")
+  };
+}
+
+function durableParentFenceEvidence() {
+  const namespaceBefore = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "durable-parent-fence-namespace-before");
+  if (!activeCutoverNamespace(namespaceBefore, parentNamespace)) return null;
+  const namespaceUid = namespaceBefore.metadata.uid;
+  const journalConfigMap = kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "configmap", CUTOVER_JOURNAL_NAME, "-o", "json"
+  ], "durable-cutover-journal");
+  const journalPolicy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ], "durable-cutover-journal-policy");
+  const journalBinding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ], "durable-cutover-journal-binding");
+  const policy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ], "durable-parent-fence-policy");
+  const binding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ], "durable-parent-fence-binding");
+  const deployment = kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ], "durable-parent-fence-deployment");
+  const namespaceAfter = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "durable-parent-fence-namespace-after");
+  let journal = null;
+  try {
+    journal = parseStructurallyExactCutoverJournalConfigMap(
+      journalConfigMap,
+      durableCutoverJournalVerification(namespaceUid)
+    );
+  } catch (_error) {
+    return null;
+  }
+  const valid = activeCutoverNamespace(namespaceAfter, parentNamespace) &&
+    namespaceAfter.metadata.uid === namespaceUid &&
+    journal.namespace.uid === namespaceUid &&
+    journalPolicy !== null && journalBinding !== null &&
+    policy !== null && binding !== null && deployment !== null &&
+    [journalPolicy, journalBinding, policy, binding, deployment]
+      .every(liveObjectIsUnencumbered) &&
+    (journal.mode === "clean-install" ||
+      deployment.metadata.uid === journal.baselineDeployment.uid) &&
+    admissionPolicyIsObserved(journalPolicy) &&
+    exactCutoverJournalBinding(journalBinding, parentNamespace) &&
+    isDeepStrictEqual(journalPolicy?.spec, generatedCutoverJournalPolicy().spec) &&
+    admissionPolicyIsObserved(policy) &&
+    exactParentFenceBinding(binding, parentNamespace) &&
+    parentFencePolicyProtectsLiveOrTarget({
+      livePolicy: policy,
+      targetPolicy: generatedParentFencePolicy(),
+      liveDeployment: deployment,
+      targetDeployment: generatedBotOrchestratorDeployment()
+    });
+  if (!valid) return null;
+  return {
+    namespace: resourceVersionEvidence(namespaceAfter, "durable_parent_namespace"),
+    journal: {
+      ...resourceVersionEvidence(journalConfigMap, "durable_cutover_journal"),
+      operationId: journal.operationId,
+      namespaceUid: journal.namespace.uid,
+      manifestSha256: journal.manifestSha256
+    },
+    journalPolicy: resourceVersionEvidence(journalPolicy, "durable_cutover_journal_policy"),
+    journalBinding: resourceVersionEvidence(journalBinding, "durable_cutover_journal_binding"),
+    deployment: resourceVersionEvidence(deployment, "durable_parent_deployment"),
+    policy: resourceVersionEvidence(policy, "durable_parent_policy"),
+    binding: resourceVersionEvidence(binding, "durable_parent_binding")
+  };
+}
+
+function pristineLegacyCutoverLiveEvidence() {
+  const liveNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "parent-namespace");
+  const liveDeployment = kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ], "bot-orchestrator-deployment");
+  const runnerNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", RUNNER_NAMESPACE, "-o", "json"
+  ], "runner-namespace");
+  const absentResources = {
+    parentServiceAccount: ["-n", parentNamespace, "get", "serviceaccount", "bot-orchestrator", "-o", "json"],
+    parentRole: ["-n", parentNamespace, "get", "role", "bot-orchestrator-runner-pods", "-o", "json"],
+    parentRoleBinding: ["-n", parentNamespace, "get", "rolebinding", "bot-orchestrator-runner-pods", "-o", "json"],
+    runnerAdmissionPolicy: ["get", "validatingadmissionpolicy", ADMISSION_POLICY_NAME, "-o", "json"],
+    runnerAdmissionBinding: ["get", "validatingadmissionpolicybinding", ADMISSION_POLICY_NAME, "-o", "json"],
+    runnerProtocolPolicy: ["get", "validatingadmissionpolicy", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"],
+    runnerProtocolBinding: ["get", "validatingadmissionpolicybinding", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"],
+    cutoverJournalPolicy: ["get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"],
+    cutoverJournalBinding: ["get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"],
+    parentFencePolicy: ["get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"],
+    parentFenceBinding: ["get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"]
+  };
+  const isolatedResources = Object.fromEntries(Object.entries(absentResources).map(
+    ([name, args]) => [name, kubectlAbsentOnlyJson(args, `isolated-control-plane-${name}`)]
+  ));
+  const authority = Object.fromEntries([
+    ["parent", parentNamespace],
+    ["runner", RUNNER_NAMESPACE]
+  ].map(([label, namespace]) => [
+    label,
+    Object.fromEntries(["create", "delete", "patch"].map(verb => [
+      verb,
+      canServiceAccount(verb, namespace)
+    ]))
+  ]));
+  return {
+    liveNamespace,
+    liveDeployment,
+    runnerNamespace,
+    isolatedResources,
+    parentPodList: kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]),
+    parentReplicaSetList: kubectlJson([
+      "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    ]),
+    authority
+  };
+}
+
+function verifyPristineLegacyCutoverEvidence() {
+  const attestation = readPrivateCutoverAttestation(
+    process.env.PROCESS_LOCAL_CUTOVER_ATTESTATION_PATH
+  );
+  const key = readPrivateCutoverKey(process.env.PROCESS_LOCAL_CUTOVER_KEY_PATH);
+  const evidence = pristineLegacyCutoverLiveEvidence();
+  const result = verifyPristineLegacyCutoverGate({
+    attestation,
+    key,
+    namespace: parentNamespace,
+    expectedKubeContext: kubectlContext,
+    ...evidence
+  });
+  cutoverKey = key;
+  cutoverAttestation = attestation;
+  cutoverBaselineEvidence = result;
+  cutoverNamespaceUid = result.namespaceUid;
+  return result;
+}
+
+function verifyCleanInstallCutoverEvidence(expectedNamespaceUid) {
+  const evidence = pristineLegacyCutoverLiveEvidence();
+  const result = verifyCleanInstallCutoverGate({
+    namespace: parentNamespace,
+    expectedNamespaceUid,
+    ...evidence
+  });
+  cutoverBaselineEvidence = result;
+  cutoverNamespaceUid = result.namespaceUid;
+  return result;
+}
+
+function loadPrivateCutoverKey() {
+  cutoverKey = readPrivateCutoverKey(process.env.PROCESS_LOCAL_CUTOVER_KEY_PATH);
+  return cutoverKey;
+}
+
+function journalTransitionState(evidence, journalConfigMap, journal) {
+  const {
+    journalPolicy: targetJournalPolicy,
+    journalBinding: targetJournalBinding,
+    targetPolicy,
+    targetBinding,
+    targetDeployment: deploymentMutationResource
+  } = cutoverTargetResources();
+  const targetDeployment = serverNormalizedCutoverDeployment(
+    deploymentMutationResource,
+    evidence.liveDeployment
+  );
+  if (targetDeployment === null) {
+    throw new Error("runner_cutover_parent_deployment_server_normalization_failed");
+  }
+  const policy = evidence.isolatedResources.parentFencePolicy;
+  const binding = evidence.isolatedResources.parentFenceBinding;
+  const journalPolicy = evidence.isolatedResources.cutoverJournalPolicy;
+  const journalBinding = evidence.isolatedResources.cutoverJournalBinding;
+  const deploymentIsTarget = liveDeploymentMatchesJournalTarget(
+    evidence.liveDeployment,
+    targetDeployment,
+    journal
+  );
+  const parentFenceObserved = policy !== null && binding !== null &&
+    admissionPolicyIsObserved(policy) &&
+    exactParentFenceBinding(binding, parentNamespace) &&
+    isDeepStrictEqual(policy.spec, targetPolicy.spec);
+  const journalFenceObserved = journalPolicy !== null && journalBinding !== null &&
+    admissionPolicyIsObserved(journalPolicy) &&
+    exactCutoverJournalBinding(journalBinding, parentNamespace) &&
+    isDeepStrictEqual(journalPolicy.spec, targetJournalPolicy.spec);
+  return {
+    journalConfigMap,
+    journalPolicy,
+    journalBinding,
+    policy,
+    binding,
+    deployment: evidence.liveDeployment,
+    parentFenceObserved,
+    journalFenceObserved,
+    parentQuiesced: deploymentIsTarget && parentIsQuiesced(
+      evidence.liveDeployment,
+      evidence.parentPodList,
+      evidence.parentReplicaSetList,
+      journal.baselineDeployment?.uid
+    ),
+    journal,
+    targetJournalPolicy,
+    targetJournalBinding,
+    targetPolicy,
+    targetBinding,
+    targetDeployment,
+    deploymentMutationResource
+  };
+}
+
+function verifyJournalCutoverResumeEvidence(expectedOperationId = null) {
+  const evidence = pristineLegacyCutoverLiveEvidence();
+  const namespaceUid = evidence.liveNamespace?.metadata?.uid;
+  if (!activeCutoverNamespace(evidence.liveNamespace, parentNamespace)) {
+    throw new Error("runner_cutover_journal_namespace_invalid");
+  }
+  const journalConfigMap = readCutoverJournalConfigMap();
+  if (journalConfigMap === null) throw new Error("runner_cutover_journal_missing");
+  const journal = parseExactCutoverJournalConfigMap(
+    journalConfigMap,
+    cutoverJournalVerification(namespaceUid)
+  );
+  if (expectedOperationId !== null && journal.operationId !== expectedOperationId) {
+    throw new Error("runner_cutover_journal_operation_replaced");
+  }
+  if (
+    journal.mode === "clean-install" &&
+    evidence.liveNamespace.metadata.annotations?.["yenhubs.org/runner-clean-install"] !==
+      "fence-aware-bootstrap-v1"
+  ) {
+    throw new Error("runner_cutover_journal_clean_namespace_marker_missing");
+  }
+  const state = journalTransitionState(evidence, journalConfigMap, journal);
+  const prefix = classifyCutoverJournalPrefix(state);
+  const isolatedResources = {
+    ...evidence.isolatedResources,
+    cutoverJournalPolicy: null,
+    cutoverJournalBinding: null,
+    parentFencePolicy: null,
+    parentFenceBinding: null
+  };
+  verifyJournalCutoverIsolationGate({
+    ...evidence,
+    isolatedResources,
+    allowParentCandidates: ["P5", "P6"].includes(prefix)
+  });
+  cutoverJournal = journal;
+  cutoverNamespaceUid = namespaceUid;
+  return { journal, journalConfigMap, prefix, state };
+}
+
+function verifyPristineLegacyCutoverPreflight() {
+  pristineLegacyCutoverRequired = false;
+  cutoverKey = null;
+  cutoverAttestation = null;
+  cutoverBaselineEvidence = null;
+  cutoverJournal = null;
+  cutoverNamespaceUid = null;
+  let observedFenceEvidence = null;
+  const observedNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "parent-namespace-preflight");
+  const observedDeployment = observedNamespace === null ? null : kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ], "bot-orchestrator-preflight");
+  const liveActivation =
+    observedDeployment?.metadata?.annotations?.["yenhubs.org/runner-activation-phase"] || "legacy";
+  if (observedNamespace !== null && liveActivation !== "legacy") {
+    observedFenceEvidence = durableParentFenceEvidence();
+    if (observedFenceEvidence !== null) {
+      cutoverPreflightClassification = "fence-aware";
+      cutoverFenceEvidence = observedFenceEvidence;
+      return false;
+    }
+  }
+  const observedJournal = observedNamespace === null ? null : readCutoverJournalConfigMap();
+  if (observedJournal !== null) {
+    if (plan.activationPhase !== "bootstrap") {
+      throw new Error("partial_runner_cutover_journal_requires_bootstrap_target");
+    }
+    loadPrivateCutoverKey();
+    const resume = verifyJournalCutoverResumeEvidence();
+    cutoverPreflightClassification = `${resume.journal.mode}-journal-resume`;
+    pristineLegacyCutoverRequired = resume.journal.mode === "pristine-cutover";
+    cutoverFenceEvidence = null;
+    return pristineLegacyCutoverRequired;
+  }
+  const classification = executeCutoverPreflight({
+    targetActivation: plan.activationPhase,
+    readParentNamespace: () => observedNamespace,
+    readParentDeployment: () => observedDeployment,
+    readDurableParentPolicyObserved: () => {
+      observedFenceEvidence = durableParentFenceEvidence();
+      return observedFenceEvidence !== null;
+    },
+    verifyPristineEvidence: verifyPristineLegacyCutoverEvidence,
+    verifyCleanEvidence: uid => verifyCleanInstallCutoverEvidence(uid),
+    verifyCleanCapability: loadPrivateCutoverKey
+  });
+  pristineLegacyCutoverRequired = classification === "pristine-cutover";
+  cutoverPreflightClassification = classification;
+  cutoverFenceEvidence = classification === "fence-aware" ? observedFenceEvidence : null;
+  if (classification === "clean-install-resume") {
+    cutoverNamespaceUid = verifyCleanInstallCutoverEvidence().namespaceUid;
+  }
+  return pristineLegacyCutoverRequired;
+}
+
+function verifyEmergencyRefencePreflight() {
+  const emergencyNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "emergency-parent-namespace-preflight");
+  if (emergencyNamespace !== null && readCutoverJournalConfigMap() !== null) {
+    const emergencyDeployment = kubectlAbsentOnlyJson([
+      "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+    ], "emergency-bot-orchestrator-journal-preflight");
+    const emergencyActivation =
+      emergencyDeployment?.metadata?.annotations?.["yenhubs.org/runner-activation-phase"] || "legacy";
+    if (emergencyActivation === "legacy" || durableParentFenceEvidence() === null) {
+      throw new Error("emergency_refence_blocked_by_partial_runner_cutover_journal");
+    }
+  }
+  let observedFenceEvidence = null;
+  const classification = executeCutoverPreflight({
+    targetActivation: "active",
+    readParentNamespace: () => emergencyNamespace,
+    readParentDeployment: () => kubectlAbsentOnlyJson([
+      "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+    ], "emergency-bot-orchestrator-preflight"),
+    readDurableParentPolicyObserved: () => {
+      observedFenceEvidence = durableParentFenceEvidence();
+      return observedFenceEvidence !== null;
+    },
+    verifyPristineEvidence: () => {
+      throw new Error("emergency_refence_cannot_perform_first_pristine_cutover");
+    },
+    verifyCleanEvidence: () => {
+      throw new Error("emergency_refence_requires_fence_aware_live_control_plane");
+    }
+  });
+  if (classification !== "fence-aware") {
+    throw new Error("emergency_refence_requires_fence_aware_live_control_plane");
+  }
+  cutoverPreflightClassification = classification;
+  cutoverFenceEvidence = observedFenceEvidence;
+}
+
+function verifyPristineLegacyCutoverUnderLease() {
+  assertOperationLeaseHeld();
+  if (!pristineLegacyCutoverRequired) return false;
+  verifyPristineLegacyCutoverEvidence();
+  assertOperationLeaseHeld();
+  return true;
+}
+
+function verifyCutoverPreflightUnderLease() {
+  assertOperationLeaseHeld();
+  if (cutoverPreflightClassification?.endsWith("-journal-resume")) {
+    verifyJournalCutoverResumeEvidence(cutoverJournal?.operationId || null);
+    assertOperationLeaseHeld();
+    return;
+  }
+  executeCutoverRevalidation({
+    classification: cutoverPreflightClassification,
+    expectedFenceEvidence: cutoverFenceEvidence,
+    verifyPristineEvidence: verifyPristineLegacyCutoverEvidence,
+    verifyCleanEvidence: () => verifyCleanInstallCutoverEvidence(cutoverNamespaceUid),
+    readFenceEvidence: durableParentFenceEvidence
+  });
+  assertOperationLeaseHeld();
 }
 
 function liveRunnerControlPlaneErrors(generatedResources = plan.resources) {
@@ -394,25 +1063,29 @@ function listPodsBySelector(namespace, selector) {
   throw new Error(`runner_pod_list_failed:${namespace}:${result.status}`);
 }
 
-function liveRunnerPods() {
-  const podLists = [];
-  podLists.push(listPodsBySelector(parentNamespace, "app=bot-runner"));
-  podLists.push(listPodsBySelector(parentNamespace, "component=bot-runner"));
-  podLists.push(listPodsBySelector(parentNamespace, "yenhubs.org/managed-by=bot-orchestrator"));
-  podLists.push(listPodsBySelector(RUNNER_NAMESPACE, ""));
-  const pods = uniqueRunnerPods(podLists);
-  if (!Array.isArray(pods)) throw new Error("runner_pod_lists_invalid");
-  return pods;
+function runnerRuntimeIsQuiesced() {
+  const parentPods = uniqueRunnerPods([
+    listPodsBySelector(parentNamespace, "app=bot-runner"),
+    listPodsBySelector(parentNamespace, "component=bot-runner"),
+    listPodsBySelector(parentNamespace, "yenhubs.org/managed-by=bot-orchestrator")
+  ]);
+  if (!Array.isArray(parentPods) || parentPods.length !== 0) return false;
+  const inventory = completeRunnerNamespaceInventory(
+    listPodsBySelector(RUNNER_NAMESPACE, "")
+  );
+  return inventory.runners.size === 0 && inventory.intents.size === 0;
 }
 
-function deletePodByExactUid(pod) {
+function deletePodByExactUid(pod, { requireResourceVersion = false } = {}) {
   const namespace = pod?.metadata?.namespace;
   const name = pod?.metadata?.name;
   const uid = pod?.metadata?.uid;
+  const resourceVersion = pod?.metadata?.resourceVersion;
   if (
     ![parentNamespace, RUNNER_NAMESPACE].includes(namespace) ||
     typeof name !== "string" || !name ||
-    typeof uid !== "string" || !uid
+    typeof uid !== "string" || !uid ||
+    (requireResourceVersion && (typeof resourceVersion !== "string" || !resourceVersion))
   ) {
     throw new Error("runner_pod_delete_identity_invalid");
   }
@@ -420,7 +1093,10 @@ function deletePodByExactUid(pod) {
   const deleteOptions = {
     apiVersion: "v1",
     kind: "DeleteOptions",
-    preconditions: { uid },
+    preconditions: {
+      uid,
+      ...(requireResourceVersion ? { resourceVersion } : {})
+    },
     propagationPolicy: "Background"
   };
   const deleted = runLeaseGuardedMutation(
@@ -436,20 +1112,61 @@ function deletePodByExactUid(pod) {
     )
   );
   if (deleted.status !== 0 && !`${deleted.stderr || ""}`.includes("NotFound")) {
-    throw new Error(`runner_pod_uid_delete_failed:${deleted.status}`);
+    const error = new Error(`runner_pod_uid_delete_failed:${deleted.status}`);
+    const diagnostic = `${deleted.stdout || ""}\n${deleted.stderr || ""}`;
+    error.conflict = /\bConflict\b|object was modified|precondition.*failed/iu.test(diagnostic);
+    throw error;
   }
 }
 
 async function deleteAllRunnerPodsByExactUid() {
-  const pods = liveRunnerPods();
-  return runBestEffortFenceSteps(pods.map(pod => ({
+  const parentPods = uniqueRunnerPods([
+    listPodsBySelector(parentNamespace, "app=bot-runner"),
+    listPodsBySelector(parentNamespace, "component=bot-runner"),
+    listPodsBySelector(parentNamespace, "yenhubs.org/managed-by=bot-orchestrator")
+  ]);
+  if (!Array.isArray(parentPods)) throw new Error("runner_parent_pod_lists_invalid");
+  const failures = await runBestEffortFenceSteps(parentPods.map(pod => ({
     name: `pod:${pod?.metadata?.namespace || "invalid"}/${pod?.metadata?.name || "invalid"}`,
     action: async () => deletePodByExactUid(pod)
   })));
+  try {
+    await reconcileRunnerNamespace({
+      listPods: async () => listPodsBySelector(RUNNER_NAMESPACE, ""),
+      getPod: async name => kubectlOptionalJson([
+        "-n", RUNNER_NAMESPACE, "get", "pod", name, "-o", "json"
+      ]),
+      createPod: async document => {
+        const created = runLeaseGuardedMutation(
+          assertOperationLeaseHeld,
+          () => spawnSync(
+            "kubectl",
+            contextArgs(["--request-timeout=30s", "create", "-f", "-", "-o", "json"]),
+            {
+              input: JSON.stringify(document),
+              encoding: "utf8",
+              timeout: MUTATION_TIMEOUT_MS
+            }
+          )
+        );
+        if (created.status !== 0) {
+          const error = new Error(`runner_fence_create_failed:${created.status}`);
+          error.status = created.status;
+          throw error;
+        }
+        return JSON.parse(created.stdout);
+      },
+      deletePodByUid: async (pod, options) => deletePodByExactUid(pod, options),
+      sleep
+    });
+  } catch (error) {
+    failures.push(`runner-namespace:${error.message}`);
+  }
+  return failures;
 }
 
 function parentAndRunnerPodsAreAbsent() {
-  return liveParentIsQuiesced() && liveRunnerPods().length === 0;
+  return liveParentIsQuiesced() && runnerRuntimeIsQuiesced();
 }
 
 function podListForWatch(namespace) {
@@ -721,6 +1438,45 @@ async function runWithStablePodAbsence(
   }
 }
 
+async function waitForStableFirstCutoverParentAbsence(label, finalPredicate) {
+  const deadline = Date.now() + waitTimeoutMs;
+  while (Date.now() < deadline) {
+    const initial = podListForWatch(parentNamespace);
+    if (podListHasForbidden(parentNamespace, initial) || !finalPredicate()) {
+      await sleep(1_000);
+      continue;
+    }
+    const watch = startPodWatch(parentNamespace, initial.metadata?.resourceVersion);
+    try {
+      if (!(await waitForWatchInitialEventsEnd([watch], deadline))) continue;
+      const stableUntil = Date.now() + 61_000;
+      while (
+        Date.now() < stableUntil &&
+        !watch.evidence.error &&
+        !watch.evidence.violation
+      ) {
+        assertOperationLeaseProcessHealthy();
+        await sleep(100);
+      }
+      if (watch.evidence.error || watch.evidence.violation) continue;
+      const boundary = podListForWatch(parentNamespace);
+      if (
+        podListHasForbidden(parentNamespace, boundary) ||
+        !finalPredicate() ||
+        !(await confirmWatchBoundary([watch], [boundary], deadline)) ||
+        watch.evidence.error ||
+        watch.evidence.violation
+      ) {
+        continue;
+      }
+      return;
+    } finally {
+      watch.stop();
+    }
+  }
+  throw new Error(`${label}_timeout`);
+}
+
 function liveRecoveryConsumersAreQuiesced() {
   const deployments = kubectlJson([
     "-n", parentNamespace, "get", "deployments", "-o", "json"
@@ -812,7 +1568,7 @@ function admissionDenialProbe() {
   const diagnostic = `${result.stdout || ""}\n${result.stderr || ""}`;
   return result.status !== 0 &&
     diagnostic.includes(ADMISSION_POLICY_NAME) &&
-    diagnostic.includes("Pod-bound parent ServiceAccount principal") &&
+    diagnostic.includes("phase-bound parent or shape-limited recovery operator principal") &&
     !diagnostic.includes("violates PodSecurity");
 }
 
@@ -857,6 +1613,267 @@ function applyNamedResources(identities) {
     if (!resource) throw new Error(`generated_manifest_resource_missing:${kind}:${name}`);
     applyResource(resource);
   }
+}
+
+async function prepareRecoveryAdmissionFence() {
+  await prepareParentFenceAdmission();
+  applyNamedResources([
+    ["Namespace", RUNNER_NAMESPACE, ""],
+    ["ServiceAccount", "bot-runner-guard", RUNNER_NAMESPACE],
+    ["ResourceQuota", "bot-runner-guard-capacity", RUNNER_NAMESPACE]
+  ]);
+  applyResource(recoveryAdmissionPolicy());
+  applyNamedResources([
+    ["ValidatingAdmissionPolicyBinding", ADMISSION_POLICY_NAME, ""],
+    ["ValidatingAdmissionPolicy", RUNNER_PROTOCOL_POLICY_NAME, ""],
+    ["ValidatingAdmissionPolicyBinding", RUNNER_PROTOCOL_POLICY_NAME, ""]
+  ]);
+  await waitFor("runner_recovery_admission_observed", liveRecoveryAdmissionIsObserved);
+}
+
+async function prepareParentFenceAdmission() {
+  applyNamedResources([
+    ["ValidatingAdmissionPolicy", PARENT_FENCE_POLICY_NAME, ""],
+    ["ValidatingAdmissionPolicyBinding", PARENT_FENCE_POLICY_NAME, ""]
+  ]);
+  await waitFor("parent_fence_admission_observed", liveParentFenceAdmissionIsObserved);
+}
+
+function createCutoverResource(resource, label) {
+  const result = runLeaseGuardedMutation(
+    assertOperationLeaseHeld,
+    () => spawnSync(
+      "kubectl",
+      contextArgs(["--request-timeout=30s", "create", "-f", "-"]),
+      {
+        input: JSON.stringify(resource),
+        encoding: "utf8",
+        timeout: MUTATION_TIMEOUT_MS
+      }
+    )
+  );
+  if (result.status !== 0) throw new Error(`${label}_create_failed:${result.status}`);
+}
+
+function writeCutoverParentDeployment(targetDeployment, baselineDeployment, mode) {
+  const resource = structuredClone(targetDeployment);
+  const verb = mode === "clean-install" ? "create" : "replace";
+  if (mode === "pristine-cutover") {
+    if (
+      baselineDeployment?.name !== "bot-orchestrator" ||
+      typeof baselineDeployment?.uid !== "string" || !baselineDeployment.uid ||
+      typeof baselineDeployment?.resourceVersion !== "string" ||
+      !baselineDeployment.resourceVersion
+    ) {
+      throw new Error("runner_cutover_parent_deployment_baseline_invalid");
+    }
+    resource.metadata = {
+      ...resource.metadata,
+      uid: baselineDeployment.uid,
+      resourceVersion: baselineDeployment.resourceVersion
+    };
+  } else if (baselineDeployment !== null) {
+    throw new Error("runner_clean_install_deployment_baseline_must_be_absent");
+  }
+  const result = runLeaseGuardedMutation(
+    assertOperationLeaseHeld,
+    () => spawnSync(
+      "kubectl",
+      contextArgs(["--request-timeout=30s", verb, "-f", "-"]),
+      {
+        input: JSON.stringify(resource),
+        encoding: "utf8",
+        timeout: MUTATION_TIMEOUT_MS
+      }
+    )
+  );
+  if (result.status !== 0) {
+    throw new Error(`runner_cutover_parent_deployment_${verb}_failed:${result.status}`);
+  }
+}
+
+function newCutoverJournalForCurrentOperation() {
+  if (cutoverJournal !== null) return cutoverJournal;
+  if (!Buffer.isBuffer(cutoverKey) || typeof cutoverNamespaceUid !== "string") {
+    throw new Error("runner_cutover_journal_local_capability_missing");
+  }
+  const mode = cutoverPreflightClassification.startsWith("pristine-cutover")
+    ? "pristine-cutover"
+    : "clean-install";
+  const baselineDeployment = mode === "pristine-cutover" ? {
+    name: "bot-orchestrator",
+    uid: cutoverBaselineEvidence?.deploymentUid,
+    resourceVersion: cutoverBaselineEvidence?.deploymentResourceVersion
+  } : null;
+  cutoverJournal = createCutoverJournal({
+    mode,
+    operationId: randomUUID(),
+    authorization: mode === "pristine-cutover" ? cutoverAttestation : null,
+    expectedKubeContext: kubectlContext,
+    namespace: parentNamespace,
+    namespaceUid: cutoverNamespaceUid,
+    baselineDeployment,
+    manifestSha256: cutoverManifestSha256(),
+    targetHashes: cutoverTargetHashes(),
+    issuedAt: new Date().toISOString()
+  }, cutoverKey);
+  return cutoverJournal;
+}
+
+function readLiveCutoverTransitionState(journal) {
+  const evidence = pristineLegacyCutoverLiveEvidence();
+  const journalConfigMap = readCutoverJournalConfigMap();
+  return {
+    ...journalTransitionState(evidence, journalConfigMap, journal),
+    evidence
+  };
+}
+
+function validateLiveCutoverTransitionState(state) {
+  const namespaceUid = state.evidence?.liveNamespace?.metadata?.uid;
+  if (
+    namespaceUid !== cutoverNamespaceUid ||
+    !activeCutoverNamespace(state.evidence?.liveNamespace, parentNamespace)
+  ) {
+    throw new Error("runner_cutover_journal_namespace_replaced");
+  }
+  if (
+    state.journal.mode === "clean-install" &&
+    state.evidence.liveNamespace.metadata.annotations?.["yenhubs.org/runner-clean-install"] !==
+      "fence-aware-bootstrap-v1"
+  ) {
+    throw new Error("runner_cutover_journal_clean_namespace_marker_missing");
+  }
+  if (
+    state.journalConfigMap !== null &&
+    !exactCutoverJournalConfigMap(state.journalConfigMap, cutoverNamespaceUid)
+  ) {
+    throw new Error("runner_cutover_journal_live_object_not_exact");
+  }
+  const prefix = classifyCutoverJournalPrefix(state);
+  verifyJournalCutoverIsolationGate({
+    ...state.evidence,
+    isolatedResources: {
+      ...state.evidence.isolatedResources,
+      cutoverJournalPolicy: null,
+      cutoverJournalBinding: null,
+      parentFencePolicy: null,
+      parentFenceBinding: null
+    },
+    allowParentCandidates: ["P5", "P6"].includes(prefix)
+  });
+}
+
+function liveFirstCutoverParentIsQuiesced(journal) {
+  const deployment = kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ], "first-cutover-parent-deployment-quiescence");
+  if (deployment === null) return false;
+  const pods = kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]);
+  const replicaSets = kubectlJson([
+    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+  ]);
+  return parentIsQuiesced(
+    deployment,
+    pods,
+    replicaSets,
+    journal.baselineDeployment?.uid
+  );
+}
+
+async function performFirstCutoverFenceTransition() {
+  const journal = newCutoverJournalForCurrentOperation();
+  const journalConfigMap = cutoverJournalConfigMap(journal);
+  const {
+    journalPolicy: targetJournalPolicy,
+    journalBinding: targetJournalBinding,
+    targetPolicy,
+    targetBinding,
+    targetDeployment: deploymentMutationResource
+  } = cutoverTargetResources();
+  const initialDeployment = kubectlAbsentOnlyJson([
+    "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
+  ], "runner-cutover-parent-deployment-normalization");
+  const targetDeployment = serverNormalizedCutoverDeployment(
+    deploymentMutationResource,
+    initialDeployment
+  );
+  if (targetDeployment === null) {
+    throw new Error("runner_cutover_parent_deployment_server_normalization_failed");
+  }
+  await advanceCutoverJournalTransition({
+    journal,
+    journalConfigMap,
+    targetJournalPolicy,
+    targetJournalBinding,
+    targetPolicy,
+    targetBinding,
+    targetDeployment,
+    deploymentMutationResource,
+    readState: async () => readLiveCutoverTransitionState(journal),
+    validateState: async state => validateLiveCutoverTransitionState(state),
+    isJournalExact: value =>
+      exactCutoverJournalConfigMap(value, cutoverNamespaceUid) &&
+      parseExactCutoverJournalConfigMap(
+        value,
+        cutoverJournalVerification(cutoverNamespaceUid)
+      ).operationId === journal.operationId,
+    createJournal: async resource =>
+      createCutoverResource(resource, "runner_cutover_journal"),
+    createJournalPolicy: async resource =>
+      createCutoverResource(resource, "runner_cutover_journal_guard_policy"),
+    waitJournalPolicyObserved: async () => waitFor(
+      "runner_cutover_journal_guard_policy_observed",
+      () => {
+        const live = kubectlAbsentOnlyJson([
+          "get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+        ], "runner-cutover-journal-guard-policy-observation");
+        return live !== null && admissionPolicyIsObserved(live) &&
+          liveResourceMatchesTarget(live, targetJournalPolicy);
+      }
+    ),
+    createJournalBinding: async resource =>
+      createCutoverResource(resource, "runner_cutover_journal_guard_binding"),
+    waitJournalFenceObserved: async () => waitFor(
+      "runner_cutover_journal_guard_observed",
+      liveCutoverJournalAdmissionIsObserved
+    ),
+    createPolicy: async resource =>
+      createCutoverResource(resource, "runner_cutover_parent_policy"),
+    waitPolicyObserved: async () => waitFor(
+      "runner_cutover_parent_policy_observed",
+      () => {
+        const live = kubectlAbsentOnlyJson([
+          "get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"
+        ], "runner-cutover-parent-policy-observation");
+        return live !== null && admissionPolicyIsObserved(live) &&
+          liveResourceMatchesTarget(live, targetPolicy);
+      }
+    ),
+    createBinding: async resource =>
+      createCutoverResource(resource, "runner_cutover_parent_binding"),
+    waitParentFenceObserved: async () => waitFor(
+      "runner_cutover_parent_fence_observed",
+      liveParentFenceAdmissionIsObserved
+    ),
+    writeDeployment: async (resource, baseline) =>
+      writeCutoverParentDeployment(resource, baseline, journal.mode),
+    waitParentQuiesced: async () => {
+      await waitFor(
+        "runner_cutover_parent_quiesced",
+        () => liveFirstCutoverParentIsQuiesced(journal)
+      );
+      await waitForStableFirstCutoverParentAbsence(
+        "runner_cutover_parent_stable_absence",
+        () => liveFirstCutoverParentIsQuiesced(journal)
+      );
+    }
+  });
+  const durable = durableParentFenceEvidence();
+  if (durable === null) throw new Error("runner_cutover_parent_fence_not_durable_after_transition");
+  cutoverPreflightClassification = "fence-aware";
+  cutoverFenceEvidence = durable;
+  return journal.mode;
 }
 
 function runnerRole({ inert = false, recoveryPhase = plan.recoveryPhase } = {}) {
@@ -931,6 +1948,23 @@ function serverNormalizedDeployment(expected, live) {
   const result = runLeaseGuardedRead(() => spawnSync(
     "kubectl",
     contextArgs(["replace", "--dry-run=server", "-f", "-", "-o", "json"]),
+    { input: JSON.stringify(candidate), encoding: "utf8", timeout: kubectlReadTimeoutMs }
+  ));
+  if (result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function serverNormalizedCutoverDeployment(expected, live) {
+  if (live !== null) return serverNormalizedDeployment(expected, live);
+  const candidate = structuredClone(expected);
+  delete candidate.status;
+  const result = runLeaseGuardedRead(() => spawnSync(
+    "kubectl",
+    contextArgs(["create", "--dry-run=server", "-f", "-", "-o", "json"]),
     { input: JSON.stringify(candidate), encoding: "utf8", timeout: kubectlReadTimeoutMs }
   ));
   if (result.status !== 0) return null;
@@ -1096,6 +2130,7 @@ function activeStagingFenceDeploymentsAreExact() {
 }
 
 async function establishRecoveryFenceMutations() {
+  await prepareRecoveryAdmissionFence();
   return retryBestEffortFenceAttempt(
     async () => {
       const fenceFailures = await runBestEffortFenceSteps([
@@ -1108,14 +2143,14 @@ async function establishRecoveryFenceMutations() {
           action: async () => applyResource(deployment)
         }))
       ]);
-      const deletionFailures = await deleteAllRunnerPodsByExactUid();
-      return [...fenceFailures, ...deletionFailures];
+      return fenceFailures;
     },
     { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
   );
 }
 
 async function establishActiveStagingFenceMutations() {
+  await prepareRecoveryAdmissionFence();
   return retryBestEffortFenceAttempt(
     async () => {
       const fenceFailures = await runBestEffortFenceSteps([
@@ -1128,8 +2163,7 @@ async function establishActiveStagingFenceMutations() {
           action: async () => applyResource(deployment)
         }))
       ]);
-      const deletionFailures = await deleteAllRunnerPodsByExactUid();
-      return [...fenceFailures, ...deletionFailures];
+      return fenceFailures;
     },
     { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
   );
@@ -1137,14 +2171,28 @@ async function establishActiveStagingFenceMutations() {
 
 async function refenceActiveReapplyForStaging() {
   const failures = await establishActiveStagingFenceMutations();
+  let causalFenceReady = false;
   try {
-    await waitFor("active_reapply_staging_all_consumers_and_runners_quiesced", () =>
+    await waitFor("active_reapply_staging_parent_and_authority_quiesced", () =>
       liveParentIsQuiesced() &&
       liveRecoveryConsumersAreQuiesced() &&
-      liveRunnerPods().length === 0
+      exactRunnerAuthority(false) &&
+      liveRecoveryAdmissionIsObserved()
     );
+    causalFenceReady = true;
   } catch (_error) {
-    failures.push("quiescence-verification");
+    failures.push("causal-parent-authority-fence");
+  }
+  if (causalFenceReady) {
+    failures.push(...await retryBestEffortFenceAttempt(
+      async () => deleteAllRunnerPodsByExactUid(),
+      { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
+    ));
+    try {
+      await waitFor("active_reapply_staging_runner_runtime_quiesced", runnerRuntimeIsQuiesced);
+    } catch (_error) {
+      failures.push("runner-runtime-quiescence");
+    }
   }
   try {
     await runWithStablePodAbsence(
@@ -1164,7 +2212,7 @@ async function refenceActiveReapplyForStaging() {
     ["deployment-fences-exact", activeStagingFenceDeploymentsAreExact],
     ["recovery-consumers-absent", liveRecoveryConsumersAreQuiesced],
     ["runner-authority-inert", () => exactRunnerAuthority(false)],
-    ["runner-pods-absent", () => liveRunnerPods().length === 0],
+    ["runner-runtime-quiesced", runnerRuntimeIsQuiesced],
     ["recovery-lock-absent", () => !recoveryLockExists()]
   ]) {
     try {
@@ -1180,14 +2228,28 @@ async function refenceActiveReapplyForStaging() {
 
 async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, label }) {
   const failures = await establishRecoveryFenceMutations();
+  let causalFenceReady = false;
   try {
-    await waitFor(`${label}_all_consumers_and_runners_quiesced`, () =>
+    await waitFor(`${label}_parent_and_authority_quiesced`, () =>
       liveParentIsQuiesced() &&
       liveRecoveryConsumersAreQuiesced() &&
-      liveRunnerPods().length === 0
+      exactRunnerAuthority(false) &&
+      liveRecoveryAdmissionIsObserved()
     );
+    causalFenceReady = true;
   } catch (_error) {
-    failures.push("quiescence-verification");
+    failures.push("causal-parent-authority-fence");
+  }
+  if (causalFenceReady) {
+    failures.push(...await retryBestEffortFenceAttempt(
+      async () => deleteAllRunnerPodsByExactUid(),
+      { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
+    ));
+    try {
+      await waitFor(`${label}_runner_runtime_quiesced`, runnerRuntimeIsQuiesced);
+    } catch (_error) {
+      failures.push("runner-runtime-quiescence");
+    }
   }
   try {
     await runWithStablePodAbsence(
@@ -1210,7 +2272,7 @@ async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, labe
     ["deployment-fences-exact", recoveryFenceDeploymentsAreExact],
     ["recovery-consumers-absent", liveRecoveryConsumersAreQuiesced],
     ["runner-authority-inert", () => exactRunnerAuthority(false)],
-    ["runner-pods-absent", () => liveRunnerPods().length === 0]
+    ["runner-runtime-quiesced", runnerRuntimeIsQuiesced]
   ]) {
     try {
       if (!predicate()) failures.push(name);
@@ -1258,7 +2320,7 @@ async function applyRestoreFence() {
   applyManifest();
   await waitFor("parent_quiesced_in_restore_fence", liveParentIsQuiesced);
   await waitFor("recovery_consumers_quiesced", liveRecoveryConsumersAreQuiesced);
-  await waitFor("runner_pods_absent_in_restore_fence", () => liveRunnerPods().length === 0);
+  await waitFor("runner_runtime_quiesced_in_restore_fence", runnerRuntimeIsQuiesced);
   await waitFor("restore_fence_deployments_exact", deploymentsMatchGeneratedDesiredState);
   await waitFor("runner_admission_observed_in_restore_fence", liveAdmissionIsObserved);
   await waitFor("runner_control_plane_exact_in_restore_fence", liveRunnerControlPlaneIsExact);
@@ -1272,13 +2334,33 @@ async function applyRestoreFence() {
 async function applyBootstrap() {
   if (recoveryLockExists()) throw new Error("bootstrap_blocked_while_recovery_lock_exists");
   const namespace = kubectlOptionalJson(["get", "namespace", parentNamespace, "-o", "json"]);
-  if (namespace && liveState().activationPhase !== "legacy") {
+  const firstCutoverClassifications = new Set([
+    "pristine-cutover",
+    "clean-install",
+    "clean-install-resume",
+    "pristine-cutover-journal-resume",
+    "clean-install-journal-resume"
+  ]);
+  if (namespace && firstCutoverClassifications.has(cutoverPreflightClassification)) {
+    const cutoverMode = await performFirstCutoverFenceTransition();
+    if (!exactRunnerAuthority(false)) {
+      throw new Error("first_cutover_runner_authority_not_inert");
+    }
+    if (cutoverMode === "pristine-cutover") {
+      await prepareRecoveryAdmissionFence();
+      const deletionFailures = await retryBestEffortFenceAttempt(
+        async () => deleteAllRunnerPodsByExactUid(),
+        { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
+      );
+      if (deletionFailures.length > 0) {
+        throw new Error("pristine_cutover_runner_reconciliation_failed");
+      }
+      await waitFor("pristine_runner_runtime_quiesced", runnerRuntimeIsQuiesced);
+    }
+  } else if (namespace && cutoverPreflightClassification === "fence-aware") {
     if (recoveryLockExists()) throw new Error("bootstrap_lock_appeared_before_parent_quiesce");
+    await prepareRecoveryAdmissionFence();
     const fenceFailures = await runBestEffortFenceSteps([
-      {
-        name: "runner-namespace",
-        action: async () => applyNamedResources([["Namespace", RUNNER_NAMESPACE, ""]])
-      },
       {
         name: "runner-role-inert",
         action: async () => neutralizeRunnerAuthority()
@@ -1288,12 +2370,20 @@ async function applyBootstrap() {
         action: async () => applyResource(recoveryDeployment("bot-orchestrator", 0, "active"))
       }
     ]);
-    const deletionFailures = await deleteAllRunnerPodsByExactUid();
-    if (fenceFailures.length > 0 || deletionFailures.length > 0) {
+    if (fenceFailures.length > 0) {
       throw new Error("bootstrap_fence_mutations_failed");
     }
-    await waitFor("parent_quiesced_before_bootstrap_authority", liveParentIsQuiesced);
-    await waitFor("runner_pods_absent_before_bootstrap_authority", () => liveRunnerPods().length === 0);
+    await waitFor("parent_quiesced_before_bootstrap_reconciliation", () =>
+      liveParentIsQuiesced() &&
+      exactRunnerAuthority(false) &&
+      liveRecoveryAdmissionIsObserved()
+    );
+    const deletionFailures = await retryBestEffortFenceAttempt(
+      async () => deleteAllRunnerPodsByExactUid(),
+      { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
+    );
+    if (deletionFailures.length > 0) throw new Error("bootstrap_runner_reconciliation_failed");
+    await waitFor("runner_runtime_quiesced_before_bootstrap_authority", runnerRuntimeIsQuiesced);
     await runWithStablePodAbsence(
       "stable_pod_absence_before_bootstrap_authority_fence",
       async () => {
@@ -1305,7 +2395,7 @@ async function applyBootstrap() {
   if (recoveryLockExists()) throw new Error("bootstrap_lock_appeared_before_full_apply");
   applyManifest();
   await waitFor("parent_quiesced", liveParentIsQuiesced);
-  await waitFor("runner_pods_absent", () => liveRunnerPods().length === 0);
+  await waitFor("runner_runtime_quiesced", runnerRuntimeIsQuiesced);
   await waitFor("runner_admission_observed", liveAdmissionIsObserved);
   await waitFor("runner_control_plane_exact", liveRunnerControlPlaneIsExact);
   if (!exactRunnerAuthority(false)) throw new Error("bootstrap_runner_rbac_not_inert");
@@ -1319,7 +2409,7 @@ async function applyAdmission() {
     throw new Error("runner_activation_transition_requires_active_recovery_bootstrap");
   }
   await waitFor("parent_quiesced_before_runner_authority", liveParentIsQuiesced);
-  await waitFor("runner_pods_absent_before_runner_authority", () => liveRunnerPods().length === 0);
+  await waitFor("runner_runtime_quiesced_before_runner_authority", runnerRuntimeIsQuiesced);
   await waitFor("runner_admission_observed_before_authority", liveAdmissionIsObserved);
   if (!exactRunnerAuthority(false)) throw new Error("legacy_or_bootstrap_runner_authority_not_inert");
   await prepareExactPreGrantControlPlane();
@@ -1343,7 +2433,7 @@ async function applyAdmission() {
     throw error;
   }
   await waitFor("parent_quiesced_after_runner_authority", liveParentIsQuiesced);
-  await waitFor("runner_pods_absent_after_runner_authority", () => liveRunnerPods().length === 0);
+  await waitFor("runner_runtime_quiesced_after_runner_authority", runnerRuntimeIsQuiesced);
   if (!exactRunnerAuthority(true)) throw new Error("admission_runner_rbac_not_effective");
   await waitForAdmissionDenialProbe();
   await waitFor("runner_control_plane_exact_after_admission", liveRunnerControlPlaneIsExact);
@@ -1378,7 +2468,7 @@ async function applyActiveTransition(mode) {
     }
     await waitFor("recovery_consumers_quiesced_before_reactivation", liveRecoveryConsumersAreQuiesced);
     await waitFor("parent_quiesced_before_reactivation", liveParentIsQuiesced);
-    await waitFor("runner_pods_absent_before_reactivation", () => liveRunnerPods().length === 0);
+    await waitFor("runner_runtime_quiesced_before_reactivation", runnerRuntimeIsQuiesced);
     await waitFor("runner_admission_observed_before_reactivation", liveAdmissionIsObserved);
     if (!exactRunnerAuthority(false)) throw new Error("restore_fence_runner_authority_not_inert");
     await prepareExactPreGrantControlPlane();
@@ -1432,7 +2522,7 @@ async function applyActiveTransition(mode) {
   } else if (live.activationPhase === "admission" && live.recoveryPhase === "active") {
     failClosedRefenceRequired = true;
     await waitFor("parent_quiesced_before_activation", liveParentIsQuiesced);
-    await waitFor("runner_pods_absent_before_activation", () => liveRunnerPods().length === 0);
+    await waitFor("runner_runtime_quiesced_before_activation", runnerRuntimeIsQuiesced);
     await waitFor("runner_admission_observed_before_activation", liveAdmissionIsObserved);
     await waitFor("runner_control_plane_exact_before_activation", liveRunnerControlPlaneIsExact);
     if (!exactRunnerAuthority(true)) throw new Error("admission_runner_rbac_not_effective");
@@ -1494,6 +2584,7 @@ async function applyActive(mode) {
 
 async function applyUnderOperationLease(commandMode) {
   assertOperationLeaseHeld();
+  verifyCutoverPreflightUnderLease();
   if (commandMode === "emergency-refence") {
     failClosedRefenceRequired = true;
     await emergencyRefenceAfterFailedActivation();
@@ -1539,7 +2630,22 @@ async function main() {
   const commandMode = requestedCommandMode(process.argv.slice(2));
   verifyManifestBeforeClusterMutation();
   requirePinnedKubectlContext();
-  await ensureFoundationalNamespaceForLease();
+  if (commandMode === "emergency-refence") {
+    verifyEmergencyRefencePreflight();
+  } else {
+    verifyPristineLegacyCutoverPreflight();
+  }
+  const foundationalNamespace = await ensureFoundationalNamespaceForLease();
+  if (
+    ["clean-install", "clean-install-resume", "clean-install-journal-resume",
+      "pristine-cutover-journal-resume"].includes(cutoverPreflightClassification)
+  ) {
+    const uid = foundationalNamespace?.metadata?.uid;
+    if (typeof uid !== "string" || !uid || (cutoverNamespaceUid && cutoverNamespaceUid !== uid)) {
+      throw new Error("runner_clean_install_namespace_identity_changed");
+    }
+    cutoverNamespaceUid = uid;
+  }
   operationLeaseGuard = acquireOperationLeaseGuard();
   let failure = null;
   try {

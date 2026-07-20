@@ -63,6 +63,7 @@ defmodule Ret.Application do
       Ret.Statix,
       Ret.Repo,
       Ret.BotChatPresence,
+      Ret.BotRuntimeOutboxDispatcher,
       Ret.BotRuntimeSupervisor,
       Ret.Scheduler,
       Ret.RoomAssignerMonitor,

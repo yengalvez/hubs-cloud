@@ -3,7 +3,7 @@ defmodule RetWeb.BotConfigApprovalControllerTest do
 
   import Ret.TestHelpers
 
-  alias Ret.{BotConfigAdmission, BotConfigApproval, Hub, Repo}
+  alias Ret.{BotConfigAdmission, BotConfigApproval, BotRuntimeOutbox, Hub, Repo}
 
   setup [:create_account, :create_owned_file, :create_scene]
 
@@ -106,7 +106,7 @@ defmodule RetWeb.BotConfigApprovalControllerTest do
     refute conn.resp_body =~ secret_prompt
   end
 
-  test "quarantine and approve use an expected fingerprint and synchronize runtime", %{
+  test "quarantine and approve use an expected fingerprint and enqueue ordered runtime", %{
     admin: admin,
     conn: conn,
     scene: scene
@@ -121,11 +121,10 @@ defmodule RetWeb.BotConfigApprovalControllerTest do
     assert get_resp_header(quarantine_conn, "cache-control") == ["no-store"]
     assert %{"status" => "quarantined"} = json_response(quarantine_conn, 200)
 
-    assert_receive {:bot_orchestrator_request, :post,
-                    "http://bot-orchestrator.test/internal/bots/room-stop", stop_body, _headers,
-                    _options}
-
-    assert Poison.decode!(stop_body) == %{"hub_sid" => hub.hub_sid}
+    stop = Repo.get_by!(BotRuntimeOutbox, hub_id: hub.hub_id, runtime_revision: 2)
+    assert stop.event_kind == "stop"
+    assert stop.hub_sid == hub.hub_sid
+    assert is_integer(stop.revoke_epoch) and stop.revoke_epoch > 0
 
     approval = Repo.get!(BotConfigApproval, hub.hub_id)
     assert {:ok, fingerprint} = BotConfigApproval.fingerprint(approval.candidate_bots)
@@ -153,15 +152,45 @@ defmodule RetWeb.BotConfigApprovalControllerTest do
     assert get_resp_header(approve_conn, "cache-control") == ["no-store"]
     assert %{"status" => "approved"} = json_response(approve_conn, 200)
 
-    assert_receive {:bot_orchestrator_request, :post,
-                    "http://bot-orchestrator.test/internal/bots/room-config", config_body,
-                    _headers, _options}
-
-    assert %{"hub_sid" => hub_sid, "bots" => %{"enabled" => true}} =
-             Poison.decode!(config_body)
-
-    assert hub_sid == hub.hub_sid
+    config = Repo.get_by!(BotRuntimeOutbox, hub_id: hub.hub_id, runtime_revision: 3)
+    assert config.event_kind == "config"
+    assert config.hub_sid == hub.hub_sid
+    assert config.bots["enabled"]
+    assert is_nil(config.delivered_at)
+    refute_receive {:bot_orchestrator_request, _, _, _, _, _}
     assert BotConfigApproval.runtime_enabled?(Repo.get!(Hub, hub.hub_id))
+  end
+
+  test "approve reports a stable conflict for a closed room and changes no revision", %{
+    admin: admin,
+    conn: conn,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Closed API approval")
+
+    assert {:ok, _closed} =
+             hub
+             |> Ecto.Changeset.change(entry_mode: :deny)
+             |> BotConfigAdmission.update(admin)
+
+    before_hub = Repo.get!(Hub, hub.hub_id)
+    before_approval = Repo.get!(BotConfigApproval, hub.hub_id)
+    assert before_approval.runtime_revision == 2
+    assert {:ok, fingerprint} = BotConfigApproval.fingerprint(before_approval.candidate_bots)
+
+    approve_conn =
+      conn
+      |> auth_with_account(admin)
+      |> post("/api/v1/bot_config_approvals/#{hub.hub_sid}/approve", %{
+        expected_config_fingerprint: fingerprint
+      })
+
+    assert get_resp_header(approve_conn, "cache-control") == ["no-store"]
+    assert %{"error" => "room_closed"} = json_response(approve_conn, 409)
+    assert Repo.get!(Hub, hub.hub_id) == before_hub
+    assert Repo.get!(BotConfigApproval, hub.hub_id) == before_approval
+    assert Repo.get_by(BotRuntimeOutbox, hub_id: hub.hub_id, runtime_revision: 3) == nil
+    refute_receive {:bot_orchestrator_request, _, _, _, _, _}
   end
 
   defp insert_active_hub(scene, admin, name, user_data \\ active_user_data()) do

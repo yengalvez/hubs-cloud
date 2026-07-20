@@ -7,7 +7,7 @@ const BASE_RESOURCE_TUPLES = Object.freeze([
 ]);
 
 const RUNNER_POD_TUPLES = Object.freeze(
-  ["create", "delete", "get", "list"].map(verb => ["", "pods", verb])
+  ["create", "delete", "get", "list", "patch"].map(verb => ["", "pods", verb])
 );
 
 const BASE_NON_RESOURCE_URLS = Object.freeze([
