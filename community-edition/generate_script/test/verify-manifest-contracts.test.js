@@ -257,9 +257,9 @@ test("requires globally unique resource identities and exact critical resource c
   assert.match(deploymentErrors, /exactly one Deployment\/bot-orchestrator/);
 });
 
-test("requires the exact 58-resource two-namespace apiVersion/kind/namespace/name inventory", () => {
+test("requires the exact 66-resource two-namespace apiVersion/kind/namespace/name inventory", () => {
   const resources = validInventoryResources();
-  assert.equal(resources.length, 58);
+  assert.equal(resources.length, 66);
   assert.deepEqual(verifyManifestResourceInventory(resources), []);
 
   const extraJob = {
@@ -269,7 +269,7 @@ test("requires the exact 58-resource two-namespace apiVersion/kind/namespace/nam
   };
   const extraErrors = verifyManifestResourceInventory([...resources, extraJob]).join("\n");
   assert.match(extraErrors, /unexpected resource/);
-  assert.match(extraErrors, /exactly 58/);
+  assert.match(extraErrors, /exactly 66/);
 
   const wrongNamespace = clone(resources);
   wrongNamespace.find(resource => resource.kind === "Secret").metadata.namespace = "other";
@@ -282,7 +282,7 @@ test("requires the exact 58-resource two-namespace apiVersion/kind/namespace/nam
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "pgsql-pv" } },
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "ret-pv" } }
   );
-  assert.equal(manualResources.length, 60);
+  assert.equal(manualResources.length, 68);
   assert.deepEqual(verifyManifestResourceInventory(manualResources), []);
 
   const incompleteManual = manualResources.filter(resource => resource.metadata?.name !== "ret-pv");
@@ -600,12 +600,34 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
 
   const admission = resources.find(resource => resource.kind === "ValidatingAdmissionPolicy");
   const expressions = admission.spec.validations.map(validation => validation.expression).join("\n");
+  const variables = new Map(admission.spec.variables.map(variable => [variable.name, variable.expression]));
+  const validations = new Map(admission.spec.validations.map(validation => [validation.message, validation.expression]));
+  const exactPodSubresourceRules = [
+    {
+      apiGroups: [""],
+      apiVersions: ["v1"],
+      operations: ["CREATE", "UPDATE", "DELETE"],
+      resources: ["pods", "pods/ephemeralcontainers", "pods/eviction", "pods/resize"],
+      scope: "Namespaced"
+    },
+    {
+      apiGroups: [""],
+      apiVersions: ["v1"],
+      operations: ["CONNECT"],
+      resources: ["pods/attach", "pods/exec", "pods/portforward", "pods/proxy"],
+      scope: "Namespaced"
+    }
+  ];
   assert.equal(admission.spec.matchConditions, undefined, "the exact policy must apply to every caller");
-  assert.match(
-    admission.spec.validations[0].expression,
-    /request\.operation == 'DELETE' \|\|\s*\(request\.userInfo\.username/,
-    "RBAC-authorized DELETE must not require Pod-bound ServiceAccount extras"
+  assert.deepEqual(admission.spec.matchConstraints.resourceRules, exactPodSubresourceRules);
+  assert.equal(validations.get(
+    "runner Pod eviction, executable access, ephemeral-container injection and in-place resize subresources are disabled; use the guarded stop or break-glass workflow"
+  ), "request.subResource == ''");
+  const mutationAuthorization = validations.get(
+    "runner Pod mutations require the exact phase-bound parent or shape-limited recovery operator principal"
   );
+  assert.match(mutationAuthorization, /variables\.recoveryOperator && variables\.isFence/);
+  assert.match(mutationAuthorization, /variables\.parentPrincipal \|\| variables\.recoveryOperator/);
   assert.doesNotMatch(expressions, /system:masters|do-role-name:Owner/);
   assert.match(expressions, /size\(variables\.annotations\) == 4/);
   assert.match(expressions, /appArmorProfile\.type == 'RuntimeDefault'/);
@@ -614,17 +636,28 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
   assert.match(expressions, /container\.image == '\$BOT_RUNNER_IMAGE'/);
   assert.match(expressions, /size\(variables\.env\) == 23/);
   assert.match(expressions, /request\.options\.preconditions\.uid/);
-  assert.match(expressions, /request\.operation == 'DELETE' \|\|/);
-  assert.doesNotMatch(expressions, /oldObject\.spec/);
+  assert.match(variables.get("isIntent"), /bot-runner-intent/);
+  assert.match(variables.get("isFence"), /bot-runner-fence/);
+  assert.match(expressions, /non-executable-guard@sha256:0{64}/);
+  assert.match(expressions, /schedulerName == 'yenhubs-guard-scheduler'/);
+  assert.match(expressions, /exists\(t, t\.key == 'node\.kubernetes\.io\/not-ready'\)/);
+
+  const lifecycle = validations.get(
+    "only exact runner, intent, and fence lifecycle operations are allowed; fences are permanent"
+  );
+  assert.match(lifecycle, /request\.operation == 'UPDATE' && variables\.isIntent/);
+  assert.match(lifecycle, /!variables\.isFence/);
+
+  const intentCas = validations.get(
+    "intent UPDATE permits only the exact UID and resourceVersion CAS transition from unarmed to armed"
+  );
+  assert.match(intentCas, /oldObject\.metadata\.uid == object\.metadata\.uid/);
+  assert.match(intentCas, /oldObject\.metadata\.resourceVersion == object\.metadata\.resourceVersion/);
+  assert.match(intentCas, /oldObject\.spec == object\.spec/);
+  assert.match(intentCas, /== 'unarmed'/);
+  assert.match(intentCas, /== 'armed'/);
 
   const deleteUidValidation = admission.spec.validations.at(-1).expression;
-  for (const validation of admission.spec.validations.slice(0, -1)) {
-    assert.match(
-      validation.expression,
-      /request\.operation == 'DELETE' \|\|/,
-      "every CREATE identity/spec validation must allow RBAC-authorized cleanup of a drifted Pod"
-    );
-  }
   assert.match(deleteUidValidation, /has\(request\.options\.preconditions\.uid\)/);
   assert.match(
     deleteUidValidation,
@@ -635,6 +668,97 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
   assert.equal(portableDeleteFixture("pod-uid", "pod-uid"), true);
   assert.equal(portableDeleteFixture("pod-uid", undefined), false);
   assert.equal(portableDeleteFixture("pod-uid", "replacement-uid"), false);
+
+  const durablePolicy = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "bot-runner-durable-protocol.yenhubs.org"
+  );
+  assert.deepEqual(durablePolicy.spec.matchConstraints.resourceRules, exactPodSubresourceRules);
+  assert.equal(
+    durablePolicy.spec.validations[0].expression,
+    "request.subResource == ''"
+  );
+  const protectedSubresources = durablePolicy.spec.matchConstraints.resourceRules
+    .flatMap(rule => rule.resources);
+  for (const required of [
+    "pods/eviction", "pods/ephemeralcontainers", "pods/resize",
+    "pods/exec", "pods/attach", "pods/portforward", "pods/proxy"
+  ]) {
+    assert.equal(protectedSubresources.includes(required), true, `${required} must be denied`);
+  }
+  for (const allowedSystemSurface of ["pods/status", "pods/binding", "pods/log"]) {
+    assert.equal(
+      protectedSubresources.includes(allowedSystemSurface),
+      false,
+      `${allowedSystemSurface} must remain outside the denial rule`
+    );
+  }
+  for (const policyName of [
+    "bot-runner-pods.yenhubs.org",
+    "bot-runner-durable-protocol.yenhubs.org"
+  ]) {
+    const bypass = clone(resources);
+    bypass.find(resource =>
+      resource.kind === "ValidatingAdmissionPolicy" && resource.metadata?.name === policyName
+    ).spec.matchConstraints.resourceRules[0].resources = ["pods"];
+    assert.notDeepEqual(verifyBotRunnerAdmissionResources(bypass, "$Namespace"), []);
+  }
+
+  const journalPolicy = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "yenhubs-runner-cutover-journal-v2"
+  );
+  const journalBinding = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource.metadata?.name === "yenhubs-runner-cutover-journal-v2"
+  );
+  assert.deepEqual(
+    journalPolicy.spec.matchConstraints.resourceRules[0].operations,
+    ["UPDATE", "DELETE"]
+  );
+  assert.deepEqual(journalPolicy.spec.matchConstraints.resourceRules[0].resources, ["configmaps"]);
+  assert.match(journalPolicy.spec.matchConditions[0].expression, /yenhubs-runner-cutover-v2/);
+  assert.match(
+    journalPolicy.spec.matchConditions[0].expression,
+    /request\.operation == 'DELETE' && request\.name == ''/,
+    "DeleteCollection uses an empty admission request.name and must fail closed"
+  );
+  assert.equal(journalPolicy.spec.validations[0].expression, "false");
+  assert.deepEqual(journalBinding.spec.validationActions, ["Deny"]);
+  const deletableJournal = clone(resources);
+  deletableJournal.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "yenhubs-runner-cutover-journal-v2"
+  ).spec.validations[0].expression = "request.operation != 'DELETE'";
+  assert.notDeepEqual(verifyBotRunnerAdmissionResources(deletableJournal, "$Namespace"), []);
+
+  const parentFencePolicy = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "bot-orchestrator-fence-protocol.yenhubs.org"
+  );
+  assert.deepEqual(
+    parentFencePolicy.spec.matchConstraints.resourceRules[0].resources,
+    ["deployments", "deployments/scale"],
+    "the Deployment scale subresource must be explicitly matched"
+  );
+  assert.equal(
+    parentFencePolicy.spec.validations.some(validation =>
+      validation.expression === "request.subResource != 'scale'"
+    ),
+    true,
+    "all deployments/scale updates must fail closed"
+  );
+  assert.match(
+    parentFencePolicy.spec.matchConditions[0].expression,
+    /request\.operation == 'DELETE' && request\.name == ''/,
+    "Deployment DeleteCollection also uses an empty request.name and must fail closed"
+  );
+  const scalableParent = clone(resources);
+  scalableParent.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "bot-orchestrator-fence-protocol.yenhubs.org"
+  ).spec.matchConstraints.resourceRules[0].resources = ["deployments"];
+  assert.notDeepEqual(verifyBotRunnerAdmissionResources(scalableParent, "$Namespace"), []);
 });
 
 test("keeps Reticulum singleton until multi-replica storage and operational gates are staged", () => {

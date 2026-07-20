@@ -3,7 +3,8 @@ defmodule Ret.BotConfigAdmissionTest do
 
   import Ret.TestHelpers
 
-  alias Ret.{BotConfigAdmission, BotConfigApproval, Hub, Repo}
+  alias Ecto.Adapters.SQL
+  alias Ret.{BotConfigAdmission, BotConfigApproval, BotRuntimeOutbox, Hub, Repo}
   alias Ret.Api.{Credentials, Scopes}
 
   setup [:create_account, :create_owned_file, :create_scene]
@@ -59,6 +60,26 @@ defmodule Ret.BotConfigAdmissionTest do
            ).user_data
 
     refute Repo.get_by(Hub, name: "Staged")
+  end
+
+  test "closing a room that never had bots does not create runtime approval or stop noise", %{
+    account: account,
+    scene: scene
+  } do
+    {:ok, hub} =
+      %Hub{}
+      |> Hub.changeset(scene, %{name: "No bot close"})
+      |> Hub.add_account_to_changeset(account)
+      |> BotConfigAdmission.insert(account)
+
+    assert {:ok, closed} =
+             hub
+             |> Hub.changeset_for_entry_mode(:deny)
+             |> BotConfigAdmission.update(account)
+
+    assert closed.entry_mode == :deny
+    refute Repo.get(BotConfigApproval, hub.hub_id)
+    refute Repo.exists?(from o in BotRuntimeOutbox, where: o.hub_id == ^hub.hub_id)
   end
 
   test "a stale administrator struct cannot authorize after the account is disabled", %{
@@ -164,6 +185,18 @@ defmodule Ret.BotConfigAdmissionTest do
              raw_denied
            ).user_data
 
+    numeric_drift = put_in(preserved, ["bots", "count"], 1.0)
+
+    assert {:error, numeric_drift_denied} =
+             preserved_hub
+             |> Ecto.Changeset.change()
+             |> Ecto.Changeset.force_change(:user_data, numeric_drift)
+             |> BotConfigAdmission.update(account)
+
+    assert "only a global administrator may create or modify room bot configuration" in errors_on(
+             numeric_drift_denied
+           ).user_data
+
     disabled = put_in(preserved, ["bots", "enabled"], false)
     disabled_and_modified = put_in(disabled, ["bots", "prompt"], "staged by owner")
 
@@ -182,6 +215,111 @@ defmodule Ret.BotConfigAdmissionTest do
              |> BotConfigAdmission.update(account)
 
     refute disabled_hub.user_data["bots"]["enabled"]
+  end
+
+  test "exact disable accepts only the three admitted true representations", %{
+    account: account,
+    admin: admin,
+    scene: scene
+  } do
+    for {enabled, suffix} <- [{true, "boolean"}, {"true", "string"}, {1, "integer"}] do
+      {:ok, hub} = insert_active_hub(scene, admin, "Exact disable #{suffix}")
+      raw_user_data = put_in(hub.user_data, ["bots", "enabled"], enabled)
+
+      assert {:ok, hub} =
+               hub
+               |> Ecto.Changeset.change()
+               |> Ecto.Changeset.force_change(:user_data, raw_user_data)
+               |> BotConfigAdmission.update(admin)
+
+      assert hub.user_data["bots"]["enabled"] === enabled
+      assert BotConfigApproval.runtime_enabled?(hub)
+
+      disabled = put_in(hub.user_data, ["bots", "enabled"], false)
+
+      assert {:ok, disabled_hub} =
+               hub
+               |> Ecto.Changeset.change()
+               |> Ecto.Changeset.force_change(:user_data, disabled)
+               |> BotConfigAdmission.update(account)
+
+      refute disabled_hub.user_data["bots"]["enabled"]
+    end
+
+    {:ok, hub} = insert_active_hub(scene, admin, "Float is not exact disable")
+    float_user_data = put_in(hub.user_data, ["bots", "enabled"], 1.0)
+
+    drifted_hub =
+      hub
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.force_change(:user_data, float_user_data)
+      |> Repo.update!()
+
+    assert drifted_hub.user_data["bots"]["enabled"] === 1.0
+    disabled = put_in(drifted_hub.user_data, ["bots", "enabled"], false)
+
+    assert {:error, denied} =
+             drifted_hub
+             |> Ecto.Changeset.change()
+             |> Ecto.Changeset.force_change(:user_data, disabled)
+             |> BotConfigAdmission.update(account)
+
+    assert "only a global administrator may create or modify room bot configuration" in errors_on(
+             denied
+           ).user_data
+  end
+
+  test "an integer-to-float mutation is quarantined with a fenced stop", %{
+    admin: admin,
+    scene: scene
+  } do
+    {:ok, hub} = insert_active_hub(scene, admin, "Numeric type drift")
+
+    drifted_user_data = put_in(hub.user_data, ["bots", "count"], 1.0)
+
+    assert {:ok, drifted_hub} =
+             hub
+             |> Ecto.Changeset.change()
+             |> Ecto.Changeset.force_change(:user_data, drifted_user_data)
+             |> BotConfigAdmission.update(admin)
+
+    assert drifted_hub.user_data["bots"]["count"] === 1.0
+    refute BotConfigApproval.runtime_enabled?(drifted_hub)
+
+    approval = Repo.get!(BotConfigApproval, hub.hub_id)
+    assert approval.state == "quarantined"
+    assert approval.runtime_revision == 2
+    assert approval.candidate_bots["count"] === 1.0
+    assert approval.last_quarantine_reason == "bots_disabled"
+    refute approval.approved_bots
+
+    assert [config, stop] =
+             Repo.all(
+               from(o in BotRuntimeOutbox,
+                 where: o.hub_id == ^hub.hub_id,
+                 order_by: [asc: o.runtime_revision]
+               )
+             )
+
+    assert config.runtime_revision == 1
+    assert config.event_kind == "config"
+    assert stop.runtime_revision == 2
+    assert stop.event_kind == "stop"
+    assert is_integer(stop.revoke_epoch) and stop.revoke_epoch > 0
+    refute stop.bots
+
+    assert %{rows: [[nil, nil, nil, lease_epoch, nil]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT lease_id, holder_instance_id, session_id, authority_epoch, expires_at
+               FROM ret0.bot_runner_leases
+               WHERE hub_id = $1
+               """,
+               [hub.hub_id]
+             )
+
+    assert lease_epoch == stop.revoke_epoch
   end
 
   test "ordinary updates cannot strip future approved bot fields through normalization", %{
@@ -326,6 +464,26 @@ defmodule Ret.BotConfigAdmissionTest do
     assert staged_hub.entry_mode == :deny
     assert staged_hub.user_data["bots"]["enabled"]
 
+    staged_approval = Repo.get!(BotConfigApproval, staged_hub.hub_id)
+    assert staged_approval.state == "quarantined"
+    assert staged_approval.runtime_revision == 1
+    assert staged_approval.candidate_bots == staged_hub.user_data["bots"]
+    assert staged_approval.last_quarantine_reason == "room_closed"
+    refute staged_approval.approved_bots
+
+    assert [%BotRuntimeOutbox{} = stop] =
+             Repo.all(
+               from(o in BotRuntimeOutbox,
+                 where: o.hub_id == ^staged_hub.hub_id,
+                 order_by: [asc: o.runtime_revision]
+               )
+             )
+
+    assert stop.runtime_revision == 1
+    assert stop.event_kind == "stop"
+    assert is_integer(stop.revoke_epoch) and stop.revoke_epoch > 0
+    refute stop.bots
+
     assert {:error, denied} = BotConfigAdmission.update(stale_reopen, account)
 
     assert "only a global administrator may create or modify room bot configuration" in errors_on(
@@ -339,6 +497,12 @@ defmodule Ret.BotConfigAdmissionTest do
 
     assert reopened.entry_mode == :allow
     assert reopened.user_data["bots"]["enabled"]
+    assert Repo.get!(BotConfigApproval, reopened.hub_id).runtime_revision == 1
+
+    assert Repo.aggregate(
+             from(o in BotRuntimeOutbox, where: o.hub_id == ^reopened.hub_id),
+             :count
+           ) == 1
   end
 
   test "concurrent admissions persist exactly the configured ceiling", %{
@@ -394,6 +558,19 @@ defmodule Ret.BotConfigAdmissionTest do
                  :hub_id
                ) == 2
       after
+        matching_hubs = from h in Hub, where: like(h.name, ^"#{prefix}%"), select: h.hub_id
+        matching_outbox = from o in BotRuntimeOutbox, where: o.hub_id in subquery(matching_hubs)
+
+        Repo.update_all(matching_outbox,
+          set: [
+            delivered_at: DateTime.utc_now(),
+            claim_owner: nil,
+            claim_token: nil,
+            claim_expires_at: nil
+          ]
+        )
+
+        Repo.delete_all(matching_outbox)
         Repo.delete_all(from h in Hub, where: like(h.name, ^"#{prefix}%"))
         Repo.delete!(admin)
       end

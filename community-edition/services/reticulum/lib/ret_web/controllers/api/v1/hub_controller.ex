@@ -1,7 +1,7 @@
 defmodule RetWeb.Api.V1.HubController do
   use RetWeb, :controller
 
-  alias Ret.{BotConfig, BotConfigAdmission, BotOrchestrator, Hub, Scene, Repo}
+  alias Ret.{BotConfigAdmission, Hub, Scene, Repo}
 
   import Canada, only: [can?: 2]
 
@@ -91,10 +91,6 @@ defmodule RetWeb.Api.V1.HubController do
 
     case hub |> Hub.changeset_for_entry_mode(:deny) |> BotConfigAdmission.update(nil) do
       {:ok, _closed_hub} ->
-        if BotConfig.active?(hub.user_data) do
-          _ = BotOrchestrator.room_stop(%{hub_sid: hub.hub_sid})
-        end
-
         conn |> send_resp(200, "OK")
 
       {:error, _changeset} ->

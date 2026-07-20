@@ -15,7 +15,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     |> where([h], h.hub_sid != "admin")
     |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
     |> BotConfig.with_active_bot_config()
-    |> BotConfigApproval.with_runtime_approval()
+    |> BotConfigApproval.with_runtime_snapshot_approval()
     |> send_bot_snapshot(conn)
   end
 
@@ -35,7 +35,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     |> where([h], h.hub_sid != "admin")
     |> where([h], is_nil(h.entry_mode) or h.entry_mode != :deny)
     |> BotConfig.with_active_bot_config()
-    |> BotConfigApproval.with_runtime_approval()
+    |> BotConfigApproval.with_runtime_snapshot_approval()
     |> send_bot_snapshot(conn)
   end
 
@@ -44,8 +44,9 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
       query
       |> order_by([h], asc: h.hub_sid)
       |> limit(^(@max_configured_bot_hubs + 1))
-      |> select([h], %{
+      |> select([h, runtime_approval: approval], %{
         hub_sid: h.hub_sid,
+        runtime_revision: approval.runtime_revision,
         bot_config_bytes: fragment("octet_length((?->'bots')::text)", h.user_data),
         bots:
           fragment(
@@ -90,7 +91,12 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     end
   end
 
-  defp to_bot_hub_entry(%{hub_sid: hub_sid, bots: raw_bots, last_active_at: last_active_at}) do
+  defp to_bot_hub_entry(%{
+         hub_sid: hub_sid,
+         runtime_revision: runtime_revision,
+         bots: raw_bots,
+         last_active_at: last_active_at
+       }) do
     bots = BotConfig.normalize(%{"bots" => raw_bots})
     enabled = bots["enabled"]
     count = bots["count"]
@@ -98,6 +104,7 @@ defmodule RetWeb.ApiInternal.V1.BotsController do
     if enabled && count > 0 do
       %{
         hub_sid: hub_sid,
+        runtime_revision: runtime_revision,
         bots: %{
           enabled: enabled,
           count: count,

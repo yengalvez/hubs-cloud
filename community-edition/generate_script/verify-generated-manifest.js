@@ -27,6 +27,12 @@ const {
   verifyReticulumBotRunnerAuthorityContract
 } = require("./verify-manifest-contracts");
 
+const verifierArguments = process.argv.slice(2);
+const stdinMode = verifierArguments.length === 1 && verifierArguments[0] === "--stdin";
+if (verifierArguments.length > 0 && !stdinMode) {
+  console.error("Manifest verification failed:\n- arguments must be empty or exactly --stdin");
+  process.exit(1);
+}
 const manifestPath = process.env.HCCE_MANIFEST_PATH
   ? path.resolve(process.env.HCCE_MANIFEST_PATH)
   : path.resolve(__dirname, "../hcce.yaml");
@@ -135,10 +141,10 @@ function verifyResourceBudget(resources, namespace, deploymentName, containerNam
   }
 }
 
-if (!fs.existsSync(manifestPath)) {
+if (!stdinMode && !fs.existsSync(manifestPath)) {
   fail(`manifest not found: ${manifestPath}`);
 } else {
-  const raw = fs.readFileSync(manifestPath, "utf8");
+  const raw = stdinMode ? fs.readFileSync(0, "utf8") : fs.readFileSync(manifestPath, "utf8");
   const documents = YAML.parseAllDocuments(raw);
   documents.forEach((document, index) => {
     document.errors.forEach(error => fail(`YAML document ${index + 1}: ${error.message}`));

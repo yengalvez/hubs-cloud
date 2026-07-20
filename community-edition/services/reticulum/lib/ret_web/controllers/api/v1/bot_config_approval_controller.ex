@@ -1,7 +1,7 @@
 defmodule RetWeb.Api.V1.BotConfigApprovalController do
   use RetWeb, :controller
 
-  alias Ret.{BotConfig, BotConfigApproval, BotOrchestrator}
+  alias Ret.BotConfigApproval
 
   def index(conn, params) do
     conn
@@ -17,8 +17,6 @@ defmodule RetWeb.Api.V1.BotConfigApprovalController do
 
     case BotConfigApproval.approve_candidate(hub_sid, expected_fingerprint, actor) do
       {:ok, hub} ->
-        sync_runtime(hub)
-
         conn
         |> no_store()
         |> json(%{status: "approved", hub_sid: hub.hub_sid})
@@ -35,8 +33,6 @@ defmodule RetWeb.Api.V1.BotConfigApprovalController do
 
     case BotConfigApproval.quarantine(hub_sid, actor) do
       {:ok, hub} ->
-        _ = BotOrchestrator.room_stop(%{hub_sid: hub.hub_sid})
-
         conn
         |> no_store()
         |> json(%{status: "quarantined", hub_sid: hub.hub_sid})
@@ -48,20 +44,6 @@ defmodule RetWeb.Api.V1.BotConfigApprovalController do
 
   def quarantine(conn, _params), do: send_error(conn, :invalid_request)
 
-  defp sync_runtime(hub) do
-    if BotConfigApproval.runtime_enabled?(hub) do
-      _ =
-        BotOrchestrator.room_config(%{
-          hub_sid: hub.hub_sid,
-          bots: BotConfig.normalize(hub.user_data)
-        })
-    else
-      _ = BotOrchestrator.room_stop(%{hub_sid: hub.hub_sid})
-    end
-
-    :ok
-  end
-
   defp send_error(conn, reason) do
     status =
       case reason do
@@ -69,6 +51,7 @@ defmodule RetWeb.Api.V1.BotConfigApprovalController do
         :forbidden -> 403
         :fingerprint_mismatch -> 409
         :room_limit -> 409
+        :room_closed -> 409
         :config_too_large -> 422
         :inactive_candidate -> 422
         :approval_unavailable -> 503

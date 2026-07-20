@@ -2,7 +2,7 @@ defmodule RetWeb.HubControllerTest do
   use RetWeb.ConnCase
   import Ret.TestHelpers
 
-  alias Ret.{Hub, Scene, Repo, AppConfig}
+  alias Ret.{AppConfig, BotRuntimeOutbox, Hub, Repo, Scene}
 
   setup [:create_account, :create_owned_file, :create_scene]
 
@@ -165,14 +165,12 @@ defmodule RetWeb.HubControllerTest do
     refute closed.user_data["bots"]["enabled"]
     assert closed.user_data["bots"]["count"] == 1
 
-    assert_receive {:bot_orchestrator_request, :post,
-                    "http://bot-orchestrator.test/internal/bots/room-stop", body, headers,
-                    options}
-
-    assert Poison.decode!(body) == %{"hub_sid" => hub_id}
-    assert {"x-ret-bot-orchestrator-access-key", String.duplicate("k", 32)} in headers
-    assert options[:timeout] == 5_000
-    assert options[:recv_timeout] == 5_000
+    stop = Repo.get_by!(BotRuntimeOutbox, hub_id: closed.hub_id, runtime_revision: 2)
+    assert stop.event_kind == "stop"
+    assert stop.hub_sid == hub_id
+    assert is_integer(stop.revoke_epoch) and stop.revoke_epoch > 0
+    assert is_nil(stop.delivered_at)
+    refute_receive {:bot_orchestrator_request, _, _, _, _, _}
   end
 
   @tag :authenticated

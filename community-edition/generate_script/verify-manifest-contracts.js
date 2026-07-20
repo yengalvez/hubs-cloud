@@ -374,11 +374,19 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     namespaced("rbac.authorization.k8s.io", "Role", "bot-orchestrator-runner-pods"),
     namespaced("rbac.authorization.k8s.io", "RoleBinding", "bot-orchestrator-runner-pods"),
     ["", "ServiceAccount", "hcce-bot-runners", "bot-runner"],
+    ["", "ServiceAccount", "hcce-bot-runners", "bot-runner-guard"],
     ["", "ResourceQuota", "hcce-bot-runners", "bot-runner-capacity"],
+    ["", "ResourceQuota", "hcce-bot-runners", "bot-runner-guard-capacity"],
     ["rbac.authorization.k8s.io", "Role", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
     ["rbac.authorization.k8s.io", "RoleBinding", "hcce-bot-runners", "bot-orchestrator-runner-pods"],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "bot-runner-pods.yenhubs.org"],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "bot-runner-pods.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "bot-runner-durable-protocol.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "bot-runner-durable-protocol.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "yenhubs-runner-cutover-journal-v2"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "yenhubs-runner-cutover-journal-v2"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "bot-orchestrator-fence-protocol.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "bot-orchestrator-fence-protocol.yenhubs.org"],
     namespaced("", "Service", "pgsql"),
     namespaced("apps", "Deployment", "pgsql"),
     namespaced("apps", "Deployment", "pgbouncer"),
@@ -877,7 +885,7 @@ function expectedBotRunnerControlPlaneResources(
   }
   const runnerRoleRules = activationPhase === "bootstrap" || recoveryPhase === "restore-fence"
     ? []
-    : [{ apiGroups: [""], resources: ["pods"], verbs: ["create", "delete", "get", "list"] }];
+    : [{ apiGroups: [""], resources: ["pods"], verbs: ["create", "delete", "get", "list", "patch"] }];
   return [
     {
       identity: ["", "Namespace", "", "hcce-bot-runners"],
@@ -955,6 +963,7 @@ function expectedBotRunnerControlPlaneResources(
         kind: "ResourceQuota",
         metadata: { name: "bot-runner-capacity", namespace: "hcce-bot-runners" },
         spec: {
+          scopes: ["NotBestEffort"],
           hard: {
             pods: "10",
             "requests.cpu": "250m",
@@ -962,6 +971,27 @@ function expectedBotRunnerControlPlaneResources(
             "limits.cpu": "5",
             "limits.memory": "5Gi"
           }
+        }
+      }
+    },
+    {
+      identity: ["", "ServiceAccount", "hcce-bot-runners", "bot-runner-guard"],
+      value: {
+        apiVersion: "v1",
+        kind: "ServiceAccount",
+        metadata: { name: "bot-runner-guard", namespace: "hcce-bot-runners" },
+        automountServiceAccountToken: false
+      }
+    },
+    {
+      identity: ["", "ResourceQuota", "hcce-bot-runners", "bot-runner-guard-capacity"],
+      value: {
+        apiVersion: "v1",
+        kind: "ResourceQuota",
+        metadata: { name: "bot-runner-guard-capacity", namespace: "hcce-bot-runners" },
+        spec: {
+          scopes: ["BestEffort"],
+          hard: { pods: "100" }
         }
       }
     },
@@ -1125,7 +1155,7 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
     : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
 }
 
-const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "8f5c8a716c8dba13af3dc9840b641cacc4f9c19c494f31933882f7197d4f4ba5";
+const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "9d23e5f2b2d0fb6cef513626065d12ddec629fa9f6496584f2ad5342e2d4c533";
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1157,6 +1187,48 @@ function botRunnerAdmissionTemplateResources() {
       "ValidatingAdmissionPolicyBinding",
       "",
       "bot-runner-pods.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicy",
+      "",
+      "bot-runner-durable-protocol.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicyBinding",
+      "",
+      "bot-runner-durable-protocol.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicy",
+      "",
+      "yenhubs-runner-cutover-journal-v2"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicyBinding",
+      "",
+      "yenhubs-runner-cutover-journal-v2"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicy",
+      "",
+      "bot-orchestrator-fence-protocol.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicyBinding",
+      "",
+      "bot-orchestrator-fence-protocol.yenhubs.org"
     )
   ];
 }
@@ -1171,8 +1243,13 @@ function botRunnerAdmissionRenderValues(resources, namespace) {
   }
   const values = {
     Namespace: namespace,
+    BOT_ORCHESTRATOR_IMAGE: container?.image,
     HUB_DOMAIN: hubsBaseUrl.slice("https://".length),
-    BOT_RUNNER_IMAGE: env.get("BOT_RUNNER_IMAGE")
+    BOT_RUNNER_IMAGE: env.get("BOT_RUNNER_IMAGE"),
+    BOT_RUNNER_ACTIVATION_PHASE:
+      deployment?.metadata?.annotations?.["yenhubs.org/runner-activation-phase"],
+    BOT_RUNNER_RECOVERY_PHASE:
+      deployment?.metadata?.annotations?.["yenhubs.org/bot-runner-recovery-phase"]
   };
   for (const name of [
     "GHOST_FEATURED_FETCH_TIMEOUT_MS",

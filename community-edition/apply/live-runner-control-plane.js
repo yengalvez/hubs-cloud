@@ -1,9 +1,15 @@
 const { isDeepStrictEqual } = require("node:util");
 const {
   ADMISSION_POLICY_NAME,
+  CUTOVER_JOURNAL_POLICY_NAME,
+  PARENT_FENCE_POLICY_NAME,
+  RUNNER_PROTOCOL_POLICY_NAME,
   RUNNER_NAMESPACE,
   admissionPolicyIsObserved,
-  exactAdmissionBinding
+  exactAdmissionBinding,
+  exactCutoverJournalBinding,
+  exactParentFenceBinding,
+  exactRunnerProtocolBinding
 } = require("./runner-activation");
 
 const SERVER_OWNED_METADATA_FIELDS = new Set([
@@ -69,6 +75,10 @@ function operationalDriftErrors(actual, expected) {
   const errors = [];
   const metadata = actual?.metadata;
   if (!metadata || metadata.deletionTimestamp !== undefined) errors.push("terminating");
+  if (typeof metadata?.uid !== "string" || !metadata.uid) errors.push("metadata_uid_missing");
+  if (typeof metadata?.resourceVersion !== "string" || !metadata.resourceVersion) {
+    errors.push("metadata_resource_version_missing");
+  }
   const expectedMetadata = expected?.metadata || {};
   for (const field of Object.keys(metadata || {})) {
     if (
@@ -127,13 +137,21 @@ function expectedIdentities(namespace) {
     ["rbac.authorization.k8s.io", "Role", namespace, "bot-orchestrator-runner-pods"],
     ["rbac.authorization.k8s.io", "RoleBinding", namespace, "bot-orchestrator-runner-pods"],
     ["", "ServiceAccount", RUNNER_NAMESPACE, "bot-runner"],
+    ["", "ServiceAccount", RUNNER_NAMESPACE, "bot-runner-guard"],
     ["", "ResourceQuota", RUNNER_NAMESPACE, "bot-runner-capacity"],
+    ["", "ResourceQuota", RUNNER_NAMESPACE, "bot-runner-guard-capacity"],
     ["rbac.authorization.k8s.io", "Role", RUNNER_NAMESPACE, "bot-orchestrator-runner-pods"],
     ["rbac.authorization.k8s.io", "RoleBinding", RUNNER_NAMESPACE, "bot-orchestrator-runner-pods"],
     ["networking.k8s.io", "NetworkPolicy", RUNNER_NAMESPACE, "bot-runner-default-deny"],
     ["networking.k8s.io", "NetworkPolicy", RUNNER_NAMESPACE, "bot-runner-egress"],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", ADMISSION_POLICY_NAME],
-    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", ADMISSION_POLICY_NAME]
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", ADMISSION_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", RUNNER_PROTOCOL_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", RUNNER_PROTOCOL_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", CUTOVER_JOURNAL_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", CUTOVER_JOURNAL_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", PARENT_FENCE_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", PARENT_FENCE_POLICY_NAME]
   ];
 }
 
@@ -176,8 +194,44 @@ function verifyLiveRunnerControlPlane(liveResources, generatedResources, namespa
   const binding = liveByIdentity.get(JSON.stringify([
     "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", ADMISSION_POLICY_NAME
   ]));
+  const parentFencePolicy = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", PARENT_FENCE_POLICY_NAME
+  ]));
+  const parentFenceBinding = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", PARENT_FENCE_POLICY_NAME
+  ]));
+  const runnerProtocolPolicy = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", RUNNER_PROTOCOL_POLICY_NAME
+  ]));
+  const runnerProtocolBinding = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", RUNNER_PROTOCOL_POLICY_NAME
+  ]));
+  const cutoverJournalPolicy = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", CUTOVER_JOURNAL_POLICY_NAME
+  ]));
+  const cutoverJournalBinding = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", CUTOVER_JOURNAL_POLICY_NAME
+  ]));
   if (!admissionPolicyIsObserved(policy)) errors.push("runner_admission_policy_not_observed_or_typechecked");
   if (!exactAdmissionBinding(binding)) errors.push("runner_admission_binding_not_exact");
+  if (!admissionPolicyIsObserved(runnerProtocolPolicy)) {
+    errors.push("runner_protocol_admission_policy_not_observed_or_typechecked");
+  }
+  if (!exactRunnerProtocolBinding(runnerProtocolBinding)) {
+    errors.push("runner_protocol_admission_binding_not_exact");
+  }
+  if (!admissionPolicyIsObserved(cutoverJournalPolicy)) {
+    errors.push("cutover_journal_admission_policy_not_observed_or_typechecked");
+  }
+  if (!exactCutoverJournalBinding(cutoverJournalBinding, namespace)) {
+    errors.push("cutover_journal_admission_binding_not_exact");
+  }
+  if (!admissionPolicyIsObserved(parentFencePolicy)) {
+    errors.push("parent_fence_admission_policy_not_observed_or_typechecked");
+  }
+  if (!exactParentFenceBinding(parentFenceBinding, namespace)) {
+    errors.push("parent_fence_admission_binding_not_exact");
+  }
   return errors;
 }
 
@@ -198,8 +252,14 @@ function collectLiveRunnerControlPlane(kubectlJson, namespace) {
   const runnerServiceAccount = kubectlJson([
     "-n", RUNNER_NAMESPACE, "get", "serviceaccount", "bot-runner", "-o", "json"
   ]);
-  const quota = kubectlJson([
+  const guardServiceAccount = kubectlJson([
+    "-n", RUNNER_NAMESPACE, "get", "serviceaccount", "bot-runner-guard", "-o", "json"
+  ]);
+  const runnerQuota = kubectlJson([
     "-n", RUNNER_NAMESPACE, "get", "resourcequota", "bot-runner-capacity", "-o", "json"
+  ]);
+  const guardQuota = kubectlJson([
+    "-n", RUNNER_NAMESPACE, "get", "resourcequota", "bot-runner-guard-capacity", "-o", "json"
   ]);
   const roles = kubectlJson(["-n", RUNNER_NAMESPACE, "get", "roles", "-o", "json"]);
   const roleBindings = kubectlJson([
@@ -214,6 +274,24 @@ function collectLiveRunnerControlPlane(kubectlJson, namespace) {
   const binding = kubectlJson([
     "get", "validatingadmissionpolicybinding", ADMISSION_POLICY_NAME, "-o", "json"
   ]);
+  const parentFencePolicy = kubectlJson([
+    "get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ]);
+  const parentFenceBinding = kubectlJson([
+    "get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"
+  ]);
+  const runnerProtocolPolicy = kubectlJson([
+    "get", "validatingadmissionpolicy", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"
+  ]);
+  const runnerProtocolBinding = kubectlJson([
+    "get", "validatingadmissionpolicybinding", RUNNER_PROTOCOL_POLICY_NAME, "-o", "json"
+  ]);
+  const cutoverJournalPolicy = kubectlJson([
+    "get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ]);
+  const cutoverJournalBinding = kubectlJson([
+    "get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
+  ]);
   if (
     ![roles, roleBindings, networkPolicies].every(value => Array.isArray(value?.items))
   ) {
@@ -226,12 +304,20 @@ function collectLiveRunnerControlPlane(kubectlJson, namespace) {
     legacyRole,
     legacyBinding,
     runnerServiceAccount,
-    quota,
+    guardServiceAccount,
+    runnerQuota,
+    guardQuota,
     ...roles.items,
     ...roleBindings.items,
     ...networkPolicies.items,
     policy,
-    binding
+    binding,
+    runnerProtocolPolicy,
+    runnerProtocolBinding,
+    cutoverJournalPolicy,
+    cutoverJournalBinding,
+    parentFencePolicy,
+    parentFenceBinding
   ];
 }
 
