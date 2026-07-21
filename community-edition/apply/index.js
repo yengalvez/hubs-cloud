@@ -44,10 +44,22 @@ const {
 const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
+  completeWatchListResourceVersion,
   forbiddenPod,
+  namespacedListItemWithTypeMeta,
+  namespacedWatchObjectIsValid,
+  podListRawPath,
   podWatchRawPath,
+  replicaSetListRawPath,
   replicaSetWatchRawPath
 } = require("./pod-quiescence-watch");
+const {
+  replaceWithBookmarkedSuccessors,
+  startEvidenceWatchProcess,
+  stopEvidenceWatches,
+  waitForBookmarkedWatchBoundary,
+  withOwnedEvidenceWatches
+} = require("./watch-evidence-process");
 const {
   KubectlLeaseClient,
   MUTATION_TIMEOUT_MS,
@@ -98,7 +110,12 @@ const config = utils.readConfig(process.env.HCCE_INPUT_VALUES_PATH);
 const parentNamespace = config.Namespace;
 const plan = readActivationPlanText(manifestText);
 const waitTimeoutMs = 180_000;
+const stablePodAbsenceWindowMs = 61_000;
+const stableWatchAcquisitionTimeoutMs = waitTimeoutMs * 3;
 const kubectlReadTimeoutMs = 30_000;
+const watchServerTimeoutSeconds = 600;
+const watchProcessGraceSeconds = 10;
+const maxWatchBufferBytes = 4 * 1024 * 1024;
 const kubectlContext = String(process.env.KUBECTL_CONTEXT || "");
 const leaseHeartbeatPath = path.resolve(__dirname, "operation-lease.js");
 const manifestVerifierPath = path.resolve(__dirname, "../generate_script/verify-generated-manifest.js");
@@ -1170,7 +1187,9 @@ function parentAndRunnerPodsAreAbsent() {
 }
 
 function podListForWatch(namespace) {
-  return kubectlJson(["-n", namespace, "get", "pods", "-o", "json"]);
+  return kubectlJson([
+    "--request-timeout=30s", "get", "--raw", podListRawPath(namespace)
+  ]);
 }
 
 function podListHasForbidden(
@@ -1178,12 +1197,15 @@ function podListHasForbidden(
   podList,
   { includeRecoveryConsumers = false, recoveryConsumerReplicaSets = [] } = {}
 ) {
-  return podList?.kind !== "PodList" ||
-    !Array.isArray(podList.items) ||
-    podList.items.some(pod => forbiddenPod(namespace, parentNamespace, pod, {
-      includeRecoveryConsumers,
-      recoveryConsumerReplicaSets
-    }));
+  return completeWatchListResourceVersion(podList, "PodList", "v1") === null ||
+    podList.items.some(pod => {
+      const normalizedPod = namespacedListItemWithTypeMeta(pod, "Pod", "v1", namespace);
+      return !normalizedPod ||
+      forbiddenPod(namespace, parentNamespace, normalizedPod, {
+        includeRecoveryConsumers,
+        recoveryConsumerReplicaSets
+      });
+    });
 }
 
 function startPodWatch(
@@ -1196,68 +1218,80 @@ function startPodWatch(
     includeRecoveryConsumers,
     recoveryConsumerReplicaSets
   });
-  const rawPath = podWatchRawPath(namespace, resourceVersion);
-  return startRawEvidenceWatch(rawPath, evidence);
+  const rawPath = podWatchRawPath(namespace, resourceVersion, watchServerTimeoutSeconds);
+  return {
+    ...startRawEvidenceWatch(rawPath, evidence),
+    resource: "pods",
+    namespace,
+    watchOptions: { includeRecoveryConsumers, recoveryConsumerReplicaSets }
+  };
 }
 
 function startReplicaSetWatch(resourceVersion, recoveryConsumerReplicaSets) {
   assertOperationLeaseHeld();
-  const evidence = new ReplicaSetWatchEvidence(resourceVersion, recoveryConsumerReplicaSets);
-  const rawPath = replicaSetWatchRawPath(parentNamespace, resourceVersion);
-  return startRawEvidenceWatch(rawPath, evidence);
-}
-
-function startRawEvidenceWatch(rawPath, evidence) {
-  const child = spawn("kubectl", contextArgs(["get", "--raw", rawPath]), {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  let buffer = "";
-  let intentionalStop = false;
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", chunk => {
-    buffer += chunk;
-    for (;;) {
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) break;
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      if (!line) continue;
-      try {
-        evidence.ingest(JSON.parse(line));
-      } catch (_error) {
-        evidence.error = "watch_json_invalid";
-      }
-    }
-  });
-  child.stderr.on("data", () => {});
-  child.once("error", () => { evidence.error = "watch_process_error"; });
-  child.once("exit", () => {
-    if (buffer.trim()) {
-      try {
-        evidence.ingest(JSON.parse(buffer));
-      } catch (_error) {
-        evidence.error = "watch_json_invalid";
-      }
-    }
-    if (!intentionalStop && !evidence.error) evidence.error = "watch_ended_before_evidence_boundary";
-  });
+  const evidence = new ReplicaSetWatchEvidence(
+    resourceVersion,
+    recoveryConsumerReplicaSets,
+    { initialEventsEnded: true, namespace: parentNamespace }
+  );
+  const rawPath = replicaSetWatchRawPath(
+    parentNamespace,
+    resourceVersion,
+    watchServerTimeoutSeconds
+  );
   return {
-    evidence,
-    stop() {
-      intentionalStop = true;
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-    }
+    ...startRawEvidenceWatch(rawPath, evidence),
+    resource: "replicasets",
+    namespace: parentNamespace,
+    watchOptions: { recoveryConsumerReplicaSets }
   };
 }
 
-async function waitForWatchInitialEventsEnd(watches, deadline) {
-  while (Date.now() < deadline) {
-    assertOperationLeaseProcessHealthy();
-    if (watches.some(watch => watch.evidence.error || watch.evidence.violation)) return false;
-    if (watches.every(watch => watch.evidence.coversInitialEvents())) return true;
-    await sleep(100);
+function startRawEvidenceWatch(rawPath, evidence) {
+  const requestTimeoutSeconds = watchServerTimeoutSeconds + watchProcessGraceSeconds;
+  return startEvidenceWatchProcess({
+    spawnProcess: spawn,
+    command: "kubectl",
+    args: contextArgs([
+      `--request-timeout=${requestTimeoutSeconds}s`, "get", "--raw", rawPath
+    ]),
+    evidence,
+    serverTimeoutSeconds: watchServerTimeoutSeconds,
+    processGraceSeconds: watchProcessGraceSeconds,
+    maximumBufferBytes: maxWatchBufferBytes
+  });
+}
+
+function startBookmarkedSuccessorWatch(predecessor) {
+  const resourceVersion = predecessor?.evidence?.lastBookmarkResourceVersion;
+  if (typeof resourceVersion !== "string" || !resourceVersion || resourceVersion === "0") {
+    throw new Error("watch_successor_bookmark_invalid");
   }
-  return false;
+  if (predecessor.resource === "pods") {
+    const options = predecessor.watchOptions || {};
+    return startPodWatch(
+      predecessor.namespace,
+      resourceVersion,
+      options
+    );
+  }
+  if (predecessor.resource === "replicasets") {
+    return startReplicaSetWatch(
+      resourceVersion,
+      predecessor.watchOptions?.recoveryConsumerReplicaSets || []
+    );
+  }
+  throw new Error("watch_successor_resource_invalid");
+}
+
+async function waitForInitialBookmarkedWatchBoundary(watches, deadline) {
+  return await waitForBookmarkedWatchBoundary({
+    successors: watches,
+    startingBookmarkSequences: watches.map(watch => watch.bookmarkBaseline),
+    deadline,
+    assertHealthy: assertOperationLeaseProcessHealthy,
+    sleep
+  });
 }
 
 async function confirmWatchBoundary(
@@ -1266,19 +1300,23 @@ async function confirmWatchBoundary(
   deadline,
   { includeRecoveryConsumers = false, recoveryConsumerReplicaSets = [] } = {}
 ) {
-  const successors = boundaryLists.map((podList, index) =>
-    startPodWatch(
-      [parentNamespace, RUNNER_NAMESPACE][index],
-      podList?.metadata?.resourceVersion,
-      { includeRecoveryConsumers, recoveryConsumerReplicaSets }
+  const podPredecessors = predecessors.filter(watch => watch.resource === "pods");
+  if (
+    !Array.isArray(boundaryLists) || boundaryLists.length !== podPredecessors.length ||
+    boundaryLists.some((podList, index) =>
+      podListHasForbidden(
+        podPredecessors[index].namespace,
+        podList,
+        podPredecessors[index].watchOptions || {
+          includeRecoveryConsumers,
+          recoveryConsumerReplicaSets
+        }
+      )
     )
-  );
+  ) return null;
   if (includeRecoveryConsumers) {
     const boundaryReplicaSets = recoveryReplicaSetEvidence();
-    if (!boundaryReplicaSets.valid) {
-      successors.forEach(watch => watch.stop());
-      return false;
-    }
+    if (!boundaryReplicaSets.valid) return null;
     for (const replicaSet of boundaryReplicaSets.consumerReplicaSets) {
       if (!recoveryConsumerReplicaSets.some(value =>
         value?.metadata?.uid === replicaSet?.metadata?.uid ||
@@ -1287,31 +1325,44 @@ async function confirmWatchBoundary(
         recoveryConsumerReplicaSets.push(replicaSet);
       }
     }
-    successors.push(startReplicaSetWatch(
-      boundaryReplicaSets.resourceVersion,
-      recoveryConsumerReplicaSets
-    ));
   }
-  try {
-    const successorReady = await waitForWatchInitialEventsEnd(successors, deadline);
-    return successorReady &&
-      predecessors.every(watch => !watch.evidence.error && !watch.evidence.violation) &&
-      successors.every(watch => !watch.evidence.error && !watch.evidence.violation);
-  } finally {
-    successors.forEach(watch => watch.stop());
-  }
+  return await replaceWithBookmarkedSuccessors({
+    predecessors,
+    startSuccessor: startBookmarkedSuccessorWatch,
+    deadline,
+    assertHealthy: assertOperationLeaseProcessHealthy,
+    sleep
+  });
 }
 
 function recoveryReplicaSetEvidence() {
   const replicaSetList = kubectlJson([
-    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    "--request-timeout=30s",
+    "get",
+    "--raw",
+    replicaSetListRawPath(parentNamespace)
   ]);
-  const consumerReplicaSets = recoveryConsumerReplicaSets(replicaSetList);
-  const resourceVersion = replicaSetList?.metadata?.resourceVersion;
+  const resourceVersion = completeWatchListResourceVersion(
+    replicaSetList,
+    "ReplicaSetList",
+    "apps/v1"
+  );
+  const normalizedReplicaSets = Array.isArray(replicaSetList?.items)
+    ? replicaSetList.items.map(replicaSet => namespacedListItemWithTypeMeta(
+      replicaSet,
+      "ReplicaSet",
+      "apps/v1",
+      parentNamespace
+    ))
+    : [];
+  const consumerReplicaSets = normalizedReplicaSets.every(Boolean)
+    ? recoveryConsumerReplicaSets({ ...replicaSetList, items: normalizedReplicaSets })
+    : null;
   return {
     consumerReplicaSets,
     resourceVersion,
-    valid: typeof resourceVersion === "string" && resourceVersion.length > 0 &&
+    valid: resourceVersion !== null &&
+      Array.isArray(consumerReplicaSets) &&
       recoveryConsumerReplicaSetsAreStopped(consumerReplicaSets)
   };
 }
@@ -1320,7 +1371,7 @@ async function acquireStablePodAbsenceMonitor(
   label,
   { includeRecoveryConsumers = false } = {}
 ) {
-  const deadline = Date.now() + waitTimeoutMs;
+  const deadline = Date.now() + stableWatchAcquisitionTimeoutMs;
   while (Date.now() < deadline) {
     const replicaSetEvidence = includeRecoveryConsumers
       ? recoveryReplicaSetEvidence()
@@ -1346,57 +1397,61 @@ async function acquireStablePodAbsenceMonitor(
       await sleep(1_000);
       continue;
     }
-    const watches = initialLists.map((podList, index) =>
-      startPodWatch(
-        [parentNamespace, RUNNER_NAMESPACE][index],
-        podList?.metadata?.resourceVersion,
-        watchOptions
-      )
-    );
-    if (includeRecoveryConsumers) {
-      watches.push(startReplicaSetWatch(
-        replicaSetEvidence.resourceVersion,
-        replicaSetEvidence.consumerReplicaSets
-      ));
-    }
-    if (!(await waitForWatchInitialEventsEnd(watches, deadline))) {
-      watches.forEach(watch => watch.stop());
-      await sleep(1_000);
-      continue;
-    }
-    const stableUntil = Date.now() + 61_000;
-    while (
-      Date.now() < stableUntil &&
-      watches.every(watch => !watch.evidence.error && !watch.evidence.violation)
-    ) {
-      assertOperationLeaseProcessHealthy();
-      await sleep(100);
-    }
-    if (watches.some(watch => watch.evidence.error || watch.evidence.violation)) {
-      watches.forEach(watch => watch.stop());
-      await sleep(1_000);
-      continue;
-    }
-    const boundaryLists = [podListForWatch(parentNamespace), podListForWatch(RUNNER_NAMESPACE)];
-    const forbiddenAtBoundary = boundaryLists.some((podList, index) =>
-      podListHasForbidden(
-        [parentNamespace, RUNNER_NAMESPACE][index],
-        podList,
-        watchOptions
-      )
-    );
-    if (
-      forbiddenAtBoundary ||
-      !(await confirmWatchBoundary(watches, boundaryLists, deadline, {
-        ...watchOptions
-      })) ||
-      watches.some(watch => watch.evidence.error || watch.evidence.violation)
-    ) {
-      watches.forEach(watch => watch.stop());
-      await sleep(1_000);
-      continue;
-    }
-    return { watches, watchOptions };
+    const successors = await withOwnedEvidenceWatches({
+      start(watches) {
+        for (const [index, podList] of initialLists.entries()) {
+          watches.push(startPodWatch(
+            [parentNamespace, RUNNER_NAMESPACE][index],
+            podList?.metadata?.resourceVersion,
+            watchOptions
+          ));
+        }
+        if (includeRecoveryConsumers) {
+          watches.push(startReplicaSetWatch(
+            replicaSetEvidence.resourceVersion,
+            replicaSetEvidence.consumerReplicaSets
+          ));
+        }
+      },
+      async attempt(watches) {
+        if (!(await waitForInitialBookmarkedWatchBoundary(
+          watches,
+          Math.min(deadline, Date.now() + waitTimeoutMs)
+        ))) return null;
+        const stableUntil = Date.now() + stablePodAbsenceWindowMs;
+        while (
+          Date.now() < stableUntil &&
+          Date.now() < deadline &&
+          watches.every(watch => !watch.evidence.error && !watch.evidence.violation)
+        ) {
+          assertOperationLeaseProcessHealthy();
+          await sleep(100);
+        }
+        if (
+          Date.now() >= deadline ||
+          watches.some(watch => watch.evidence.error || watch.evidence.violation)
+        ) return null;
+        const boundaryLists = [
+          podListForWatch(parentNamespace),
+          podListForWatch(RUNNER_NAMESPACE)
+        ];
+        if (boundaryLists.some((podList, index) =>
+          podListHasForbidden(
+            [parentNamespace, RUNNER_NAMESPACE][index],
+            podList,
+            watchOptions
+          )
+        )) return null;
+        return await confirmWatchBoundary(
+          watches,
+          boundaryLists,
+          Math.min(deadline, Date.now() + waitTimeoutMs),
+          watchOptions
+        );
+      }
+    });
+    if (successors) return { watches: successors, watchOptions };
+    await sleep(1_000);
   }
   throw new Error(`${label}_timeout`);
 }
@@ -1408,70 +1463,78 @@ async function runWithStablePodAbsence(
   { includeRecoveryConsumers = false } = {}
 ) {
   const monitor = await acquireStablePodAbsenceMonitor(label, { includeRecoveryConsumers });
-  const { watches, watchOptions } = monitor;
+  let { watches } = monitor;
+  const { watchOptions } = monitor;
   try {
     await action();
     const boundaryLists = [podListForWatch(parentNamespace), podListForWatch(RUNNER_NAMESPACE)];
-    if (
-      boundaryLists.some((podList, index) =>
-        podListHasForbidden(
-          [parentNamespace, RUNNER_NAMESPACE][index],
-          podList,
-          watchOptions
-        )
-      ) ||
-      !(await confirmWatchBoundary(
+    const forbiddenAtBoundary = boundaryLists.some((podList, index) =>
+      podListHasForbidden(
+        [parentNamespace, RUNNER_NAMESPACE][index],
+        podList,
+        watchOptions
+      )
+    );
+    const successors = forbiddenAtBoundary
+      ? null
+      : await confirmWatchBoundary(
         watches,
         boundaryLists,
-        Date.now() + 30_000,
+        Date.now() + waitTimeoutMs,
         watchOptions
-      )) ||
-      watches.some(watch => watch.evidence.error || watch.evidence.violation)
-    ) {
+      );
+    if (!successors) {
       throw new Error(`${label}_event_or_watch_failure`);
     }
+    watches = successors;
   } catch (error) {
     if (rollback) await rollback();
     throw error;
   } finally {
-    watches.forEach(watch => watch.stop());
+    await stopEvidenceWatches(watches);
   }
 }
 
 async function waitForStableFirstCutoverParentAbsence(label, finalPredicate) {
-  const deadline = Date.now() + waitTimeoutMs;
+  const deadline = Date.now() + stableWatchAcquisitionTimeoutMs;
   while (Date.now() < deadline) {
     const initial = podListForWatch(parentNamespace);
     if (podListHasForbidden(parentNamespace, initial) || !finalPredicate()) {
       await sleep(1_000);
       continue;
     }
-    const watch = startPodWatch(parentNamespace, initial.metadata?.resourceVersion);
+    let watch = startPodWatch(parentNamespace, initial.metadata?.resourceVersion);
     try {
-      if (!(await waitForWatchInitialEventsEnd([watch], deadline))) continue;
-      const stableUntil = Date.now() + 61_000;
+      if (!(await waitForInitialBookmarkedWatchBoundary(
+        [watch],
+        Math.min(deadline, Date.now() + waitTimeoutMs)
+      ))) continue;
+      const stableUntil = Date.now() + stablePodAbsenceWindowMs;
       while (
         Date.now() < stableUntil &&
+        Date.now() < deadline &&
         !watch.evidence.error &&
         !watch.evidence.violation
       ) {
         assertOperationLeaseProcessHealthy();
         await sleep(100);
       }
-      if (watch.evidence.error || watch.evidence.violation) continue;
+      if (Date.now() >= deadline || watch.evidence.error || watch.evidence.violation) continue;
       const boundary = podListForWatch(parentNamespace);
-      if (
+      const successors = (
         podListHasForbidden(parentNamespace, boundary) ||
-        !finalPredicate() ||
-        !(await confirmWatchBoundary([watch], [boundary], deadline)) ||
-        watch.evidence.error ||
-        watch.evidence.violation
-      ) {
-        continue;
-      }
+        !finalPredicate()
+      ) ? null : await confirmWatchBoundary(
+        [watch],
+        [boundary],
+        Math.min(deadline, Date.now() + waitTimeoutMs)
+      );
+      if (!successors) continue;
+      watch = successors[0];
+      if (!finalPredicate()) continue;
       return;
     } finally {
-      watch.stop();
+      await stopEvidenceWatches([watch]);
     }
   }
   throw new Error(`${label}_timeout`);

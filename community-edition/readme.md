@@ -220,6 +220,18 @@ updates. The parent policy also matches `deployments/scale` and rejects that
 subresource outright, so `kubectl scale`, an HPA or another scale client cannot
 bypass the complete guarded manifest or create a second authoritative parent.
 
+Every stable-absence gate starts an exact watch from its validated `LIST`
+resourceVersion and waits for an in-band `BOOKMARK`; elapsed time or a clean
+connection close is never accepted as proof of progress. Initial and final
+handoffs start the successor at the predecessor's last bookmarked, non-zero
+resourceVersion, keep the predecessor live and adopt the successor only after
+the successor produces its own bookmark. Resource versions remain opaque and
+are only passed back to the same collection. A transient runner or recovery
+consumer, missing bookmark, expired resource version, malformed event, early
+close, stalled process or local timeout therefore fails closed. Kubernetes does
+not guarantee bookmark delivery, so lack of one within the operation deadline
+is intentionally an availability failure rather than a safety bypass.
+
 For YenHubs, the journal ConfigMap has a permanent protection finalizer and its
 admission policy denies direct deletion and ConfigMap `DeleteCollection`,
 including the collection deletion used while purging a Namespace. A request to
