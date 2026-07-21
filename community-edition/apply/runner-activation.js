@@ -7,6 +7,7 @@ const ADMISSION_POLICY_NAME = "bot-runner-pods.yenhubs.org";
 const PARENT_FENCE_POLICY_NAME = "bot-orchestrator-fence-protocol.yenhubs.org";
 const RUNNER_PROTOCOL_POLICY_NAME = "bot-runner-durable-protocol.yenhubs.org";
 const CUTOVER_JOURNAL_POLICY_NAME = "yenhubs-runner-cutover-journal-v2";
+const RECOVERY_OPERATION_FENCE_POLICY_NAME = "recovery-operation-pod-fence.yenhubs.org";
 const FENCE_PROTOCOL_ANNOTATION = "yenhubs.org/runner-fence-protocol";
 const FENCE_PROTOCOL_VALUE = "intent-fence-v1";
 const ACTIVATION_PHASE_ANNOTATION = "yenhubs.org/runner-activation-phase";
@@ -87,6 +88,16 @@ function activationPlanFromResources(resources) {
     resource?.kind === "ValidatingAdmissionPolicyBinding" &&
     resource?.metadata?.name === CUTOVER_JOURNAL_POLICY_NAME
   );
+  const recoveryOperationFencePolicy = resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
+  const recoveryOperationFenceBinding = resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
   if (!["bootstrap", "admission", "active"].includes(activationPhase)) {
     throw new Error("generated_manifest_runner_activation_phase_invalid");
   }
@@ -147,7 +158,16 @@ function activationPlanFromResources(resources) {
       cutoverJournalPolicy?.spec?.matchConstraints?.resourceRules?.[0]?.operations,
       ["UPDATE", "DELETE"]
     ) ||
-    !exactCutoverJournalBinding(cutoverJournalBinding, deployment.metadata.namespace)
+    !exactCutoverJournalBinding(cutoverJournalBinding, deployment.metadata.namespace) ||
+    !exactRecoveryOperationFencePolicy(
+      recoveryOperationFencePolicy,
+      deployment.metadata.namespace
+    ) ||
+    !exactRecoveryOperationFenceBinding(
+      recoveryOperationFenceBinding,
+      deployment.metadata.namespace,
+      { active: recoveryPhase === "restore-fence" }
+    )
   ) {
     throw new Error("generated_manifest_fence_aware_parent_contract_invalid");
   }
@@ -520,6 +540,110 @@ function exactCutoverJournalBinding(binding, namespace) {
     });
 }
 
+function recoveryOperationFenceNamespaceSelector(namespace, { active = false } = {}) {
+  if (typeof namespace !== "string" || namespace.length === 0) return null;
+  return active
+    ? {
+        matchExpressions: [{
+          key: "kubernetes.io/metadata.name",
+          operator: "In",
+          values: [namespace, RUNNER_NAMESPACE]
+        }]
+      }
+    : {
+        matchExpressions: [{
+          key: "kubernetes.io/metadata.name",
+          operator: "DoesNotExist"
+        }]
+      };
+}
+
+function exactRecoveryOperationFenceBinding(binding, namespace, { active = false } = {}) {
+  const namespaceSelector = recoveryOperationFenceNamespaceSelector(namespace, { active });
+  return namespaceSelector !== null &&
+    binding?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    binding?.kind === "ValidatingAdmissionPolicyBinding" &&
+    binding?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME &&
+    isDeepStrictEqual(binding?.spec, {
+      policyName: RECOVERY_OPERATION_FENCE_POLICY_NAME,
+      validationActions: ["Deny"],
+      matchResources: {
+        matchPolicy: "Equivalent",
+        namespaceSelector,
+        objectSelector: {}
+      }
+    });
+}
+
+function exactRecoveryOperationFencePolicy(policy, namespace) {
+  return typeof namespace === "string" && namespace.length > 0 &&
+    policy?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    policy?.kind === "ValidatingAdmissionPolicy" &&
+    policy?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME &&
+    isDeepStrictEqual(policy?.spec, {
+      failurePolicy: "Fail",
+      matchConstraints: {
+        matchPolicy: "Equivalent",
+        namespaceSelector: recoveryOperationFenceNamespaceSelector(namespace, { active: true }),
+        objectSelector: {},
+        resourceRules: [
+          {
+            apiGroups: [""],
+            apiVersions: ["v1"],
+            operations: ["CREATE", "UPDATE", "DELETE"],
+            resources: ["pods", "pods/ephemeralcontainers", "pods/eviction", "pods/resize"],
+            scope: "Namespaced"
+          },
+          {
+            apiGroups: [""],
+            apiVersions: ["v1"],
+            operations: ["CONNECT"],
+            resources: ["pods/attach", "pods/exec", "pods/portforward", "pods/proxy"],
+            scope: "Namespaced"
+          }
+        ]
+      },
+      variables: [
+        {
+          name: "pod",
+          expression: "request.operation == 'DELETE' ? oldObject : object"
+        },
+        {
+          name: "labels",
+          expression: "has(variables.pod.metadata.labels) ? variables.pod.metadata.labels : {}"
+        },
+        {
+          name: "writerNames",
+          expression: "['reticulum', 'pgbouncer', 'pgbouncer-t', 'bot-orchestrator', 'coturn']"
+        },
+        {
+          name: "podNames",
+          expression: "[has(variables.pod.metadata.name) ? variables.pod.metadata.name : '',\n has(variables.pod.metadata.generateName) ? variables.pod.metadata.generateName : '']"
+        },
+        {
+          name: "labelValues",
+          expression: "['app' in variables.labels ? variables.labels['app'] : '',\n 'component' in variables.labels ? variables.labels['component'] : '',\n 'app.kubernetes.io/name' in variables.labels ? variables.labels['app.kubernetes.io/name'] : '']"
+        },
+        {
+          name: "isParentWriterCreate",
+          expression: "request.operation == 'CREATE' && (!has(request.subResource) || request.subResource == '') && request.namespace == '" + namespace + "' && (variables.writerNames.exists(writer, variables.labelValues.exists(value, value == writer)) ||\n (has(variables.pod.spec.serviceAccountName) &&\n  variables.pod.spec.serviceAccountName == 'bot-orchestrator') ||\n variables.pod.spec.containers.exists(container, container.name in variables.writerNames) ||\n variables.podNames.exists(value,\n   variables.writerNames.exists(writer, value == writer || value.startsWith(writer + '-'))) ||\n (has(variables.pod.metadata.ownerReferences) &&\n  variables.pod.metadata.ownerReferences.exists(owner,\n    owner.kind == 'ReplicaSet' &&\n    variables.writerNames.exists(writer,\n      owner.name == writer || owner.name.startsWith(writer + '-')))))"
+        }
+      ],
+      validations: [
+        {
+          expression: "!variables.isParentWriterCreate",
+          message: "recovery operation Pod fence denies database-writer Pod creation while checkpoint or restore is fenced",
+          reason: "Forbidden"
+        },
+        {
+          expression: "request.namespace != 'hcce-bot-runners'",
+          message: "recovery operation Pod fence denies runner Pod mutation while checkpoint or restore is fenced",
+          reason: "Forbidden"
+        }
+      ]
+    });
+}
+
 function fenceAwareDeploymentImages(deployment) {
   const annotations = deployment?.metadata?.annotations;
   const templateAnnotations = deployment?.spec?.template?.metadata?.annotations;
@@ -745,6 +869,7 @@ module.exports = {
   FENCE_PROTOCOL_ANNOTATION,
   FENCE_PROTOCOL_VALUE,
   PARENT_FENCE_POLICY_NAME,
+  RECOVERY_OPERATION_FENCE_POLICY_NAME,
   RUNNER_PROTOCOL_POLICY_NAME,
   RECOVERY_CONSUMERS,
   RECOVERY_EPOCH_ANNOTATION,
@@ -758,6 +883,8 @@ module.exports = {
   exactAdmissionBinding,
   exactCutoverJournalBinding,
   exactParentFenceBinding,
+  exactRecoveryOperationFenceBinding,
+  exactRecoveryOperationFencePolicy,
   exactRunnerProtocolBinding,
   fenceAwareDeploymentImages,
   exactDeploymentDesiredState,
@@ -779,6 +906,7 @@ module.exports = {
   recoveryConsumerReplicaSets,
   recoveryConsumerReplicaSetsAreStopped,
   recoveryConsumersAreQuiesced,
+  recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
   runBestEffortFenceSteps,
   uniqueRunnerPods

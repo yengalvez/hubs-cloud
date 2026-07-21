@@ -5,6 +5,7 @@ const test = require("node:test");
 
 const {
   ADMISSION_POLICY_NAME,
+  RECOVERY_OPERATION_FENCE_POLICY_NAME,
   RECOVERY_LOCK_NAME,
   RUNNER_NAMESPACE,
   admissionPolicyIsObserved,
@@ -14,7 +15,10 @@ const {
   exactAdmissionBinding,
   exactDeploymentDesiredState,
   exactFoundationalNamespace,
+  exactRecoveryOperationFenceBinding,
+  exactRecoveryOperationFencePolicy,
   exactRecoveryOperationLock,
+  manifestResourcesFromText,
   parentIsQuiesced,
   parentFencePolicyProtectsLiveOrTarget,
   policySpecForFenceAwareDeployment,
@@ -207,6 +211,144 @@ test("requires the exact admission binding matchResources with no selector bypas
   const excluded = structuredClone(binding);
   excluded.spec.matchResources.excludeResourceRules = [];
   assert.equal(exactAdmissionBinding(excluded), false);
+});
+
+test("pins the parameter-free recovery operation Pod fence and both exact binding states", () => {
+  const template = fs.readFileSync(
+    path.resolve(__dirname, "../generate_script/hcce.yam"),
+    "utf8"
+  );
+  const resources = manifestResourcesFromText(template);
+  const policy = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
+  const dormant = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
+  assert.equal(exactRecoveryOperationFencePolicy(policy, "$Namespace"), true);
+  assert.match(
+    policy.spec.variables.find(variable =>
+      variable.name === "isParentWriterCreate"
+    ).expression,
+    /!has\(request\.subResource\) \|\| request\.subResource == ''/
+  );
+  assert.equal(exactRecoveryOperationFenceBinding(
+    dormant,
+    "$Namespace",
+    { active: false }
+  ), true);
+
+  const active = structuredClone(dormant);
+  active.spec.matchResources.namespaceSelector = {
+    matchExpressions: [{
+      key: "kubernetes.io/metadata.name",
+      operator: "In",
+      values: ["$Namespace", RUNNER_NAMESPACE]
+    }]
+  };
+  assert.equal(exactRecoveryOperationFenceBinding(
+    active,
+    "$Namespace",
+    { active: true }
+  ), true);
+
+  for (const mutate of [
+    value => { value.spec.paramKind = { apiVersion: "v1", kind: "ConfigMap" }; },
+    value => { value.spec.failurePolicy = "Ignore"; },
+    value => { value.spec.matchConstraints.objectSelector = { matchLabels: { bypass: "true" } }; },
+    value => {
+      value.spec.variables.find(variable =>
+        variable.name === "isParentWriterCreate"
+      ).expression = "false";
+    },
+    value => { value.spec.variables[0].expression = "params.metadata.name"; }
+  ]) {
+    const changed = structuredClone(policy);
+    mutate(changed);
+    assert.equal(exactRecoveryOperationFencePolicy(changed, "$Namespace"), false);
+  }
+
+  const parameterized = structuredClone(dormant);
+  parameterized.spec.paramRef = { name: "yenhubs-recovery-operation-lock" };
+  assert.equal(exactRecoveryOperationFenceBinding(
+    parameterized,
+    "$Namespace",
+    { active: false }
+  ), false);
+});
+
+test("operation-fence transitions are UID/RV CAS-only and probes are collision-independent", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const dormancyGuard = source.slice(
+    source.indexOf("function recoveryOperationFenceCanBecomeDormant"),
+    source.indexOf("function transitionRecoveryOperationFenceBinding")
+  );
+  assert.match(dormancyGuard, /liveRecoveryConsumersAreQuiesced\(\)/);
+  assert.match(dormancyGuard, /liveParentIsQuiesced\(\)/);
+  assert.match(dormancyGuard, /runnerRuntimeIsQuiesced\(\)/);
+  assert.match(dormancyGuard, /exactRunnerAuthority\(false\)/);
+  const transition = source.slice(
+    source.indexOf("function transitionRecoveryOperationFenceBinding"),
+    source.indexOf("async function setRecoveryOperationFenceBinding")
+  );
+  assert.match(transition, /liveRecoveryOperationFenceBinding\(\)/);
+  assert.match(transition, /uid: before\.metadata\.uid/);
+  assert.match(transition, /resourceVersion: before\.metadata\.resourceVersion/);
+  assert.match(transition, /"replace", "-f", "-"/);
+  assert.match(transition, /after\.metadata\.uid !== before\.metadata\.uid/);
+  assert.match(
+    transition,
+    /after\.metadata\.resourceVersion === before\.metadata\.resourceVersion/
+  );
+  assert.match(transition, /recoveryOperationFenceCanBecomeDormant\(\)/);
+  assert.match(transition, /binding_dormancy_requires_quiescence/);
+  assert.match(transition, /binding_compare_and_swap_failed/);
+  assert.match(transition, /binding_compare_and_swap_unconfirmed/);
+  assert.doesNotMatch(transition, /applyResource\(/);
+
+  const applyManifest = source.slice(
+    source.indexOf("function applyManifest()"),
+    source.indexOf("function expectedDeployments()")
+  );
+  assert.match(applyManifest, /transitionRecoveryOperationFenceBinding/);
+  assert.match(applyManifest, /RECOVERY_OPERATION_FENCE_POLICY_NAME/);
+
+  const setter = source.slice(
+    source.indexOf("async function setRecoveryOperationFenceBinding"),
+    source.indexOf("async function ensureRecoveryOperationFenceBindingDormant")
+  );
+  assert.doesNotMatch(setter, /applyResource\(/);
+  assert.match(setter, /const expectedBinding = transitionRecoveryOperationFenceBinding/);
+  assert.match(setter, /liveRecoveryOperationFenceAdmissionIsObserved\(\{ active, expectedBinding \}\)/);
+  assert.match(setter, /probeAccepted &&/);
+
+  const inactiveProbe = source.slice(
+    source.indexOf("function recoveryOperationFenceInactiveProbe"),
+    source.indexOf("function liveRecoveryOperationFenceBinding")
+  );
+  assert.match(inactiveProbe, /parentResult\.status === 0/);
+  assert.match(inactiveProbe, /runnerResult\.status === 0/);
+
+  const preparation = source.slice(
+    source.indexOf("async function prepareRecoveryAdmissionFence"),
+    source.indexOf("async function prepareParentFenceAdmission")
+  );
+  assert.doesNotMatch(preparation, /setRecoveryOperationFenceBinding/);
+  assert.doesNotMatch(preparation, /ensureRecoveryOperationFenceBindingDormant/);
+
+  const parentProbe = source.slice(
+    source.indexOf("function recoveryOperationParentWriterProbePod"),
+    source.indexOf("function recoveryOperationRunnerProbePod")
+  );
+  assert.match(parentProbe, /generateName/);
+  assert.doesNotMatch(parentProbe, /metadata:\s*\{\s*name:/);
+  const runnerProbe = source.slice(
+    source.indexOf("function recoveryOperationRunnerProbePod"),
+    source.indexOf("function recoveryOperationFenceDryRun")
+  );
+  assert.match(runnerProbe, /randomUUID\(\)/);
 });
 
 function fenceAwareDeployment(parentImage, runnerImage) {
@@ -1024,7 +1166,8 @@ test("manifest apply is resource-by-resource and stops after one bounded failing
 
   const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
   assert.match(source, /--request-timeout=30s/);
-  assert.match(source, /applyResourcesSequentially\(plan\.resources, applyResource\)/);
+  assert.match(source, /applyResourcesSequentially\(plan\.resources, resource =>/);
+  assert.match(source, /transitionRecoveryOperationFenceBinding/);
 });
 
 test("watch handoffs require an in-band causal bookmark and retain the proven successor", () => {

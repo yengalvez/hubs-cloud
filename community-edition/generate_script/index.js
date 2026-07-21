@@ -214,6 +214,27 @@ function handleRunnerActivation(processedConfig, replacedContent) {
       resource.rules = [];
       yamlDocuments[index] = new YAML.Document(resource);
     }
+    if (
+      resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+      resource?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+    ) {
+      resource.spec.matchResources.namespaceSelector =
+        processedConfig.BOT_RUNNER_RECOVERY_PHASE === "restore-fence"
+          ? {
+              matchExpressions: [{
+                key: "kubernetes.io/metadata.name",
+                operator: "In",
+                values: [processedConfig.Namespace, "hcce-bot-runners"]
+              }]
+            }
+          : {
+              matchExpressions: [{
+                key: "kubernetes.io/metadata.name",
+                operator: "DoesNotExist"
+              }]
+            };
+      yamlDocuments[index] = new YAML.Document(resource);
+    }
   }
 
   const priority = resource => {
@@ -227,6 +248,8 @@ function handleRunnerActivation(processedConfig, replacedContent) {
     if (kind === "ValidatingAdmissionPolicyBinding" && name === "yenhubs-runner-cutover-journal-v2") return 3;
     if (kind === "ValidatingAdmissionPolicy" && name === "bot-orchestrator-fence-protocol.yenhubs.org") return 4;
     if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-orchestrator-fence-protocol.yenhubs.org") return 5;
+    if (kind === "ValidatingAdmissionPolicy" && name === "recovery-operation-pod-fence.yenhubs.org") return 6;
+    if (kind === "ValidatingAdmissionPolicyBinding" && name === "recovery-operation-pod-fence.yenhubs.org") return 7;
     if (kind === "ValidatingAdmissionPolicy" && name === "bot-runner-durable-protocol.yenhubs.org") return 8;
     if (kind === "ValidatingAdmissionPolicyBinding" && name === "bot-runner-durable-protocol.yenhubs.org") return 9;
     if (kind === "ValidatingAdmissionPolicy" && name === "bot-runner-pods.yenhubs.org") return 10;

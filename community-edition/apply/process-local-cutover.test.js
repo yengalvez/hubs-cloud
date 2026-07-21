@@ -109,7 +109,9 @@ function exactGateInput(key, overrides = {}) {
       cutoverJournalPolicy: null,
       cutoverJournalBinding: null,
       parentFencePolicy: null,
-      parentFenceBinding: null
+      parentFenceBinding: null,
+      recoveryOperationFencePolicy: null,
+      recoveryOperationFenceBinding: null
     },
     parentPodList: {
       apiVersion: "v1",
@@ -173,6 +175,18 @@ test("the live pristine gate requires legacy annotations, zero control plane, ze
   assert.throws(() => verifyPristineLegacyCutoverGate({
     ...exact, isolatedResources: isolated
   }), /isolated_control_plane_present/);
+  for (const resourceName of [
+    "recoveryOperationFencePolicy",
+    "recoveryOperationFenceBinding"
+  ]) {
+    assert.throws(() => verifyPristineLegacyCutoverGate({
+      ...exact,
+      isolatedResources: {
+        ...exact.isolatedResources,
+        [resourceName]: { metadata: { name: "recovery-operation-pod-fence.yenhubs.org" } }
+      }
+    }), /isolated_control_plane_present/);
+  }
   assert.throws(() => verifyPristineLegacyCutoverGate({
     ...exact, runnerNamespace: { kind: "Namespace" }
   }), /runner_namespace_present/);

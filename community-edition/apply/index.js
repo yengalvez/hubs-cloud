@@ -6,6 +6,7 @@ const { isDeepStrictEqual } = require("node:util");
 const utils = require("../utils");
 const {
   KubernetesRunnerManager,
+  guardPodDocumentForIdentity,
   requireCompletePodList
 } = require("../services/bot-orchestrator/kubernetes-runner-manager");
 const {
@@ -75,6 +76,7 @@ const {
   ADMISSION_POLICY_NAME,
   CUTOVER_JOURNAL_POLICY_NAME,
   PARENT_FENCE_POLICY_NAME,
+  RECOVERY_OPERATION_FENCE_POLICY_NAME,
   RUNNER_PROTOCOL_POLICY_NAME,
   RECOVERY_CONSUMERS,
   RECOVERY_EPOCH_ANNOTATION,
@@ -87,6 +89,8 @@ const {
   exactAdmissionBinding,
   exactCutoverJournalBinding,
   exactParentFenceBinding,
+  exactRecoveryOperationFenceBinding,
+  exactRecoveryOperationFencePolicy,
   exactRunnerProtocolBinding,
   exactDeploymentDesiredState,
   exactFoundationalNamespace,
@@ -96,6 +100,7 @@ const {
   recoveryConsumerReplicaSets,
   recoveryConsumerReplicaSetsAreStopped,
   recoveryConsumersAreQuiesced,
+  recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
   readActivationPlanText,
   runBestEffortFenceSteps,
@@ -397,7 +402,7 @@ function liveState() {
   };
 }
 
-function liveAdmissionIsObserved() {
+function liveAdmissionCoreIsObserved() {
   const policy = kubectlJson([
     "get", "validatingadmissionpolicy", ADMISSION_POLICY_NAME, "-o", "json"
   ]);
@@ -409,6 +414,13 @@ function liveAdmissionIsObserved() {
     liveRunnerProtocolAdmissionIsObserved() &&
     liveCutoverJournalAdmissionIsObserved() &&
     liveParentFenceAdmissionIsObserved();
+}
+
+function liveAdmissionIsObserved() {
+  return liveAdmissionCoreIsObserved() &&
+    liveRecoveryOperationFenceAdmissionIsObserved({
+      active: plan.recoveryPhase === "restore-fence"
+    });
 }
 
 function recoveryAdmissionPolicy() {
@@ -438,6 +450,7 @@ function liveRecoveryAdmissionIsObserved() {
     exactAdmissionBinding(binding) &&
     liveRunnerProtocolAdmissionIsObserved() &&
     liveCutoverJournalAdmissionIsObserved() &&
+    liveRecoveryOperationFencePolicyIsObserved() &&
     isDeepStrictEqual(policy?.spec, recoveryAdmissionPolicy().spec);
 }
 
@@ -472,6 +485,62 @@ function generatedParentFencePolicy() {
   );
   if (!policy) throw new Error("generated_manifest_parent_fence_policy_missing");
   return policy;
+}
+
+function generatedRecoveryOperationFencePolicy() {
+  const policy = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
+  if (!policy) throw new Error("generated_manifest_recovery_operation_fence_policy_missing");
+  return policy;
+}
+
+function generatedRecoveryOperationFenceBinding() {
+  const binding = plan.resources.find(resource =>
+    resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+    resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+  );
+  if (!binding) throw new Error("generated_manifest_recovery_operation_fence_binding_missing");
+  return binding;
+}
+
+function recoveryOperationFenceBinding(active) {
+  const binding = structuredClone(generatedRecoveryOperationFenceBinding());
+  binding.spec.matchResources.namespaceSelector = recoveryOperationFenceNamespaceSelector(
+    parentNamespace,
+    { active }
+  );
+  return binding;
+}
+
+function liveRecoveryOperationFencePolicyIsObserved() {
+  const policy = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicy", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"
+  ], "recovery-operation-fence-policy");
+  return policy !== null &&
+    admissionPolicyIsObserved(policy) &&
+    exactRecoveryOperationFencePolicy(policy, parentNamespace) &&
+    isDeepStrictEqual(policy?.spec, generatedRecoveryOperationFencePolicy().spec);
+}
+
+function liveRecoveryOperationFenceAdmissionIsObserved({ active, expectedBinding = null }) {
+  const binding = kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"
+  ], "recovery-operation-fence-binding");
+  return binding !== null &&
+    liveRecoveryOperationFencePolicyIsObserved() &&
+    transitionableRecoveryOperationFenceBinding(binding) &&
+    exactRecoveryOperationFenceBinding(binding, parentNamespace, { active }) &&
+    (
+      expectedBinding === null ||
+      (
+        binding.metadata.uid === expectedBinding?.metadata?.uid &&
+        binding.metadata.resourceVersion === expectedBinding?.metadata?.resourceVersion
+      )
+    );
 }
 
 function generatedCutoverJournalPolicy() {
@@ -719,7 +788,9 @@ function pristineLegacyCutoverLiveEvidence() {
     cutoverJournalPolicy: ["get", "validatingadmissionpolicy", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"],
     cutoverJournalBinding: ["get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"],
     parentFencePolicy: ["get", "validatingadmissionpolicy", PARENT_FENCE_POLICY_NAME, "-o", "json"],
-    parentFenceBinding: ["get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"]
+    parentFenceBinding: ["get", "validatingadmissionpolicybinding", PARENT_FENCE_POLICY_NAME, "-o", "json"],
+    recoveryOperationFencePolicy: ["get", "validatingadmissionpolicy", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"],
+    recoveryOperationFenceBinding: ["get", "validatingadmissionpolicybinding", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"]
   };
   const isolatedResources = Object.fromEntries(Object.entries(absentResources).map(
     ([name, args]) => [name, kubectlAbsentOnlyJson(args, `isolated-control-plane-${name}`)]
@@ -1635,6 +1706,227 @@ function admissionDenialProbe() {
     !diagnostic.includes("violates PodSecurity");
 }
 
+function recoveryOperationParentWriterProbePod() {
+  return {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      generateName: "yenhubs-recovery-operation-writer-probe-",
+      namespace: parentNamespace,
+      labels: { app: "reticulum" }
+    },
+    spec: {
+      automountServiceAccountToken: false,
+      enableServiceLinks: false,
+      restartPolicy: "Never",
+      terminationGracePeriodSeconds: 0,
+      securityContext: {
+        runAsNonRoot: true,
+        runAsUser: 10001,
+        runAsGroup: 10001,
+        seccompProfile: { type: "RuntimeDefault" }
+      },
+      containers: [{
+        name: "reticulum",
+        image: "registry.k8s.io/pause:3.10",
+        imagePullPolicy: "IfNotPresent",
+        securityContext: {
+          runAsNonRoot: true,
+          runAsUser: 10001,
+          runAsGroup: 10001,
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          capabilities: { drop: ["ALL"] },
+          seccompProfile: { type: "RuntimeDefault" }
+        },
+        resources: {
+          requests: { cpu: "1m", memory: "1Mi" },
+          limits: { cpu: "1m", memory: "1Mi" }
+        }
+      }]
+    }
+  };
+}
+
+function recoveryOperationRunnerProbePod() {
+  const identity = {
+    roomKey: "55555555555555555555",
+    processGeneration: randomUUID()
+  };
+  identity.name = `bot-runner-${identity.roomKey.substring(0, 16)}-${identity.processGeneration.substring(0, 8)}`;
+  return guardPodDocumentForIdentity(identity, "fence", RUNNER_NAMESPACE);
+}
+
+function recoveryOperationFenceDryRun(pod) {
+  return runLeaseGuardedRead(() => spawnSync(
+    "kubectl",
+    contextArgs(["create", "--dry-run=server", "-f", "-"]),
+    {
+      input: JSON.stringify(pod),
+      encoding: "utf8",
+      timeout: kubectlReadTimeoutMs
+    }
+  ));
+}
+
+function recoveryOperationFenceDiagnostic(result) {
+  return `${result?.stdout || ""}\n${result?.stderr || ""}`;
+}
+
+function recoveryOperationFenceDenialProbe() {
+  const probes = [
+    [
+      recoveryOperationParentWriterProbePod(),
+      "recovery operation Pod fence denies database-writer Pod creation while checkpoint or restore is fenced"
+    ],
+    [
+      recoveryOperationRunnerProbePod(),
+      "recovery operation Pod fence denies runner Pod mutation while checkpoint or restore is fenced"
+    ]
+  ];
+  return probes.every(([pod, message]) => {
+    const result = recoveryOperationFenceDryRun(pod);
+    const diagnostic = recoveryOperationFenceDiagnostic(result);
+    return result.status !== 0 &&
+      diagnostic.includes(RECOVERY_OPERATION_FENCE_POLICY_NAME) &&
+      diagnostic.includes(message) &&
+      !diagnostic.includes("violates PodSecurity");
+  });
+}
+
+function recoveryOperationFenceInactiveProbe() {
+  const parentResult = recoveryOperationFenceDryRun(recoveryOperationParentWriterProbePod());
+  const runnerResult = recoveryOperationFenceDryRun(recoveryOperationRunnerProbePod());
+  const diagnostic = [parentResult, runnerResult]
+    .map(recoveryOperationFenceDiagnostic)
+    .join("\n");
+  return parentResult.status === 0 &&
+    runnerResult.status === 0 &&
+    !diagnostic.includes(RECOVERY_OPERATION_FENCE_POLICY_NAME) &&
+    !diagnostic.includes("recovery operation Pod fence denies");
+}
+
+function liveRecoveryOperationFenceBinding() {
+  return kubectlAbsentOnlyJson([
+    "get", "validatingadmissionpolicybinding", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"
+  ], "recovery-operation-fence-binding-transition");
+}
+
+function transitionableRecoveryOperationFenceBinding(binding) {
+  const metadata = binding?.metadata;
+  const annotations = metadata?.annotations || {};
+  const allowedMetadata = new Set([
+    "annotations",
+    "creationTimestamp",
+    "generation",
+    "managedFields",
+    "name",
+    "resourceVersion",
+    "uid"
+  ]);
+  return metadata &&
+    Object.keys(metadata).every(key => allowedMetadata.has(key)) &&
+    Object.keys(annotations).every(key => key === "kubectl.kubernetes.io/last-applied-configuration") &&
+    (metadata.labels === undefined || Object.keys(metadata.labels).length === 0) &&
+    metadata.deletionTimestamp === undefined &&
+    metadata.finalizers === undefined &&
+    typeof metadata.uid === "string" && metadata.uid.length > 0 &&
+    typeof metadata.resourceVersion === "string" && metadata.resourceVersion.length > 0 &&
+    (
+      exactRecoveryOperationFenceBinding(binding, parentNamespace, { active: false }) ||
+      exactRecoveryOperationFenceBinding(binding, parentNamespace, { active: true })
+    );
+}
+
+function recoveryOperationFenceCanBecomeDormant() {
+  return liveRecoveryConsumersAreQuiesced() &&
+    liveParentIsQuiesced() &&
+    runnerRuntimeIsQuiesced() &&
+    exactRunnerAuthority(false);
+}
+
+function transitionRecoveryOperationFenceBinding(active, label, { allowCreate = false } = {}) {
+  const before = liveRecoveryOperationFenceBinding();
+  if (before === null) {
+    if (!allowCreate) throw new Error(`${label}_binding_missing`);
+    createCutoverResource(recoveryOperationFenceBinding(active), `${label}_binding`);
+    const created = liveRecoveryOperationFenceBinding();
+    if (
+      !transitionableRecoveryOperationFenceBinding(created) ||
+      !exactRecoveryOperationFenceBinding(created, parentNamespace, { active })
+    ) {
+      throw new Error(`${label}_binding_create_unconfirmed`);
+    }
+    return created;
+  }
+  if (!transitionableRecoveryOperationFenceBinding(before)) {
+    throw new Error(`${label}_binding_source_not_exact`);
+  }
+  if (
+    !active &&
+    exactRecoveryOperationFenceBinding(before, parentNamespace, { active: true }) &&
+    !recoveryOperationFenceCanBecomeDormant()
+  ) {
+    throw new Error(`${label}_binding_dormancy_requires_quiescence`);
+  }
+  if (!exactRecoveryOperationFenceBinding(before, parentNamespace, { active })) {
+    const replacement = recoveryOperationFenceBinding(active);
+    replacement.metadata = {
+      ...replacement.metadata,
+      uid: before.metadata.uid,
+      resourceVersion: before.metadata.resourceVersion
+    };
+    const replaced = runLeaseGuardedMutation(
+      assertOperationLeaseHeld,
+      () => spawnSync(
+        "kubectl",
+        contextArgs(["--request-timeout=30s", "replace", "-f", "-"]),
+        {
+          input: JSON.stringify(replacement),
+          encoding: "utf8",
+          timeout: MUTATION_TIMEOUT_MS
+        }
+      )
+    );
+    if (replaced.status !== 0 && replaced.status !== null) {
+      throw new Error(`${label}_binding_compare_and_swap_failed:${replaced.status}`);
+    }
+    const after = liveRecoveryOperationFenceBinding();
+    if (
+      !transitionableRecoveryOperationFenceBinding(after) ||
+      after.metadata.uid !== before.metadata.uid ||
+      !exactRecoveryOperationFenceBinding(after, parentNamespace, { active }) ||
+      after.metadata.resourceVersion === before.metadata.resourceVersion
+    ) {
+      throw new Error(`${label}_binding_compare_and_swap_unconfirmed`);
+    }
+    return after;
+  }
+  return before;
+}
+
+async function setRecoveryOperationFenceBinding(active, label, options = {}) {
+  const expectedBinding = transitionRecoveryOperationFenceBinding(active, label, options);
+  await waitFor(
+    `${label}_binding_and_${active ? "denial" : "inactive"}_probe_observed`,
+    () => {
+      if (!liveRecoveryOperationFenceAdmissionIsObserved({ active, expectedBinding })) {
+        return false;
+      }
+      const probeAccepted = active
+        ? recoveryOperationFenceDenialProbe()
+        : recoveryOperationFenceInactiveProbe();
+      return probeAccepted &&
+        liveRecoveryOperationFenceAdmissionIsObserved({ active, expectedBinding });
+    }
+  );
+  return expectedBinding;
+}
+
+async function ensureRecoveryOperationFenceBindingDormant(label) {
+  await setRecoveryOperationFenceBinding(false, label, { allowCreate: true });
+}
+
 async function waitForAdmissionDenialProbe() {
   await waitFor("runner_admission_denial_probe", admissionDenialProbe);
 }
@@ -1689,7 +1981,8 @@ async function prepareRecoveryAdmissionFence() {
   applyNamedResources([
     ["ValidatingAdmissionPolicyBinding", ADMISSION_POLICY_NAME, ""],
     ["ValidatingAdmissionPolicy", RUNNER_PROTOCOL_POLICY_NAME, ""],
-    ["ValidatingAdmissionPolicyBinding", RUNNER_PROTOCOL_POLICY_NAME, ""]
+    ["ValidatingAdmissionPolicyBinding", RUNNER_PROTOCOL_POLICY_NAME, ""],
+    ["ValidatingAdmissionPolicy", RECOVERY_OPERATION_FENCE_POLICY_NAME, ""]
   ]);
   await waitFor("runner_recovery_admission_observed", liveRecoveryAdmissionIsObserved);
 }
@@ -1990,7 +2283,21 @@ async function prepareExactPreGrantControlPlane() {
 }
 
 function applyManifest() {
-  applyResourcesSequentially(plan.resources, applyResource);
+  applyResourcesSequentially(plan.resources, resource => {
+    if (
+      resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
+      resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+      resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
+    ) {
+      transitionRecoveryOperationFenceBinding(
+        plan.recoveryPhase === "restore-fence",
+        "manifest_recovery_operation_fence",
+        { allowCreate: true }
+      );
+      return;
+    }
+    applyResource(resource);
+  });
 }
 
 function expectedDeployments() {
@@ -2304,6 +2611,14 @@ async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, labe
     failures.push("causal-parent-authority-fence");
   }
   if (causalFenceReady) {
+    try {
+      await ensureRecoveryOperationFenceBindingDormant(`${label}_operation_fence_reconciliation`);
+    } catch (_error) {
+      failures.push("recovery-operation-fence-dormancy");
+      causalFenceReady = false;
+    }
+  }
+  if (causalFenceReady) {
     failures.push(...await retryBestEffortFenceAttempt(
       async () => deleteAllRunnerPodsByExactUid(),
       { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
@@ -2316,7 +2631,7 @@ async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, labe
   }
   try {
     await runWithStablePodAbsence(
-      `stable_pod_absence_before_${label}_authority_refence`,
+      `stable_pod_absence_before_${label}_operation_fence`,
       async () => {
         if (
           expectedRecoveryLockState &&
@@ -2324,6 +2639,7 @@ async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, labe
         ) {
           throw new Error(`${label}_recovery_lock_changed_during_refence`);
         }
+        await setRecoveryOperationFenceBinding(true, `${label}_operation_fence_active`);
       },
       undefined,
       { includeRecoveryConsumers: true }
@@ -2335,7 +2651,10 @@ async function refenceRecoveryConsumers({ expectedRecoveryLockState = null, labe
     ["deployment-fences-exact", recoveryFenceDeploymentsAreExact],
     ["recovery-consumers-absent", liveRecoveryConsumersAreQuiesced],
     ["runner-authority-inert", () => exactRunnerAuthority(false)],
-    ["runner-runtime-quiesced", runnerRuntimeIsQuiesced]
+    ["runner-runtime-quiesced", runnerRuntimeIsQuiesced],
+    ["recovery-operation-fence-active", () =>
+      liveRecoveryOperationFenceAdmissionIsObserved({ active: true }) &&
+      recoveryOperationFenceDenialProbe()]
   ]) {
     try {
       if (!predicate()) failures.push(name);
@@ -2386,6 +2705,10 @@ async function applyRestoreFence() {
   await waitFor("runner_runtime_quiesced_in_restore_fence", runnerRuntimeIsQuiesced);
   await waitFor("restore_fence_deployments_exact", deploymentsMatchGeneratedDesiredState);
   await waitFor("runner_admission_observed_in_restore_fence", liveAdmissionIsObserved);
+  await waitFor(
+    "recovery_operation_fence_denial_probe_in_restore_fence",
+    recoveryOperationFenceDenialProbe
+  );
   await waitFor("runner_control_plane_exact_in_restore_fence", liveRunnerControlPlaneIsExact);
   if (!exactRunnerAuthority(false)) throw new Error("restore_fence_runner_rbac_not_inert");
   if (!exactLiveRecoveryLock("restore-fence-prepared")) {
@@ -2519,7 +2842,9 @@ async function applyActiveTransition(mode) {
         deploymentsMatchGeneratedDesiredState() &&
         liveRunnerControlPlaneIsExact() &&
         exactRunnerAuthority(true) &&
-        admissionDenialProbe()
+        admissionDenialProbe() &&
+        liveRecoveryOperationFenceAdmissionIsObserved({ active: false }) &&
+        recoveryOperationFenceInactiveProbe()
       ) {
         console.log(
           "reactivation already converged; recovery lock remains for the root live runner smoke and finalizer"
@@ -2532,8 +2857,16 @@ async function applyActiveTransition(mode) {
     await waitFor("recovery_consumers_quiesced_before_reactivation", liveRecoveryConsumersAreQuiesced);
     await waitFor("parent_quiesced_before_reactivation", liveParentIsQuiesced);
     await waitFor("runner_runtime_quiesced_before_reactivation", runnerRuntimeIsQuiesced);
-    await waitFor("runner_admission_observed_before_reactivation", liveAdmissionIsObserved);
+    await waitFor("runner_admission_observed_before_reactivation", () =>
+      liveAdmissionCoreIsObserved() &&
+      liveRecoveryOperationFenceAdmissionIsObserved({ active: true }) &&
+      recoveryOperationFenceDenialProbe()
+    );
     if (!exactRunnerAuthority(false)) throw new Error("restore_fence_runner_authority_not_inert");
+    await setRecoveryOperationFenceBinding(false, "recovery_reactivation_operation_fence");
+    if (!exactLiveRecoveryLock("restore-complete-awaiting-reactivation")) {
+      throw new Error("recovery_lock_changed_during_operation_fence_deactivation");
+    }
     await prepareExactPreGrantControlPlane();
     try {
       await runWithStablePodAbsence(
@@ -2607,6 +2940,12 @@ async function applyActiveTransition(mode) {
     await waitFor("runner_control_plane_exact_after_activation", liveRunnerControlPlaneIsExact);
     await waitFor("runner_effective_rbac_exact_after_activation", () => exactRunnerAuthority(true));
     await waitForAdmissionDenialProbe();
+    if (restoreReactivation) {
+      await waitFor(
+        "recovery_operation_fence_inactive_after_reactivation",
+        recoveryOperationFenceInactiveProbe
+      );
+    }
     if (restoreReactivation && !exactLiveRecoveryLock("restore-complete-awaiting-reactivation")) {
       throw new Error("recovery_lock_changed_after_reactivation_apply");
     }
