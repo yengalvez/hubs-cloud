@@ -228,6 +228,12 @@ test("pins the parameter-free recovery operation Pod fence and both exact bindin
     resource.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
   );
   assert.equal(exactRecoveryOperationFencePolicy(policy, "$Namespace"), true);
+  assert.match(
+    policy.spec.variables.find(variable =>
+      variable.name === "isParentWriterCreate"
+    ).expression,
+    /!has\(request\.subResource\) \|\| request\.subResource == ''/
+  );
   assert.equal(exactRecoveryOperationFenceBinding(
     dormant,
     "$Namespace",

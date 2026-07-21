@@ -1896,7 +1896,8 @@ spec:
        'app.kubernetes.io/name' in variables.labels ? variables.labels['app.kubernetes.io/name'] : '']
   - name: isParentWriterCreate
     expression: >-
-      request.operation == 'CREATE' && request.subResource == '' &&
+      request.operation == 'CREATE' &&
+      (!has(request.subResource) || request.subResource == '') &&
       request.namespace == '$Namespace' &&
       (variables.writerNames.exists(writer, variables.labelValues.exists(value, value == writer)) ||
        (has(variables.pod.spec.serviceAccountName) &&
