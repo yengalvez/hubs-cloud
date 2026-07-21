@@ -31,7 +31,9 @@ const ISOLATED_RESOURCE_KEYS = Object.freeze([
   "cutoverJournalPolicy",
   "cutoverJournalBinding",
   "parentFencePolicy",
-  "parentFenceBinding"
+  "parentFenceBinding",
+  "recoveryOperationFencePolicy",
+  "recoveryOperationFenceBinding"
 ]);
 
 function exactKeys(value, keys) {

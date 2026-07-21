@@ -1832,6 +1832,107 @@ spec:
         kubernetes.io/metadata.name: $Namespace
     objectSelector: {}
 ---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: recovery-operation-pod-fence.yenhubs.org
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: In
+        values:
+        - $Namespace
+        - hcce-bot-runners
+    objectSelector: {}
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      - DELETE
+      resources:
+      - pods
+      - pods/ephemeralcontainers
+      - pods/eviction
+      - pods/resize
+      scope: Namespaced
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CONNECT
+      resources:
+      - pods/attach
+      - pods/exec
+      - pods/portforward
+      - pods/proxy
+      scope: Namespaced
+  variables:
+  - name: pod
+    expression: >-
+      request.operation == 'DELETE' ? oldObject : object
+  - name: labels
+    expression: >-
+      has(variables.pod.metadata.labels) ? variables.pod.metadata.labels : {}
+  - name: writerNames
+    expression: >-
+      ['reticulum', 'pgbouncer', 'pgbouncer-t', 'bot-orchestrator', 'coturn']
+  - name: podNames
+    expression: >-
+      [has(variables.pod.metadata.name) ? variables.pod.metadata.name : '',
+       has(variables.pod.metadata.generateName) ? variables.pod.metadata.generateName : '']
+  - name: labelValues
+    expression: >-
+      ['app' in variables.labels ? variables.labels['app'] : '',
+       'component' in variables.labels ? variables.labels['component'] : '',
+       'app.kubernetes.io/name' in variables.labels ? variables.labels['app.kubernetes.io/name'] : '']
+  - name: isParentWriterCreate
+    expression: >-
+      request.operation == 'CREATE' && request.subResource == '' &&
+      request.namespace == '$Namespace' &&
+      (variables.writerNames.exists(writer, variables.labelValues.exists(value, value == writer)) ||
+       (has(variables.pod.spec.serviceAccountName) &&
+        variables.pod.spec.serviceAccountName == 'bot-orchestrator') ||
+       variables.pod.spec.containers.exists(container, container.name in variables.writerNames) ||
+       variables.podNames.exists(value,
+         variables.writerNames.exists(writer, value == writer || value.startsWith(writer + '-'))) ||
+       (has(variables.pod.metadata.ownerReferences) &&
+        variables.pod.metadata.ownerReferences.exists(owner,
+          owner.kind == 'ReplicaSet' &&
+          variables.writerNames.exists(writer,
+            owner.name == writer || owner.name.startsWith(writer + '-')))))
+  validations:
+  - expression: "!variables.isParentWriterCreate"
+    message: recovery operation Pod fence denies database-writer Pod creation while checkpoint or restore is fenced
+    reason: Forbidden
+  - expression: request.namespace != 'hcce-bot-runners'
+    message: recovery operation Pod fence denies runner Pod mutation while checkpoint or restore is fenced
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: recovery-operation-pod-fence.yenhubs.org
+spec:
+  policyName: recovery-operation-pod-fence.yenhubs.org
+  validationActions:
+  - Deny
+  matchResources:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: DoesNotExist
+    objectSelector: {}
+---
 ########################################################################
 ######################   pgsql   #######################################
 ########################################################################

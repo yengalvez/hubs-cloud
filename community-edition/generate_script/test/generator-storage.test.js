@@ -21,8 +21,8 @@ function runNode(script, env) {
 
 test("generator and verifier support dynamic and retained manual storage only", () => {
   for (const [storageClass, expectedResources] of [
-    ["do-block-storage", 66],
-    ["manual", 68]
+    ["do-block-storage", 68],
+    ["manual", 70]
   ]) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-storage-contract-"));
     const inputPath = path.join(directory, "input-values.yaml");
@@ -154,6 +154,20 @@ test("generator binds activation and restore-fence phases to exact replicas and 
     );
     assert.equal(bot.spec.replicas, expectedBotReplicas);
     assert.equal(role.rules.length, expectedRoleRules);
+    const recoveryFenceBinding = resources.find(resource =>
+      resource.kind === "ValidatingAdmissionPolicyBinding" &&
+      resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+    );
+    assert.deepEqual(
+      recoveryFenceBinding.spec.matchResources.namespaceSelector,
+      {
+        matchExpressions: [{
+          key: "kubernetes.io/metadata.name",
+          operator: "DoesNotExist"
+        }]
+      },
+      `${activationPhase} must keep the recovery operation fence dormant`
+    );
   }
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-restore-fence-"));
@@ -192,6 +206,17 @@ test("generator binds activation and restore-fence phases to exact replicas and 
     resource.metadata?.namespace === "hcce-bot-runners" &&
     resource.metadata?.name === "bot-orchestrator-runner-pods"
   ).rules, []);
+  const recoveryFenceBinding = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+  );
+  assert.deepEqual(recoveryFenceBinding.spec.matchResources.namespaceSelector, {
+    matchExpressions: [{
+      key: "kubernetes.io/metadata.name",
+      operator: "In",
+      values: [ciInput.Namespace, "hcce-bot-runners"]
+    }]
+  });
 });
 
 test("verifier binds every Reticulum access-key environment and TOML mapping to its own domain", () => {

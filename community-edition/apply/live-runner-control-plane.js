@@ -3,12 +3,15 @@ const {
   ADMISSION_POLICY_NAME,
   CUTOVER_JOURNAL_POLICY_NAME,
   PARENT_FENCE_POLICY_NAME,
+  RECOVERY_OPERATION_FENCE_POLICY_NAME,
   RUNNER_PROTOCOL_POLICY_NAME,
   RUNNER_NAMESPACE,
   admissionPolicyIsObserved,
   exactAdmissionBinding,
   exactCutoverJournalBinding,
   exactParentFenceBinding,
+  exactRecoveryOperationFenceBinding,
+  exactRecoveryOperationFencePolicy,
   exactRunnerProtocolBinding
 } = require("./runner-activation");
 
@@ -151,7 +154,9 @@ function expectedIdentities(namespace) {
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", CUTOVER_JOURNAL_POLICY_NAME],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", CUTOVER_JOURNAL_POLICY_NAME],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", PARENT_FENCE_POLICY_NAME],
-    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", PARENT_FENCE_POLICY_NAME]
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", PARENT_FENCE_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", RECOVERY_OPERATION_FENCE_POLICY_NAME],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", RECOVERY_OPERATION_FENCE_POLICY_NAME]
   ];
 }
 
@@ -212,6 +217,23 @@ function verifyLiveRunnerControlPlane(liveResources, generatedResources, namespa
   const cutoverJournalBinding = liveByIdentity.get(JSON.stringify([
     "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", CUTOVER_JOURNAL_POLICY_NAME
   ]));
+  const recoveryOperationFencePolicy = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "",
+    RECOVERY_OPERATION_FENCE_POLICY_NAME
+  ]));
+  const recoveryOperationFenceBinding = liveByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "",
+    RECOVERY_OPERATION_FENCE_POLICY_NAME
+  ]));
+  const expectedRecoveryOperationFenceBinding = generatedByIdentity.get(JSON.stringify([
+    "admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "",
+    RECOVERY_OPERATION_FENCE_POLICY_NAME
+  ]));
+  const expectedRecoveryOperationFenceActive = exactRecoveryOperationFenceBinding(
+    expectedRecoveryOperationFenceBinding,
+    namespace,
+    { active: true }
+  );
   if (!admissionPolicyIsObserved(policy)) errors.push("runner_admission_policy_not_observed_or_typechecked");
   if (!exactAdmissionBinding(binding)) errors.push("runner_admission_binding_not_exact");
   if (!admissionPolicyIsObserved(runnerProtocolPolicy)) {
@@ -231,6 +253,28 @@ function verifyLiveRunnerControlPlane(liveResources, generatedResources, namespa
   }
   if (!exactParentFenceBinding(parentFenceBinding, namespace)) {
     errors.push("parent_fence_admission_binding_not_exact");
+  }
+  if (
+    !admissionPolicyIsObserved(recoveryOperationFencePolicy) ||
+    !exactRecoveryOperationFencePolicy(recoveryOperationFencePolicy, namespace)
+  ) {
+    errors.push("recovery_operation_fence_admission_policy_not_observed_or_exact");
+  }
+  if (
+    !expectedRecoveryOperationFenceActive &&
+    !exactRecoveryOperationFenceBinding(
+      expectedRecoveryOperationFenceBinding,
+      namespace,
+      { active: false }
+    )
+  ) {
+    errors.push("generated_recovery_operation_fence_binding_not_exact");
+  } else if (!exactRecoveryOperationFenceBinding(
+    recoveryOperationFenceBinding,
+    namespace,
+    { active: expectedRecoveryOperationFenceActive }
+  )) {
+    errors.push("recovery_operation_fence_admission_binding_not_exact");
   }
   return errors;
 }
@@ -292,6 +336,12 @@ function collectLiveRunnerControlPlane(kubectlJson, namespace) {
   const cutoverJournalBinding = kubectlJson([
     "get", "validatingadmissionpolicybinding", CUTOVER_JOURNAL_POLICY_NAME, "-o", "json"
   ]);
+  const recoveryOperationFencePolicy = kubectlJson([
+    "get", "validatingadmissionpolicy", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"
+  ]);
+  const recoveryOperationFenceBinding = kubectlJson([
+    "get", "validatingadmissionpolicybinding", RECOVERY_OPERATION_FENCE_POLICY_NAME, "-o", "json"
+  ]);
   if (
     ![roles, roleBindings, networkPolicies].every(value => Array.isArray(value?.items))
   ) {
@@ -317,7 +367,9 @@ function collectLiveRunnerControlPlane(kubectlJson, namespace) {
     cutoverJournalPolicy,
     cutoverJournalBinding,
     parentFencePolicy,
-    parentFenceBinding
+    parentFenceBinding,
+    recoveryOperationFencePolicy,
+    recoveryOperationFenceBinding
   ];
 }
 

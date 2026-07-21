@@ -387,6 +387,8 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "yenhubs-runner-cutover-journal-v2"],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "bot-orchestrator-fence-protocol.yenhubs.org"],
     ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "bot-orchestrator-fence-protocol.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicy", "", "recovery-operation-pod-fence.yenhubs.org"],
+    ["admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding", "", "recovery-operation-pod-fence.yenhubs.org"],
     namespaced("", "Service", "pgsql"),
     namespaced("apps", "Deployment", "pgsql"),
     namespaced("apps", "Deployment", "pgbouncer"),
@@ -1155,7 +1157,7 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
     : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
 }
 
-const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "9d23e5f2b2d0fb6cef513626065d12ddec629fa9f6496584f2ad5342e2d4c533";
+const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "7770c6ca633aa10989997fed53a2b81df85fbd9a9271f1b575fdac5b1b7c1a6a";
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1229,6 +1231,20 @@ function botRunnerAdmissionTemplateResources() {
       "ValidatingAdmissionPolicyBinding",
       "",
       "bot-orchestrator-fence-protocol.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicy",
+      "",
+      "recovery-operation-pod-fence.yenhubs.org"
+    ),
+    findExactResource(
+      resources,
+      "admissionregistration.k8s.io",
+      "ValidatingAdmissionPolicyBinding",
+      "",
+      "recovery-operation-pod-fence.yenhubs.org"
     )
   ];
 }
@@ -1295,7 +1311,30 @@ function expectedBotRunnerAdmissionResources(resources, namespace) {
     throw new Error("bot_runner_admission_template_hash_mismatch");
   }
   const replacements = botRunnerAdmissionRenderValues(resources, namespace);
-  return templateResources.map(resource => renderAdmissionTemplateValue(resource, replacements));
+  return templateResources.map(resource => {
+    const rendered = renderAdmissionTemplateValue(resource, replacements);
+    if (
+      rendered?.kind === "ValidatingAdmissionPolicyBinding" &&
+      rendered?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+    ) {
+      rendered.spec.matchResources.namespaceSelector =
+        replacements.BOT_RUNNER_RECOVERY_PHASE === "restore-fence"
+          ? {
+              matchExpressions: [{
+                key: "kubernetes.io/metadata.name",
+                operator: "In",
+                values: [namespace, "hcce-bot-runners"]
+              }]
+            }
+          : {
+              matchExpressions: [{
+                key: "kubernetes.io/metadata.name",
+                operator: "DoesNotExist"
+              }]
+            };
+    }
+    return rendered;
+  });
 }
 
 function verifyBotRunnerAdmissionResources(resources, namespace) {
