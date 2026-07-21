@@ -26,10 +26,44 @@ const {
 const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
+  completeWatchListResourceVersion,
   forbiddenPod,
+  namespacedListItemIsValid,
+  namespacedListItemWithTypeMeta,
+  namespacedWatchObjectIsValid,
+  podListRawPath,
   podWatchRawPath,
+  replicaSetListRawPath,
   replicaSetWatchRawPath
 } = require("./pod-quiescence-watch");
+
+function watchedPod(object, namespace = "hcce") {
+  const name = object?.metadata?.name || "pod";
+  return {
+    apiVersion: "v1",
+    kind: "Pod",
+    ...object,
+    metadata: {
+      namespace,
+      uid: `${name}-uid`,
+      ...object.metadata
+    }
+  };
+}
+
+function watchedReplicaSet(object, namespace = "hcce") {
+  const name = object?.metadata?.name || "replicaset";
+  return {
+    apiVersion: "apps/v1",
+    kind: "ReplicaSet",
+    ...object,
+    metadata: {
+      namespace,
+      uid: `${name}-uid`,
+      ...object.metadata
+    }
+  };
+}
 
 test("legacy default-ServiceAccount parent Pods remain physically visible until their Deployment UID chain is absent", () => {
   const deployment = {
@@ -497,29 +531,109 @@ test("stable window resets with injected time and never treats a gap as continuo
 });
 
 test("event-backed pod evidence catches transient Pods and fails closed on resourceVersion 410", () => {
-  const rawPath = podWatchRawPath("hcce", "123");
+  assert.equal(podListRawPath("hcce"), "/api/v1/namespaces/hcce/pods");
+  assert.equal(
+    replicaSetListRawPath("hcce"),
+    "/apis/apps/v1/namespaces/hcce/replicasets"
+  );
+  const completePods = {
+    apiVersion: "v1",
+    kind: "PodList",
+    metadata: { resourceVersion: "opaque-list-rv" },
+    items: []
+  };
+  assert.equal(
+    completeWatchListResourceVersion(completePods, "PodList", "v1"),
+    "opaque-list-rv"
+  );
+  for (const mutate of [
+    value => { value.apiVersion = "attacker.example/v9"; },
+    value => { value.kind = "List"; },
+    value => { value.metadata.resourceVersion = ""; },
+    value => { value.metadata.resourceVersion = "0"; },
+    value => { value.metadata.continue = "next"; },
+    value => { value.metadata.continue = 0; },
+    value => { value.metadata.remainingItemCount = 1; },
+    value => { value.metadata.remainingItemCount = "0"; },
+    value => { delete value.items; }
+  ]) {
+    const invalid = structuredClone(completePods);
+    mutate(invalid);
+    assert.equal(completeWatchListResourceVersion(invalid, "PodList", "v1"), null);
+  }
+  assert.equal(namespacedWatchObjectIsValid(
+    watchedPod({ metadata: { name: "valid", resourceVersion: "1" } }),
+    "Pod",
+    "v1",
+    "hcce"
+  ), true);
+  const listItemWithoutTypeMeta = watchedPod({
+    metadata: { name: "valid-list-item", resourceVersion: "2" }
+  });
+  delete listItemWithoutTypeMeta.kind;
+  delete listItemWithoutTypeMeta.apiVersion;
+  assert.equal(namespacedListItemIsValid(
+    listItemWithoutTypeMeta,
+    "Pod",
+    "v1",
+    "hcce"
+  ), true);
+  assert.deepEqual(
+    namespacedListItemWithTypeMeta(listItemWithoutTypeMeta, "Pod", "v1", "hcce"),
+    { ...listItemWithoutTypeMeta, apiVersion: "v1", kind: "Pod" }
+  );
+  assert.equal(namespacedWatchObjectIsValid(
+    listItemWithoutTypeMeta,
+    "Pod",
+    "v1",
+    "hcce"
+  ), false);
+  for (const [field, value] of [["kind", "ConfigMap"], ["apiVersion", "v2"]]) {
+    const invalidListItem = structuredClone(listItemWithoutTypeMeta);
+    invalidListItem[field] = value;
+    assert.equal(namespacedListItemIsValid(
+      invalidListItem,
+      "Pod",
+      "v1",
+      "hcce"
+    ), false);
+  }
+  for (const invalid of [
+    watchedPod({ metadata: { name: "", resourceVersion: "1" } }),
+    watchedPod({ metadata: { name: "missing-uid", uid: "", resourceVersion: "1" } }),
+    watchedPod({ metadata: { name: "wrong-rv", resourceVersion: "0" } }),
+    watchedPod({ metadata: { name: "wrong-namespace", namespace: "other", resourceVersion: "1" } })
+  ]) {
+    assert.equal(namespacedWatchObjectIsValid(invalid, "Pod", "v1", "hcce"), false);
+  }
+  const rawPath = podWatchRawPath("hcce", "opaque-rv-a");
   assert.match(rawPath, /watch=true/);
-  assert.match(rawPath, /sendInitialEvents=true/);
-  assert.match(rawPath, /resourceVersionMatch=NotOlderThan/);
-  assert.match(rawPath, /resourceVersion=123/);
-  const replicaSetPath = replicaSetWatchRawPath("hcce", "124");
+  assert.match(rawPath, /resourceVersion=opaque-rv-a/);
+  assert.match(rawPath, /timeoutSeconds=600/);
+  assert.doesNotMatch(rawPath, /sendInitialEvents/);
+  assert.doesNotMatch(rawPath, /resourceVersionMatch/);
+  assert.throws(() => podWatchRawPath("hcce", "0"), /input_invalid/);
+  const replicaSetPath = replicaSetWatchRawPath("hcce", "opaque-rv-b");
   assert.match(replicaSetPath, /replicasets\?/);
-  assert.match(replicaSetPath, /sendInitialEvents=true/);
-  assert.match(replicaSetPath, /resourceVersion=124/);
+  assert.match(replicaSetPath, /resourceVersion=opaque-rv-b/);
+  assert.match(replicaSetPath, /timeoutSeconds=600/);
+  assert.doesNotMatch(replicaSetPath, /sendInitialEvents/);
+  assert.doesNotMatch(replicaSetPath, /resourceVersionMatch/);
+  assert.throws(() => replicaSetWatchRawPath("hcce", "0"), /input_invalid/);
   const parentWatch = new PodWatchEvidence("hcce", "hcce", "100");
   parentWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: { name: "transient", resourceVersion: "101", labels: {} },
       spec: { serviceAccountName: "bot-orchestrator" }
-    }
+    })
   });
   parentWatch.ingest({
     type: "DELETED",
-    object: {
+    object: watchedPod({
       metadata: { name: "transient", resourceVersion: "102", labels: {} },
       spec: { serviceAccountName: "bot-orchestrator" }
-    }
+    })
   });
   assert.equal(parentWatch.violation, true);
   parentWatch.ingest({
@@ -532,29 +646,31 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
     }
   });
   assert.equal(parentWatch.coversInitialEvents(), true);
+  assert.equal(parentWatch.bookmarkSequence, 1);
+  assert.equal(parentWatch.lastBookmarkResourceVersion, "opaque-rv-a");
 
   const legacyWatch = new PodWatchEvidence("hcce", "hcce", "102");
   legacyWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "legacy-transient",
         resourceVersion: "103",
         labels: { component: "bot-runner" }
       },
       spec: { serviceAccountName: "default" }
-    }
+    })
   });
   legacyWatch.ingest({
     type: "DELETED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "legacy-transient",
         resourceVersion: "104",
         labels: { component: "bot-runner" }
       },
       spec: { serviceAccountName: "default" }
-    }
+    })
   });
   assert.equal(legacyWatch.violation, true);
   legacyWatch.ingest({
@@ -562,6 +678,35 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
     object: { metadata: { resourceVersion: "opaque-rv-b", annotations: {} } }
   });
   assert.equal(legacyWatch.coversInitialEvents(), false, "ordinary bookmarks are not an initial-list boundary");
+  assert.equal(legacyWatch.bookmarkSequence, 1, "ordinary bookmarks are causal progress boundaries");
+  assert.equal(legacyWatch.lastBookmarkResourceVersion, "opaque-rv-b");
+
+  const malformedBookmark = new PodWatchEvidence("hcce", "hcce", "104");
+  malformedBookmark.ingest({ type: "BOOKMARK", object: { metadata: { resourceVersion: "0" } } });
+  assert.equal(malformedBookmark.error, "watch_bookmark_resource_version_invalid");
+  const unknownPodEvent = new PodWatchEvidence("hcce", "hcce", "104");
+  unknownPodEvent.ingest({ type: "FUTURE", object: { metadata: { resourceVersion: "105" } } });
+  assert.equal(unknownPodEvent.error, "watch_event_type_invalid");
+  const malformedReplicaSetEvent = new ReplicaSetWatchEvidence("404", [], {
+    initialEventsEnded: true,
+    namespace: "hcce"
+  });
+  malformedReplicaSetEvent.ingest({
+    type: "ADDED",
+    object: { metadata: { name: "missing-rv" }, spec: { replicas: 0 }, status: { replicas: 0 } }
+  });
+  assert.equal(malformedReplicaSetEvent.error, "watch_event_resource_version_invalid");
+  const malformedPodObject = new PodWatchEvidence("hcce", "hcce", "104");
+  malformedPodObject.ingest({
+    type: "ADDED",
+    object: {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name: "missing-uid", namespace: "hcce", resourceVersion: "105" },
+      spec: {}
+    }
+  });
+  assert.equal(malformedPodObject.error, "watch_event_object_invalid");
 
   const runnerWatch = new PodWatchEvidence(RUNNER_NAMESPACE, "hcce", "200");
   runnerWatch.ingest({ type: "ERROR", object: { code: 410 } });
@@ -579,6 +724,20 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   fence.metadata.uid = "fence-uid";
   fence.metadata.resourceVersion = "201";
   fence.status = { phase: "Pending" };
+  const fenceListItem = structuredClone(fence);
+  delete fenceListItem.apiVersion;
+  delete fenceListItem.kind;
+  const normalizedFenceListItem = namespacedListItemWithTypeMeta(
+    fenceListItem,
+    "Pod",
+    "v1",
+    RUNNER_NAMESPACE
+  );
+  assert.equal(
+    forbiddenPod(RUNNER_NAMESPACE, "hcce", normalizedFenceListItem),
+    false,
+    "a LIST item with omitted TypeMeta is restored before exact fence validation"
+  );
   const fenceAdded = new PodWatchEvidence(RUNNER_NAMESPACE, "hcce", "200");
   fenceAdded.ingest({ type: "ADDED", object: structuredClone(fence) });
   fenceAdded.ingest({ type: "MODIFIED", object: structuredClone(fence) });
@@ -607,14 +766,14 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   });
   recoveryWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "standalone-consumer",
         resourceVersion: "301",
         labels: { app: "reticulum" }
       },
       spec: { serviceAccountName: "default", containers: [{ name: "application" }] }
-    }
+    })
   });
   assert.equal(recoveryWatch.violation, true);
   const oldReplicaSetWatch = new PodWatchEvidence("hcce", "hcce", "302", {
@@ -627,21 +786,23 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   });
   oldReplicaSetWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "opaque-pod",
         resourceVersion: "303",
         ownerReferences: [{ kind: "ReplicaSet", name: "opaque-old-rs", uid: "old-rs-uid" }]
       },
       spec: { serviceAccountName: "default", containers: [{ name: "application" }] }
-    }
+    })
   });
   assert.equal(oldReplicaSetWatch.violation, true, "opaque old-RS Pods cannot cross the stable watch");
   const sharedReplicaSets = [];
-  const replicaSetWatch = new ReplicaSetWatchEvidence("400", sharedReplicaSets);
+  const replicaSetWatch = new ReplicaSetWatchEvidence("400", sharedReplicaSets, {
+    namespace: "hcce"
+  });
   replicaSetWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedReplicaSet({
       metadata: {
         name: "opaque-dynamic-rs",
         uid: "dynamic-rs-uid",
@@ -650,7 +811,7 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
       },
       spec: { replicas: 0 },
       status: { replicas: 0 }
-    }
+    })
   });
   assert.equal(replicaSetWatch.violation, false, "initial stopped RS inventory is safe");
   assert.equal(sharedReplicaSets.length, 1);
@@ -660,14 +821,14 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   });
   bridgedPodWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "opaque-dynamic-pod",
         resourceVersion: "402",
         ownerReferences: [{ kind: "ReplicaSet", name: "opaque-dynamic-rs", uid: "dynamic-rs-uid" }]
       },
       spec: { serviceAccountName: "default", containers: [{ name: "application" }] }
-    }
+    })
   });
   assert.equal(bridgedPodWatch.violation, true, "RS watch identities bridge into the Pod watch");
   replicaSetWatch.ingest({
@@ -681,7 +842,7 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
   });
   replicaSetWatch.ingest({
     type: "MODIFIED",
-    object: {
+    object: watchedReplicaSet({
       metadata: {
         name: "opaque-dynamic-rs",
         uid: "dynamic-rs-uid",
@@ -689,20 +850,44 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
       },
       spec: { replicas: 0 },
       status: { replicas: 0 }
-    }
+    })
   });
   assert.equal(replicaSetWatch.violation, true, "post-boundary RS churn resets the stable window");
+  const replicaSetExactWatch = new ReplicaSetWatchEvidence("404", [], {
+    initialEventsEnded: true,
+    namespace: "hcce"
+  });
+  replicaSetExactWatch.ingest({
+    type: "ADDED",
+    object: watchedReplicaSet({
+      metadata: {
+        name: "catchup-rs",
+        uid: "catchup-rs-uid",
+        resourceVersion: "405",
+        ownerReferences: [{
+          kind: "Deployment", name: "reticulum", uid: "old-deployment"
+        }]
+      },
+      spec: { replicas: 0 },
+      status: { replicas: 0 }
+    })
+  });
+  assert.equal(
+    replicaSetExactWatch.violation,
+    true,
+    "an exact stream treats every recovery ReplicaSet event after its LIST as post-boundary"
+  );
   const runnerOnlyWatch = new PodWatchEvidence("hcce", "hcce", "300");
   runnerOnlyWatch.ingest({
     type: "ADDED",
-    object: {
+    object: watchedPod({
       metadata: {
         name: "standalone-consumer",
         resourceVersion: "301",
         labels: { app: "reticulum" }
       },
       spec: { serviceAccountName: "default", containers: [{ name: "application" }] }
-    }
+    })
   });
   assert.equal(runnerOnlyWatch.violation, false, "normal activation watches only runner authority");
 });
@@ -840,6 +1025,70 @@ test("manifest apply is resource-by-resource and stops after one bounded failing
   const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
   assert.match(source, /--request-timeout=30s/);
   assert.match(source, /applyResourcesSequentially\(plan\.resources, applyResource\)/);
+});
+
+test("watch handoffs require an in-band causal bookmark and retain the proven successor", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const processSource = fs.readFileSync(
+    path.resolve(__dirname, "watch-evidence-process.js"),
+    "utf8"
+  );
+  const transport = source.slice(
+    source.indexOf("function startRawEvidenceWatch"),
+    source.indexOf("function startBookmarkedSuccessorWatch")
+  );
+  assert.match(transport, /--request-timeout=\$\{requestTimeoutSeconds\}s/);
+  assert.match(transport, /startEvidenceWatchProcess/);
+  assert.match(processSource, /watch_process_timeout/);
+  assert.match(processSource, /lastBookmarkResourceVersion/);
+  assert.match(processSource, /replaceWithBookmarkedSuccessors/);
+  assert.match(processSource, /child\.once\("close"/);
+
+  const rawLists = source.slice(
+    source.indexOf("function podListForWatch"),
+    source.indexOf("function startPodWatch")
+  );
+  assert.match(rawLists, /get", "--raw", podListRawPath\(namespace\)/);
+  assert.match(rawLists, /completeWatchListResourceVersion\(podList, "PodList", "v1"\)/);
+
+  const successor = source.slice(
+    source.indexOf("function startBookmarkedSuccessorWatch"),
+    source.indexOf("async function waitForInitialBookmarkedWatchBoundary")
+  );
+  assert.match(successor, /lastBookmarkResourceVersion/);
+  assert.match(successor, /startPodWatch/);
+  assert.match(successor, /startReplicaSetWatch/);
+
+  const initial = source.slice(
+    source.indexOf("async function waitForInitialBookmarkedWatchBoundary"),
+    source.indexOf("async function confirmWatchBoundary")
+  );
+  assert.match(initial, /waitForBookmarkedWatchBoundary/);
+  assert.match(initial, /startingBookmarkSequences/);
+
+  const handoff = source.slice(
+    source.indexOf("async function confirmWatchBoundary"),
+    source.indexOf("function recoveryReplicaSetEvidence")
+  );
+  assert.match(handoff, /podPredecessors = predecessors\.filter/);
+  assert.match(handoff, /replaceWithBookmarkedSuccessors/);
+  assert.match(handoff, /startSuccessor: startBookmarkedSuccessorWatch/);
+
+  const replicaSetList = source.slice(
+    source.indexOf("function recoveryReplicaSetEvidence"),
+    source.indexOf("async function acquireStablePodAbsenceMonitor")
+  );
+  assert.match(replicaSetList, /get",[\s\S]*"--raw"/);
+  assert.match(replicaSetList, /replicaSetListRawPath\(parentNamespace\)/);
+  assert.match(replicaSetList, /completeWatchListResourceVersion/);
+
+  const acquisition = source.slice(
+    source.indexOf("async function acquireStablePodAbsenceMonitor"),
+    source.indexOf("async function runWithStablePodAbsence")
+  );
+  assert.match(acquisition, /withOwnedEvidenceWatches/);
+  assert.match(acquisition, /waitForInitialBookmarkedWatchBoundary/);
+  assert.match(acquisition, /return \{ watches: successors, watchOptions \}/);
 });
 
 test("standard and emergency apply entrypoints verify the complete manifest first", () => {
