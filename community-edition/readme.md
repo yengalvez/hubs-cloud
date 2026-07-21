@@ -203,6 +203,33 @@ runner admission policies also deny Pod eviction, exec/attach/port-forward/proxy
 ephemeral-container injection and in-place resize subresources; status, binding
 and logs remain available to the Kubernetes system and operators.
 
+Checkpoint and restore byte streams use a separate parameter-free
+`recovery-operation-pod-fence.yenhubs.org` admission pair. It never reads the
+secret-bearing recovery lock and adds no ConfigMap RBAC. Its Binding is
+permanently present but selects no Namespace (`kubernetes.io/metadata.name`
+`DoesNotExist`) in bootstrap, admission and active manifests. A restore-fence
+manifest selects exactly the parent and `hcce-bot-runners` Namespaces. While
+active, the policy denies creation of the five database-writing workload Pods
+(`reticulum`, both pgbouncers, `bot-orchestrator` and `coturn`) and denies main
+and dangerous-subresource runner Pod mutations; status, binding and logs stay
+outside the rule. Cleanup and permanent-fence reconciliation therefore finish
+before activation.
+
+Binding state changes are fail-closed compare-and-swap operations: read one
+exact UID/resourceVersion, replace that same object, re-read the same UID and
+wait for two server-side dry-run probes. Conflicts, deletion/recreation, drift,
+type-check warnings or ambiguous propagation stop the operation. Reactivation
+returns the Binding to its exact dormant selector and proves the writer probe is
+accepted before runner authority or Deployments can resume. The initial
+campaign checkpoint remains the pre-mutation legacy checkpoint; this pair is a
+gate only for later durable-v2 checkpoint/restore windows.
+
+`services-ci` compiles and exercises this exact generated pair in an ephemeral
+Kind cluster pinned to Kubernetes 1.34.8. The job verifies the tool downloads,
+requires observed CEL status without warnings, tests dormant/active propagation
+and rejects stale resourceVersion, replaced UID and ABA transitions before the
+cluster is deleted.
+
 Runner ingress is denied. Egress is limited to kube-dns, the parent control
 service, and public TCP 443 needed for the Hubs/scene endpoints. The
 runner polls an authenticated parent endpoint for exact configuration and
@@ -270,7 +297,8 @@ preserve or explicitly migrate all of these contracts:
 - runtime protocol `yenhubs-bot-runtime-v2`, exact terminal config/stop ACKs,
   per-room snapshot ordering and provider-neutral privacy behavior;
 - intent/fence Pod shapes, UID/resourceVersion CAS, dedicated quotas and RBAC,
-  and all runner, parent-fence and cutover-journal admission policies;
+  and all runner, parent-fence, recovery-operation-fence and cutover-journal
+  admission policies;
 - the authenticated first-cutover journal, generated-manifest verifier, global
   operation Lease and `bootstrap -> admission -> active` recovery path.
 

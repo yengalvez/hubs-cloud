@@ -257,9 +257,9 @@ test("requires globally unique resource identities and exact critical resource c
   assert.match(deploymentErrors, /exactly one Deployment\/bot-orchestrator/);
 });
 
-test("requires the exact 66-resource two-namespace apiVersion/kind/namespace/name inventory", () => {
+test("requires the exact 68-resource two-namespace apiVersion/kind/namespace/name inventory", () => {
   const resources = validInventoryResources();
-  assert.equal(resources.length, 66);
+  assert.equal(resources.length, 68);
   assert.deepEqual(verifyManifestResourceInventory(resources), []);
 
   const extraJob = {
@@ -269,7 +269,7 @@ test("requires the exact 66-resource two-namespace apiVersion/kind/namespace/nam
   };
   const extraErrors = verifyManifestResourceInventory([...resources, extraJob]).join("\n");
   assert.match(extraErrors, /unexpected resource/);
-  assert.match(extraErrors, /exactly 66/);
+  assert.match(extraErrors, /exactly 68/);
 
   const wrongNamespace = clone(resources);
   wrongNamespace.find(resource => resource.kind === "Secret").metadata.namespace = "other";
@@ -282,7 +282,7 @@ test("requires the exact 66-resource two-namespace apiVersion/kind/namespace/nam
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "pgsql-pv" } },
     { apiVersion: "v1", kind: "PersistentVolume", metadata: { name: "ret-pv" } }
   );
-  assert.equal(manualResources.length, 68);
+  assert.equal(manualResources.length, 70);
   assert.deepEqual(verifyManifestResourceInventory(manualResources), []);
 
   const incompleteManual = manualResources.filter(resource => resource.metadata?.name !== "ret-pv");
@@ -759,6 +759,71 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
     resource.metadata?.name === "bot-orchestrator-fence-protocol.yenhubs.org"
   ).spec.matchConstraints.resourceRules[0].resources = ["deployments"];
   assert.notDeepEqual(verifyBotRunnerAdmissionResources(scalableParent, "$Namespace"), []);
+
+  const recoveryFencePolicy = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicy" &&
+    resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+  );
+  const recoveryFenceBinding = resources.find(resource =>
+    resource.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+  );
+  assert.equal(recoveryFencePolicy.spec.paramKind, undefined);
+  assert.equal(recoveryFenceBinding.spec.paramRef, undefined);
+  assert.doesNotMatch(JSON.stringify(recoveryFencePolicy), /\bparams\b/);
+  assert.deepEqual(recoveryFenceBinding.spec.matchResources.namespaceSelector, {
+    matchExpressions: [{
+      key: "kubernetes.io/metadata.name",
+      operator: "DoesNotExist"
+    }]
+  });
+  const recoveryProtectedSurfaces = recoveryFencePolicy.spec.matchConstraints.resourceRules
+    .flatMap(rule => rule.resources);
+  for (const required of [
+    "pods/eviction", "pods/ephemeralcontainers", "pods/resize",
+    "pods/exec", "pods/attach", "pods/portforward", "pods/proxy"
+  ]) {
+    assert.equal(recoveryProtectedSurfaces.includes(required), true, `${required} must be fenced`);
+  }
+  for (const allowed of ["pods/status", "pods/binding", "pods/log"]) {
+    assert.equal(recoveryProtectedSurfaces.includes(allowed), false, `${allowed} must remain available`);
+  }
+
+  for (const mutate of [
+    changed => { changed.policy.spec.paramKind = { apiVersion: "v1", kind: "ConfigMap" }; },
+    changed => { changed.binding.spec.paramRef = { name: "secret-bearing-lock" }; },
+    changed => { changed.policy.spec.variables[0].expression = "params.metadata.name"; },
+    changed => { changed.policy.spec.failurePolicy = "Ignore"; },
+    changed => { changed.policy.spec.matchConstraints.matchPolicy = "Exact"; },
+    changed => {
+      changed.policy.spec.matchConstraints.objectSelector = { matchLabels: { bypass: "true" } };
+    },
+    changed => {
+      changed.policy.spec.variables.find(variable =>
+        variable.name === "isParentWriterCreate"
+      ).expression = "false";
+    },
+    changed => { changed.binding.spec.validationActions = ["Warn"]; },
+    changed => {
+      changed.binding.spec.matchResources.namespaceSelector = {
+        matchLabels: { "kubernetes.io/metadata.name": "hcce" }
+      };
+    }
+  ]) {
+    const changedResources = clone(resources);
+    const changed = {
+      policy: changedResources.find(resource =>
+        resource.kind === "ValidatingAdmissionPolicy" &&
+        resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+      ),
+      binding: changedResources.find(resource =>
+        resource.kind === "ValidatingAdmissionPolicyBinding" &&
+        resource.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+      )
+    };
+    mutate(changed);
+    assert.notDeepEqual(verifyBotRunnerAdmissionResources(changedResources, "$Namespace"), []);
+  }
 });
 
 test("keeps Reticulum singleton until multi-replica storage and operational gates are staged", () => {

@@ -181,6 +181,70 @@ test("activation planning rejects scale and Pod-subresource bypasses of durable 
   );
 });
 
+test("activation planning requires the parameter-free recovery operation fence in the phase-bound state", t => {
+  const fixture = generatedFixture(t);
+  const resources = YAML.parseAllDocuments(fs.readFileSync(fixture.manifestPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const policy = resources.find(resource =>
+    resource?.kind === "ValidatingAdmissionPolicy" &&
+    resource?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+  );
+  const binding = resources.find(resource =>
+    resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+    resource?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+  );
+  assert.equal(policy.spec.paramKind, undefined);
+  assert.equal(binding.spec.paramRef, undefined);
+  assert.deepEqual(binding.spec.matchResources.namespaceSelector, {
+    matchExpressions: [{
+      key: "kubernetes.io/metadata.name",
+      operator: "DoesNotExist"
+    }]
+  });
+
+  const serialize = values => values.map(resource => YAML.stringify(resource)).join("---\n");
+  assert.throws(
+    () => readActivationPlanText(serialize(resources.filter(resource => resource !== policy))),
+    /generated_manifest_fence_aware_parent_contract_invalid/
+  );
+  for (const mutate of [
+    changed => { changed.policy.spec.paramKind = { apiVersion: "v1", kind: "ConfigMap" }; },
+    changed => { changed.binding.spec.paramRef = { name: "yenhubs-recovery-operation-lock" }; },
+    changed => {
+      changed.policy.spec.variables.find(variable =>
+        variable.name === "isParentWriterCreate"
+      ).expression = "false";
+    },
+    changed => {
+      changed.binding.spec.matchResources.namespaceSelector = {
+        matchExpressions: [{
+          key: "kubernetes.io/metadata.name",
+          operator: "In",
+          values: [fixture.input.Namespace, "hcce-bot-runners"]
+        }]
+      };
+    }
+  ]) {
+    const changedResources = structuredClone(resources);
+    const changed = {
+      policy: changedResources.find(resource =>
+        resource?.kind === "ValidatingAdmissionPolicy" &&
+        resource?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+      ),
+      binding: changedResources.find(resource =>
+        resource?.kind === "ValidatingAdmissionPolicyBinding" &&
+        resource?.metadata?.name === "recovery-operation-pod-fence.yenhubs.org"
+      )
+    };
+    mutate(changed);
+    assert.throws(
+      () => readActivationPlanText(serialize(changedResources)),
+      /generated_manifest_fence_aware_parent_contract_invalid/
+    );
+  }
+});
+
 test("standalone entrypoint completes the values contract before any kubectl read", () => {
   const source = fs.readFileSync(
     path.resolve(__dirname, "verify-live-runner-control-plane.js"),
