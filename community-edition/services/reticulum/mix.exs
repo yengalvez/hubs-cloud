@@ -9,9 +9,8 @@ defmodule Ret.Mixfile do
       deps: deps(),
       elixir: "~> 1.18.4",
       elixirc_paths: elixirc_paths(Mix.env()),
-      # cowlib 2.18.0 is the latest release. Revisit these two upstream advisories
-      # as soon as a patched cowlib version is published; every new advisory
-      # remains fatal in CI.
+      # These two upstream advisories remain unfixed in cowlib 2.19.0; every
+      # additional advisory remains fatal in CI.
       hex: [ignore_advisories: ["CVE-2026-43966", "CVE-2026-43969"]],
       releases: releases(),
       start_permanent: Mix.env() == :prod,
@@ -53,7 +52,7 @@ defmodule Ret.Mixfile do
       {:phoenix_html, "~> 3.0.4"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
       {:gettext, "~> 0.26.2"},
-      {:cowboy, "~> 2.15.0"},
+      {:cowboy, "~> 2.18.0"},
       {:plug_cowboy, "~> 2.8.1"},
       {:peerage, "~> 1.0"},
       {:httpoison, "~> 3.0.0", override: true},
