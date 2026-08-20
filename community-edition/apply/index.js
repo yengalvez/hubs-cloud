@@ -114,6 +114,7 @@ const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
 const config = utils.readConfig(process.env.HCCE_INPUT_VALUES_PATH);
 const parentNamespace = config.Namespace;
 const plan = readActivationPlanText(manifestText);
+const legacyAbsentGreenfield = plan.activationPhase === "legacy-absent";
 const waitTimeoutMs = 180_000;
 const stablePodAbsenceWindowMs = 61_000;
 const stableWatchAcquisitionTimeoutMs = waitTimeoutMs * 3;
@@ -1008,6 +1009,43 @@ function verifyPristineLegacyCutoverPreflight() {
     cutoverNamespaceUid = verifyCleanInstallCutoverEvidence().namespaceUid;
   }
   return pristineLegacyCutoverRequired;
+}
+
+function verifyLegacyAbsentGreenfieldPreflight(commandMode) {
+  if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
+  if (process.env.HCCE_TARGET_PROFILE !== "cold-rebind-legacy-absent-v1") {
+    throw new Error("legacy_absent_greenfield_profile_required");
+  }
+  const observedNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "legacy-absent-parent-namespace-preflight");
+  if (observedNamespace !== null) {
+    if (
+      observedNamespace?.metadata?.annotations?.["yenhubs.org/target-profile"] !==
+        "cold-rebind-legacy-absent-v1" ||
+      observedNamespace?.metadata?.deletionTimestamp !== undefined
+    ) {
+      throw new Error("legacy_absent_greenfield_existing_namespace_not_exact");
+    }
+    const expectedNames = new Set(expectedDeployments().map(resource => resource.metadata.name));
+    const liveDeployments = legacyAbsentDeploymentList();
+    if (
+      liveDeployments?.kind !== "DeploymentList" ||
+      liveDeployments.items.some(deployment => !expectedNames.has(deployment?.metadata?.name)) ||
+      liveDeployments.items.some(deployment =>
+        RECOVERY_CONSUMERS.includes(deployment?.metadata?.name) &&
+        Number(deployment?.spec?.replicas || 0) !== 0
+      )
+    ) {
+      throw new Error("legacy_absent_greenfield_existing_runtime_not_safe");
+    }
+  }
+  const observedRunnerNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", RUNNER_NAMESPACE, "-o", "json"
+  ], "legacy-absent-runner-namespace-preflight");
+  if (observedRunnerNamespace !== null) {
+    throw new Error("legacy_absent_greenfield_requires_absent_runner_namespace");
+  }
 }
 
 function verifyEmergencyRefencePreflight() {
@@ -2308,6 +2346,57 @@ function expectedDeployments() {
   );
 }
 
+function legacyAbsentDeploymentList() {
+  return kubectlJson([
+    "get", "--raw", `/apis/apps/v1/namespaces/${parentNamespace}/deployments`
+  ]);
+}
+
+function legacyAbsentDeploymentsMatchGeneratedDesiredState() {
+  assertOperationLeaseProcessHealthy();
+  const deployments = legacyAbsentDeploymentList();
+  const expected = expectedDeployments();
+  const liveByName = new Map(
+    Array.isArray(deployments?.items)
+      ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
+      : []
+  );
+  if (
+    deployments?.apiVersion !== "apps/v1" ||
+    deployments?.kind !== "DeploymentList" ||
+    liveByName.size !== expected.length ||
+    expected.some(deployment => !liveByName.has(deployment.metadata.name))
+  ) {
+    return false;
+  }
+  return expected.every(deployment => {
+    const live = liveByName.get(deployment.metadata.name);
+    const normalized = serverNormalizedDeployment(deployment, live);
+    return normalized !== null && exactDeploymentDesiredState(live, normalized);
+  });
+}
+
+function legacyAbsentDeploymentsAreReady() {
+  const deployments = legacyAbsentDeploymentList();
+  const expectedNames = expectedDeployments().map(resource => resource.metadata.name).sort();
+  const actualNames = Array.isArray(deployments?.items)
+    ? deployments.items.map(deployment => deployment?.metadata?.name).sort()
+    : [];
+  return deployments?.apiVersion === "apps/v1" &&
+    deployments?.kind === "DeploymentList" &&
+    JSON.stringify(actualNames) === JSON.stringify(expectedNames) &&
+    deployments.items.every(deployment => {
+      const replicas = Number(deployment.spec?.replicas || 0);
+      const generation = deployment?.metadata?.generation;
+      return Number.isInteger(generation) && generation > 0 &&
+        deployment?.status?.observedGeneration === generation &&
+        Number(deployment.status?.updatedReplicas || 0) === replicas &&
+        Number(deployment.status?.availableReplicas || 0) === replicas &&
+        Number(deployment.status?.readyReplicas || 0) === replicas &&
+        Number(deployment.status?.unavailableReplicas || 0) === 0;
+    });
+}
+
 function serverNormalizedDeployment(expected, live) {
   const candidate = structuredClone(expected);
   candidate.metadata = {
@@ -2986,6 +3075,16 @@ async function applyActive(mode) {
 
 async function applyUnderOperationLease(commandMode) {
   assertOperationLeaseHeld();
+  if (legacyAbsentGreenfield) {
+    if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
+    if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_present");
+    applyManifest();
+    await waitFor("legacy_absent_deployments_exact", legacyAbsentDeploymentsMatchGeneratedDesiredState);
+    await waitFor("legacy_absent_deployments_ready", legacyAbsentDeploymentsAreReady);
+    if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_appeared");
+    console.log("legacy-absent greenfield gate passed; five consumers remain stopped");
+    return;
+  }
   verifyCutoverPreflightUnderLease();
   if (commandMode === "emergency-refence") {
     failClosedRefenceRequired = true;
@@ -3032,7 +3131,10 @@ async function main() {
   const commandMode = requestedCommandMode(process.argv.slice(2));
   verifyManifestBeforeClusterMutation();
   requirePinnedKubectlContext();
-  if (commandMode === "emergency-refence") {
+  if (legacyAbsentGreenfield) {
+    verifyLegacyAbsentGreenfieldPreflight(commandMode);
+    cutoverPreflightClassification = "legacy-absent-greenfield";
+  } else if (commandMode === "emergency-refence") {
     verifyEmergencyRefencePreflight();
   } else {
     verifyPristineLegacyCutoverPreflight();

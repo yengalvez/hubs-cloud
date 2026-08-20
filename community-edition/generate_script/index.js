@@ -4,6 +4,11 @@ const YAML = require("yaml");
 const pemJwk = require("pem-jwk");
 const utils = require("../utils");
 const { verifyDockerConfigCredentials } = require("./verify-manifest-contracts");
+const {
+  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  applyLegacyAbsentColdRebindProfile,
+  targetProfileFromEnvironment
+} = require("./legacy-absent-cold-rebind-profile");
 
 function generationOverrides() {
   const hasInput = Object.prototype.hasOwnProperty.call(process.env, "HCCE_INPUT_VALUES_PATH");
@@ -274,6 +279,7 @@ function handleRunnerActivation(processedConfig, replacedContent) {
 function main() {
   try {
     const { inputPath, outputPath } = generationOverrides();
+    const targetProfile = targetProfileFromEnvironment();
     // Values are already parsed YAML scalars. Do not reinterpret user-provided
     // strings as templates: a secret containing `$NAME` must remain literal.
     const processedConfig = utils.readConfig(inputPath);
@@ -413,7 +419,12 @@ function main() {
     processedConfig.BOT_ORCHESTRATOR_IMAGE = botOrchestratorImage;
     const pullConfigBase64 = String(processedConfig.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 || "").trim();
     try {
-      verifyDockerConfigCredentials(pullConfigBase64, [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]);
+      verifyDockerConfigCredentials(
+        pullConfigBase64,
+        targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE
+          ? [botOrchestratorImage]
+          : [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]
+      );
     } catch (_error) {
       throw new Error(
         "BOT_IMAGE_PULL_CONFIG_JSON_BASE64 must contain canonical usable credentials for both bot image registries"
@@ -447,6 +458,9 @@ function main() {
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
     replacedContent = handleRunnerActivation(processedConfig, replacedContent);
+    if (targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE) {
+      replacedContent = applyLegacyAbsentColdRebindProfile(processedConfig, replacedContent);
+    }
 
     utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);
 

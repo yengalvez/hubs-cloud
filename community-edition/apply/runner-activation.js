@@ -98,6 +98,40 @@ function activationPlanFromResources(resources) {
     resource?.kind === "ValidatingAdmissionPolicyBinding" &&
     resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
   );
+  const legacyAbsent =
+    activationPhase === undefined &&
+    recoveryPhase === undefined &&
+    recoveryEpoch === undefined &&
+    !resources.some(resource => resource?.metadata?.namespace === RUNNER_NAMESPACE) &&
+    ![
+      ADMISSION_POLICY_NAME,
+      PARENT_FENCE_POLICY_NAME,
+      RUNNER_PROTOCOL_POLICY_NAME,
+      CUTOVER_JOURNAL_POLICY_NAME,
+      RECOVERY_OPERATION_FENCE_POLICY_NAME
+    ].some(name => resources.some(resource => resource?.metadata?.name === name));
+  if (legacyAbsent) {
+    const consumers = RECOVERY_CONSUMERS.map(name => findDeployment(resources, name));
+    const pgsql = findDeployment(resources, "pgsql");
+    if (
+      consumers.some(consumer =>
+        !consumer ||
+        consumer?.metadata?.namespace !== deployment?.metadata?.namespace ||
+        consumer?.spec?.replicas !== 0
+      ) ||
+      !pgsql ||
+      pgsql?.metadata?.namespace !== deployment?.metadata?.namespace ||
+      pgsql?.spec?.replicas !== 1
+    ) {
+      throw new Error("generated_manifest_legacy_absent_recovery_boundary_invalid");
+    }
+    return {
+      activationPhase: "legacy-absent",
+      recoveryPhase: "legacy-absent",
+      recoveryEpoch: "legacy-absent",
+      resources
+    };
+  }
   if (!["bootstrap", "admission", "active"].includes(activationPhase)) {
     throw new Error("generated_manifest_runner_activation_phase_invalid");
   }

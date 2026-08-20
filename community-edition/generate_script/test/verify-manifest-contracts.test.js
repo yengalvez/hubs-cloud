@@ -9,6 +9,7 @@ const {
   BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES,
   BOT_ORCHESTRATOR_RUNTIME_ENV,
   HAPROXY_CLUSTER_ROLE,
+  expectedLegacyAbsentColdRebindInventory,
   expectedManifestInventory,
   verifyAuditedDeploymentContainers,
   verifyBotOrchestratorContainers,
@@ -24,6 +25,7 @@ const {
   verifyBotRunnerNetworkPolicy,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
+  verifyLegacyAbsentColdRebindInventory,
   verifyManifestResourceIdentities,
   verifyManifestResourceInventory,
   verifyNoYamlIndirections,
@@ -148,6 +150,40 @@ function validInventoryResources(namespace = "hcce") {
     return resource;
   });
 }
+
+function validLegacyInventoryResources(namespace = "hcce") {
+  return expectedLegacyAbsentColdRebindInventory(namespace).map(
+    ([group, kind, resourceNamespace, name]) => {
+      const resource = {
+        apiVersion: apiVersionForGroup(group),
+        kind,
+        metadata: { name }
+      };
+      if (resourceNamespace) resource.metadata.namespace = resourceNamespace;
+      return resource;
+    }
+  );
+}
+
+test("legacy cold-rebind inventory rejects every durable residual and mixed profile", () => {
+  const resources = validLegacyInventoryResources();
+  assert.deepEqual(verifyLegacyAbsentColdRebindInventory(resources), []);
+
+  const residual = clone(resources);
+  residual.push({ apiVersion: "v1", kind: "Namespace", metadata: { name: "hcce-bot-runners" } });
+  assert.match(
+    verifyLegacyAbsentColdRebindInventory(residual).join("\n"),
+    /exactly one target Namespace/
+  );
+
+  const missing = clone(resources).filter(resource =>
+    !(resource.kind === "PersistentVolumeClaim" && resource.metadata?.name === "ret-pvc")
+  );
+  assert.match(
+    verifyLegacyAbsentColdRebindInventory(missing).join("\n"),
+    /missing.*ret-pvc/
+  );
+});
 
 test("accepts exactly one exclusive configs SecretKeyRef for each parent credential", () => {
   assert.deepEqual(verifyBotOrchestratorSecretEnv(validContainer()), []);
