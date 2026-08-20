@@ -9,6 +9,7 @@ const YAML = require("yaml");
 const { readActivationPlan, readActivationPlanText } = require("./runner-activation");
 const {
   verifyActivePlanAndConfig,
+  verifyLegacyAbsentPlanAndConfig,
   verifyManifestAgainstInputValues
 } = require("./manifest-input-contract");
 
@@ -18,6 +19,7 @@ const generatedManifestVerifierPath = path.resolve(
   communityEditionDir,
   "generate_script/verify-generated-manifest.js"
 );
+const legacyProfile = "cold-rebind-legacy-absent-v1";
 const ciInput = YAML.parse(fs.readFileSync(
   path.resolve(communityEditionDir, "input-values.ci.yaml"),
   "utf8"
@@ -28,7 +30,7 @@ const { privateKey: stableTestPermsKey } = crypto.generateKeyPairSync("rsa", {
   publicKeyEncoding: { type: "spki", format: "pem" }
 });
 
-function generatedFixture(t, overrides = {}) {
+function generatedFixture(t, overrides = {}, environment = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-live-contract-test-"));
   fs.chmodSync(directory, 0o700);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -44,6 +46,7 @@ function generatedFixture(t, overrides = {}) {
     cwd: communityEditionDir,
     env: {
       ...process.env,
+      ...environment,
       HCCE_INPUT_VALUES_PATH: inputPath,
       HCCE_OUTPUT_PATH: manifestPath
     },
@@ -53,12 +56,143 @@ function generatedFixture(t, overrides = {}) {
   return { input, inputPath, manifestPath };
 }
 
+function legacyInputOverrides(overrides = {}) {
+  return {
+    OVERRIDE_BOT_RUNNER_IMAGE: "No",
+    ...overrides
+  };
+}
+
 test("standalone live verifier accepts only the exact reproducible active manifest", t => {
   const fixture = generatedFixture(t);
   const result = verifyManifestAgainstInputValues(fixture.inputPath, fixture.manifestPath);
   assert.equal(result.plan.activationPhase, "active");
   assert.equal(result.plan.recoveryPhase, "active");
   assert.equal(result.plan.recoveryEpoch, fixture.input.BOT_RUNNER_RECOVERY_EPOCH);
+});
+
+test("standalone live verifier accepts only the exact reproducible legacy-absent cold target", t => {
+  const environment = { HCCE_TARGET_PROFILE: legacyProfile };
+  const fixture = generatedFixture(t, legacyInputOverrides(), environment);
+  const result = verifyManifestAgainstInputValues(
+    fixture.inputPath,
+    fixture.manifestPath,
+    environment
+  );
+  assert.equal(result.targetProfile, legacyProfile);
+  assert.equal(result.plan.activationPhase, "legacy-absent");
+  assert.equal(result.plan.recoveryPhase, "legacy-absent");
+  assert.equal(result.plan.recoveryEpoch, "legacy-absent");
+});
+
+test("standalone live verifier keeps durable and legacy target profiles disjoint", async t => {
+  await t.test("durable manifest under legacy profile", child => {
+    const fixture = generatedFixture(child);
+    assert.throws(
+      () => verifyManifestAgainstInputValues(
+        fixture.inputPath,
+        fixture.manifestPath,
+        { HCCE_TARGET_PROFILE: legacyProfile }
+      ),
+      /canonical_manifest_generation_failed/
+    );
+  });
+  await t.test("legacy manifest without target profile", child => {
+    const environment = { HCCE_TARGET_PROFILE: legacyProfile };
+    const fixture = generatedFixture(child, legacyInputOverrides(), environment);
+    assert.throws(
+      () => verifyManifestAgainstInputValues(fixture.inputPath, fixture.manifestPath, {}),
+      /canonical_manifest_generation_failed/
+    );
+  });
+  await t.test("legacy manifest with durable runner residue", child => {
+    const environment = { HCCE_TARGET_PROFILE: legacyProfile };
+    const fixture = generatedFixture(child, legacyInputOverrides(), environment);
+    const resources = YAML.parseAllDocuments(fs.readFileSync(fixture.manifestPath, "utf8"))
+      .map(document => document.toJS())
+      .filter(Boolean);
+    resources.push({
+      apiVersion: "v1",
+      kind: "Namespace",
+      metadata: { name: "hcce-bot-runners" }
+    });
+    fs.writeFileSync(
+      fixture.manifestPath,
+      resources.map(resource => YAML.stringify(resource)).join("---\n"),
+      { mode: 0o600 }
+    );
+    assert.throws(
+      () => verifyManifestAgainstInputValues(
+        fixture.inputPath,
+        fixture.manifestPath,
+        environment
+      ),
+      /manifest_does_not_match_input_values/
+    );
+  });
+});
+
+test("legacy live contract rejects invalid durable input phase combinations", async t => {
+  const environment = { HCCE_TARGET_PROFILE: legacyProfile };
+  await t.test("bootstrap activation input", child => {
+    const fixture = generatedFixture(child, legacyInputOverrides({
+      BOT_RUNNER_ACTIVATION_PHASE: "bootstrap"
+    }), environment);
+    assert.throws(
+      () => verifyManifestAgainstInputValues(
+        fixture.inputPath,
+        fixture.manifestPath,
+        environment
+      ),
+      /legacy_live_verifier_requires_config_activation_active/
+    );
+  });
+  await t.test("restore-fence recovery input", child => {
+    const fixture = generatedFixture(child, legacyInputOverrides({
+      BOT_RUNNER_RECOVERY_PHASE: "restore-fence"
+    }), environment);
+    assert.throws(
+      () => verifyManifestAgainstInputValues(
+        fixture.inputPath,
+        fixture.manifestPath,
+        environment
+      ),
+      /legacy_live_verifier_requires_config_recovery_active/
+    );
+  });
+});
+
+test("legacy plan guard rejects mixed phases, durable epoch and missing exact profile", t => {
+  const fixture = generatedFixture(
+    t,
+    legacyInputOverrides(),
+    { HCCE_TARGET_PROFILE: legacyProfile }
+  );
+  const plan = readActivationPlan(fixture.manifestPath);
+  assert.throws(
+    () => verifyLegacyAbsentPlanAndConfig({ ...plan, activationPhase: "active" }, fixture.input),
+    /legacy_live_verifier_requires_manifest_activation_absent/
+  );
+  assert.throws(
+    () => verifyLegacyAbsentPlanAndConfig({ ...plan, recoveryPhase: "active" }, fixture.input),
+    /legacy_live_verifier_requires_manifest_recovery_absent/
+  );
+  assert.throws(
+    () => verifyLegacyAbsentPlanAndConfig({
+      ...plan,
+      recoveryEpoch: fixture.input.BOT_RUNNER_RECOVERY_EPOCH
+    }, fixture.input),
+    /legacy_live_verifier_requires_manifest_recovery_epoch_absent/
+  );
+  const resources = structuredClone(plan.resources);
+  const namespace = resources.find(resource =>
+    resource?.apiVersion === "v1" && resource?.kind === "Namespace"
+  );
+  delete namespace.metadata.annotations["yenhubs.org/target-profile"];
+  assert.throws(
+    () => verifyLegacyAbsentPlanAndConfig({ ...plan, resources }, fixture.input),
+    /legacy_live_verifier_target_profile_mismatch/
+  );
 });
 
 test("standalone live verifier rejects bootstrap/inert and restore-fence manifests", async t => {
@@ -243,6 +377,44 @@ test("activation planning requires the parameter-free recovery operation fence i
       /generated_manifest_fence_aware_parent_contract_invalid/
     );
   }
+});
+
+test("activation planning accepts only an exact stopped legacy-absent greenfield boundary", () => {
+  const namespace = "hcce";
+  const deployments = [
+    "reticulum",
+    "pgbouncer",
+    "pgbouncer-t",
+    "bot-orchestrator",
+    "coturn"
+  ].map(name => ({
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name, namespace },
+    spec: { replicas: 0 }
+  }));
+  deployments.push({
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: "pgsql", namespace },
+    spec: { replicas: 1 }
+  });
+  const resources = [
+    { apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } },
+    ...deployments
+  ];
+  const serialize = values => values.map(resource => YAML.stringify(resource)).join("---\n");
+  const plan = readActivationPlanText(serialize(resources));
+  assert.equal(plan.activationPhase, "legacy-absent");
+  assert.equal(plan.recoveryPhase, "legacy-absent");
+  assert.equal(plan.resources.length, resources.length);
+
+  const unsafe = structuredClone(resources);
+  unsafe.find(resource => resource?.metadata?.name === "reticulum").spec.replicas = 1;
+  assert.throws(
+    () => readActivationPlanText(serialize(unsafe)),
+    /generated_manifest_legacy_absent_recovery_boundary_invalid/
+  );
 });
 
 test("standalone entrypoint completes the values contract before any kubectl read", () => {

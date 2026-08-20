@@ -20,12 +20,17 @@ const {
   verifyBotRunnerRecoveryContract,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
+  verifyLegacyAbsentColdRebindProfile,
   verifyManifestResourceIdentities,
   verifyManifestResourceInventory,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
   verifyReticulumBotRunnerAuthorityContract
 } = require("./verify-manifest-contracts");
+const {
+  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  targetProfileFromEnvironment
+} = require("./legacy-absent-cold-rebind-profile");
 
 const verifierArguments = process.argv.slice(2);
 const stdinMode = verifierArguments.length === 1 && verifierArguments[0] === "--stdin";
@@ -37,6 +42,13 @@ const manifestPath = process.env.HCCE_MANIFEST_PATH
   ? path.resolve(process.env.HCCE_MANIFEST_PATH)
   : path.resolve(__dirname, "../hcce.yaml");
 const errors = [];
+let targetProfile;
+try {
+  targetProfile = targetProfileFromEnvironment();
+} catch (error) {
+  console.error(`Manifest verification failed:\n- ${error.message}`);
+  process.exit(1);
+}
 
 function fail(message) {
   errors.push(message);
@@ -151,19 +163,27 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   });
   verifyNoYamlIndirections(documents, YAML).forEach(fail);
   const resources = documents.map(document => document.toJS()).filter(Boolean);
+  const legacyProfile = targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE;
   verifyManifestResourceIdentities(resources).forEach(fail);
-  verifyManifestResourceInventory(resources).forEach(fail);
+  if (legacyProfile) {
+    verifyLegacyAbsentColdRebindProfile(resources).forEach(fail);
+  } else {
+    verifyManifestResourceInventory(resources).forEach(fail);
+  }
   const primaryNamespace = resources.find(resource =>
     resource?.apiVersion === "v1" &&
     resource?.kind === "Namespace" &&
     resource?.metadata?.name !== "hcce-bot-runners"
   )?.metadata?.name;
-  verifyBotRunnerRecoveryContract(resources, primaryNamespace).forEach(fail);
+  if (!legacyProfile) {
+    verifyBotRunnerRecoveryContract(resources, primaryNamespace).forEach(fail);
+  }
   verifyNoReticulumHorizontalPodAutoscaler(resources).forEach(fail);
   const namespaceResource = resources.find(resource => {
     return resource?.apiVersion === "v1" &&
       resource?.kind === "Namespace" &&
-      resource?.metadata?.namespace === undefined;
+      resource?.metadata?.namespace === undefined &&
+      resource?.metadata?.name === primaryNamespace;
   });
   const manifestNamespace = namespaceResource?.metadata?.name || "";
   verifyAuditedDeploymentContainers(resources, manifestNamespace).forEach(fail);
@@ -178,55 +198,16 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   const accessKeys = Object.fromEntries(
     accessKeyNames.map(name => [name, configsSecret?.stringData?.[name]])
   );
-  for (const name of accessKeyNames) {
-    if (typeof accessKeys[name] !== "string" || accessKeys[name].length < 32) {
-      fail(`Secret/configs ${name} must contain at least 32 characters`);
-    }
-  }
-  if (new Set(accessKeyNames.map(name => accessKeys[name])).size !== accessKeyNames.length) {
-    fail("Secret/configs bot integration, runner, orchestrator and dashboard keys must be distinct");
-  }
-
   const retConfig = findExactResource(resources, "", "ConfigMap", manifestNamespace, "ret-config");
   const reticulum = findExactResource(resources, "apps", "Deployment", manifestNamespace, "reticulum");
-  verifyReticulumBotRunnerAuthorityContract(reticulum).forEach(fail);
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
     container => container.name === "reticulum"
   );
   const reticulumEnv = Array.isArray(reticulumContainer?.env) ? reticulumContainer.env : [];
-  const reticulumAccessKeyContracts = accessKeyNames.map(name => ({
-    envName: `turkeyCfg_${name}`,
-    secretKey: name
-  }));
-  for (const contract of reticulumAccessKeyContracts) {
-    const entries = reticulumEnv.filter(entry => entry?.name === contract.envName);
-    const entry = entries[0];
-    const valueFrom = entry?.valueFrom;
-    const secretKeyRef = valueFrom?.secretKeyRef;
-    if (
-      entries.length !== 1 ||
-      !hasExactOwnKeys(entry, ["name", "valueFrom"]) ||
-      !hasExactOwnKeys(valueFrom, ["secretKeyRef"]) ||
-      !hasExactOwnKeys(secretKeyRef, ["name", "key"]) ||
-      secretKeyRef.name !== "configs" ||
-      secretKeyRef.key !== contract.secretKey
-    ) {
-      fail(
-        `Deployment/reticulum ${contract.envName} must exclusively reference ` +
-        `Secret/configs key ${contract.secretKey}`
-      );
-    }
-  }
-  const reticulumAccessKeyReferences = reticulumEnv.filter(entry =>
-    accessKeyNames.includes(entry?.valueFrom?.secretKeyRef?.key)
-  );
-  if (reticulumAccessKeyReferences.length !== reticulumAccessKeyContracts.length) {
-    fail("Deployment/reticulum must contain exactly four scoped access-key Secret references");
-  }
   const runtimeConfig = retConfig?.data?.["config.toml.template"] || "";
   const runtimePlaceholders = [...runtimeConfig.matchAll(/<([A-Z][A-Z0-9_]*)>/g)].map(match => match[1]);
   const runtimeVariables = new Set(
-    (reticulumContainer?.env || [])
+    reticulumEnv
       .map(variable => variable.name)
       .filter(name => name.startsWith("turkeyCfg_"))
       .map(name => name.slice("turkeyCfg_".length))
@@ -239,75 +220,152 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
       `ret-config placeholders have no matching turkeyCfg_ environment variable: ${missingRuntimeVariables.join(", ")}`
     );
   }
-  const accessKeyPlaceholderSet = new Set(accessKeyNames);
-  const observedAccessKeyMappings = [];
-  const observedBotRoomLimitMappings = [];
-  let currentRuntimeSection = "";
-  for (const rawLine of runtimeConfig.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (/^\[[^\r\n]+\]$/.test(line)) {
-      currentRuntimeSection = line;
-      continue;
+  if (!legacyProfile) {
+    verifyReticulumBotRunnerAuthorityContract(reticulum).forEach(fail);
+    for (const name of accessKeyNames) {
+      if (typeof accessKeys[name] !== "string" || accessKeys[name].length < 32) {
+        fail(`Secret/configs ${name} must contain at least 32 characters`);
+      }
     }
-    const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"<([A-Z][A-Z0-9_]*)>"\s*$/);
-    if (assignment && accessKeyPlaceholderSet.has(assignment[2])) {
-      observedAccessKeyMappings.push(`${currentRuntimeSection}\t${assignment[1]}\t${assignment[2]}`);
+    if (new Set(accessKeyNames.map(name => accessKeys[name])).size !== accessKeyNames.length) {
+      fail("Secret/configs bot integration, runner, orchestrator and dashboard keys must be distinct");
     }
-    const botRoomLimitAssignment = line.match(
-      /^(max_active_bot_rooms)\s*=\s*<([A-Z][A-Z0-9_]*)>\s*$/
+    const reticulumAccessKeyContracts = accessKeyNames.map(name => ({
+      envName: `turkeyCfg_${name}`,
+      secretKey: name
+    }));
+    for (const contract of reticulumAccessKeyContracts) {
+      const entries = reticulumEnv.filter(entry => entry?.name === contract.envName);
+      const entry = entries[0];
+      const valueFrom = entry?.valueFrom;
+      const secretKeyRef = valueFrom?.secretKeyRef;
+      if (
+        entries.length !== 1 ||
+        !hasExactOwnKeys(entry, ["name", "valueFrom"]) ||
+        !hasExactOwnKeys(valueFrom, ["secretKeyRef"]) ||
+        !hasExactOwnKeys(secretKeyRef, ["name", "key"]) ||
+        secretKeyRef.name !== "configs" ||
+        secretKeyRef.key !== contract.secretKey
+      ) {
+        fail(
+          `Deployment/reticulum ${contract.envName} must exclusively reference ` +
+          `Secret/configs key ${contract.secretKey}`
+        );
+      }
+    }
+    const reticulumAccessKeyReferences = reticulumEnv.filter(entry =>
+      accessKeyNames.includes(entry?.valueFrom?.secretKeyRef?.key)
     );
-    if (botRoomLimitAssignment) {
-      observedBotRoomLimitMappings.push(
-        `${currentRuntimeSection}\t${botRoomLimitAssignment[1]}\t${botRoomLimitAssignment[2]}`
+    if (reticulumAccessKeyReferences.length !== reticulumAccessKeyContracts.length) {
+      fail("Deployment/reticulum must contain exactly four scoped access-key Secret references");
+    }
+    const accessKeyPlaceholderSet = new Set(accessKeyNames);
+    const observedAccessKeyMappings = [];
+    const observedBotRoomLimitMappings = [];
+    let currentRuntimeSection = "";
+    for (const rawLine of runtimeConfig.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (/^\[[^\r\n]+\]$/.test(line)) {
+        currentRuntimeSection = line;
+        continue;
+      }
+      const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"<([A-Z][A-Z0-9_]*)>"\s*$/);
+      if (assignment && accessKeyPlaceholderSet.has(assignment[2])) {
+        observedAccessKeyMappings.push(`${currentRuntimeSection}\t${assignment[1]}\t${assignment[2]}`);
+      }
+      const botRoomLimitAssignment = line.match(
+        /^(max_active_bot_rooms)\s*=\s*<([A-Z][A-Z0-9_]*)>\s*$/
       );
+      if (botRoomLimitAssignment) {
+        observedBotRoomLimitMappings.push(
+          `${currentRuntimeSection}\t${botRoomLimitAssignment[1]}\t${botRoomLimitAssignment[2]}`
+        );
+      }
+    }
+    const expectedAccessKeyMappings = [
+      '[ret."Elixir.RetWeb.Plugs.DashboardHeaderAuthorization"]\tdashboard_access_key\tDASHBOARD_ACCESS_KEY',
+      '[ret."Elixir.RetWeb.Plugs.HeaderAuthorization"]\theader_value\tDASHBOARD_ACCESS_KEY',
+      '[ret]\tbot_access_key\tBOT_ACCESS_KEY',
+      '[ret]\tbot_runner_access_key\tBOT_RUNNER_ACCESS_KEY',
+      '[ret]\tbot_orchestrator_access_key\tBOT_ORCHESTRATOR_ACCESS_KEY',
+      '[ret."Elixir.Ret.BotOrchestrator"]\taccess_key\tBOT_ORCHESTRATOR_ACCESS_KEY'
+    ];
+    if (
+      JSON.stringify(observedAccessKeyMappings.sort()) !== JSON.stringify(expectedAccessKeyMappings.sort())
+    ) {
+      fail("ret-config must preserve the exact scoped access-key placeholder mappings");
+    }
+    if (
+      JSON.stringify(observedBotRoomLimitMappings) !==
+      JSON.stringify(["[ret]\tmax_active_bot_rooms\tMAX_ACTIVE_ROOMS"])
+    ) {
+      fail("ret-config must bind max_active_bot_rooms exactly to MAX_ACTIVE_ROOMS");
+    }
+
+    const reticulumBotRoomLimitEntries = reticulumEnv.filter(
+      entry => entry?.name === "turkeyCfg_MAX_ACTIVE_ROOMS"
+    );
+    const reticulumBotRoomLimitEntry = reticulumBotRoomLimitEntries[0];
+    const capacityBotOrchestrator = findExactResource(
+      resources,
+      "apps",
+      "Deployment",
+      manifestNamespace,
+      "bot-orchestrator"
+    );
+    const capacityBotContainer = capacityBotOrchestrator?.spec?.template?.spec?.containers?.find(
+      container => container.name === "bot-orchestrator"
+    );
+    const botRoomLimitEntries = (capacityBotContainer?.env || []).filter(
+      entry => entry?.name === "MAX_ACTIVE_ROOMS"
+    );
+    const botRoomLimitEntry = botRoomLimitEntries[0];
+    if (
+      reticulumBotRoomLimitEntries.length !== 1 ||
+      botRoomLimitEntries.length !== 1 ||
+      !hasExactOwnKeys(reticulumBotRoomLimitEntry, ["name", "value"]) ||
+      !hasExactOwnKeys(botRoomLimitEntry, ["name", "value"]) ||
+      String(reticulumBotRoomLimitEntry.value) !== String(botRoomLimitEntry.value)
+    ) {
+      fail("Reticulum and bot-orchestrator must receive the same MAX_ACTIVE_ROOMS value");
     }
   }
-  const expectedAccessKeyMappings = [
-    '[ret."Elixir.RetWeb.Plugs.DashboardHeaderAuthorization"]\tdashboard_access_key\tDASHBOARD_ACCESS_KEY',
-    '[ret."Elixir.RetWeb.Plugs.HeaderAuthorization"]\theader_value\tDASHBOARD_ACCESS_KEY',
-    '[ret]\tbot_access_key\tBOT_ACCESS_KEY',
-    '[ret]\tbot_runner_access_key\tBOT_RUNNER_ACCESS_KEY',
-    '[ret]\tbot_orchestrator_access_key\tBOT_ORCHESTRATOR_ACCESS_KEY',
-    '[ret."Elixir.Ret.BotOrchestrator"]\taccess_key\tBOT_ORCHESTRATOR_ACCESS_KEY'
-  ];
-  if (
-    JSON.stringify(observedAccessKeyMappings.sort()) !== JSON.stringify(expectedAccessKeyMappings.sort())
-  ) {
-    fail("ret-config must preserve the exact scoped access-key placeholder mappings");
-  }
-  if (
-    JSON.stringify(observedBotRoomLimitMappings) !==
-    JSON.stringify(["[ret]\tmax_active_bot_rooms\tMAX_ACTIVE_ROOMS"])
-  ) {
-    fail("ret-config must bind max_active_bot_rooms exactly to MAX_ACTIVE_ROOMS");
-  }
-
-  const reticulumBotRoomLimitEntries = reticulumEnv.filter(
-    entry => entry?.name === "turkeyCfg_MAX_ACTIVE_ROOMS"
-  );
-  const reticulumBotRoomLimitEntry = reticulumBotRoomLimitEntries[0];
-  const capacityBotOrchestrator = findExactResource(
-    resources,
-    "apps",
-    "Deployment",
-    manifestNamespace,
-    "bot-orchestrator"
-  );
-  const capacityBotContainer = capacityBotOrchestrator?.spec?.template?.spec?.containers?.find(
-    container => container.name === "bot-orchestrator"
-  );
-  const botRoomLimitEntries = (capacityBotContainer?.env || []).filter(
-    entry => entry?.name === "MAX_ACTIVE_ROOMS"
-  );
-  const botRoomLimitEntry = botRoomLimitEntries[0];
-  if (
-    reticulumBotRoomLimitEntries.length !== 1 ||
-    botRoomLimitEntries.length !== 1 ||
-    !hasExactOwnKeys(reticulumBotRoomLimitEntry, ["name", "value"]) ||
-    !hasExactOwnKeys(botRoomLimitEntry, ["name", "value"]) ||
-    String(reticulumBotRoomLimitEntry.value) !== String(botRoomLimitEntry.value)
-  ) {
-    fail("Reticulum and bot-orchestrator must receive the same MAX_ACTIVE_ROOMS value");
+  if (legacyProfile) {
+    const observedBotRoomLimitMappings = [];
+    let currentRuntimeSection = "";
+    for (const rawLine of runtimeConfig.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (/^\[[^\r\n]+\]$/.test(line)) {
+        currentRuntimeSection = line;
+        continue;
+      }
+      const assignment = line.match(/^(max_active_bot_rooms)\s*=\s*<([A-Z][A-Z0-9_]*)>\s*$/);
+      if (assignment) {
+        observedBotRoomLimitMappings.push(
+          `${currentRuntimeSection}\t${assignment[1]}\t${assignment[2]}`
+        );
+      }
+    }
+    if (
+      JSON.stringify(observedBotRoomLimitMappings) !==
+      JSON.stringify(["[ret]\tmax_active_bot_rooms\tMAX_ACTIVE_ROOMS"])
+    ) {
+      fail("ret-config must bind max_active_bot_rooms exactly to MAX_ACTIVE_ROOMS");
+    }
+    const reticulumEntries = reticulumEnv.filter(entry => entry?.name === "turkeyCfg_MAX_ACTIVE_ROOMS");
+    const parent = findExactResource(resources, "apps", "Deployment", manifestNamespace, "bot-orchestrator");
+    const parentContainer = parent?.spec?.template?.spec?.containers?.find(
+      container => container.name === "bot-orchestrator"
+    );
+    const parentEntries = (parentContainer?.env || []).filter(entry => entry?.name === "MAX_ACTIVE_ROOMS");
+    if (
+      reticulumEntries.length !== 1 || parentEntries.length !== 1 ||
+      !hasExactOwnKeys(reticulumEntries[0], ["name", "value"]) ||
+      !hasExactOwnKeys(parentEntries[0], ["name", "value"]) ||
+      String(reticulumEntries[0].value) !== String(parentEntries[0].value)
+    ) {
+      fail("Reticulum and bot-orchestrator must receive the same MAX_ACTIVE_ROOMS value");
+    }
   }
 
   for (const deployment of resources.filter(resource => resource.kind === "Deployment")) {
@@ -398,59 +456,61 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
     manifestNamespace,
     "bot-orchestrator"
   );
-  if (
-    botOrchestrator?.spec?.template?.spec?.serviceAccountName !== "bot-orchestrator" ||
-    botOrchestrator?.spec?.template?.spec?.automountServiceAccountToken !== true ||
-    JSON.stringify(botOrchestrator?.spec?.template?.spec?.imagePullSecrets) !==
-      JSON.stringify([{ name: "bot-images-pull" }])
-  ) {
-    fail("Deployment/bot-orchestrator must use its dedicated service account and image-pull Secret");
-  }
   verifyBotOrchestratorContainers(botOrchestrator).forEach(fail);
-  verifyBotOrchestratorDeploymentContract(botOrchestrator).forEach(fail);
-  verifyBotOrchestratorIsolationContract(botOrchestrator).forEach(fail);
   const dialog = findExactResource(resources, "apps", "Deployment", manifestNamespace, "dialog");
-  const reticulumBotKeyChecksum =
-    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
-  const reticulumRunnerKeyChecksum =
-    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
-  const reticulumOrchestratorKeyChecksum =
-    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
-  const reticulumDashboardKeyChecksum =
-    reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"];
-  const botOrchestratorRunnerKeyChecksum =
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
-  const botOrchestratorAccessKeyChecksum =
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
-  const checksumFor = name =>
-    typeof accessKeys[name] === "string"
-      ? crypto.createHash("sha256").update(accessKeys[name]).digest("hex")
-      : "";
-  const expectedBotKeyChecksum = checksumFor("BOT_ACCESS_KEY");
-  if (reticulumBotKeyChecksum !== expectedBotKeyChecksum) {
-    fail("Deployment/reticulum bot access key checksum must match Secret/configs");
-  }
-  if (reticulumRunnerKeyChecksum !== checksumFor("BOT_RUNNER_ACCESS_KEY")) {
-    fail("Deployment/reticulum runner key checksum must match Secret/configs");
-  }
-  if (botOrchestratorRunnerKeyChecksum) {
-    fail("bot-orchestrator must not receive the master runner key checksum");
-  }
-  if (
-    reticulumOrchestratorKeyChecksum !== checksumFor("BOT_ORCHESTRATOR_ACCESS_KEY") ||
-    botOrchestratorAccessKeyChecksum !== reticulumOrchestratorKeyChecksum
-  ) {
-    fail("Reticulum and bot-orchestrator access key checksums must match Secret/configs");
-  }
-  if (reticulumDashboardKeyChecksum !== checksumFor("DASHBOARD_ACCESS_KEY")) {
-    fail("Deployment/reticulum dashboard key checksum must match Secret/configs");
-  }
-  if (
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"] ||
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"] ||
-    botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"]
-  ) {
-    fail("bot-orchestrator must not receive legacy integration or dashboard key checksums");
+  if (!legacyProfile) {
+    if (
+      botOrchestrator?.spec?.template?.spec?.serviceAccountName !== "bot-orchestrator" ||
+      botOrchestrator?.spec?.template?.spec?.automountServiceAccountToken !== true ||
+      JSON.stringify(botOrchestrator?.spec?.template?.spec?.imagePullSecrets) !==
+        JSON.stringify([{ name: "bot-images-pull" }])
+    ) {
+      fail("Deployment/bot-orchestrator must use its dedicated service account and image-pull Secret");
+    }
+    verifyBotOrchestratorDeploymentContract(botOrchestrator).forEach(fail);
+    verifyBotOrchestratorIsolationContract(botOrchestrator).forEach(fail);
+    const reticulumBotKeyChecksum =
+      reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"];
+    const reticulumRunnerKeyChecksum =
+      reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
+    const reticulumOrchestratorKeyChecksum =
+      reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
+    const reticulumDashboardKeyChecksum =
+      reticulum?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"];
+    const botOrchestratorRunnerKeyChecksum =
+      botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"];
+    const botOrchestratorAccessKeyChecksum =
+      botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-orchestrator-access-key-checksum"];
+    const checksumFor = name =>
+      typeof accessKeys[name] === "string"
+        ? crypto.createHash("sha256").update(accessKeys[name]).digest("hex")
+        : "";
+    const expectedBotKeyChecksum = checksumFor("BOT_ACCESS_KEY");
+    if (reticulumBotKeyChecksum !== expectedBotKeyChecksum) {
+      fail("Deployment/reticulum bot access key checksum must match Secret/configs");
+    }
+    if (reticulumRunnerKeyChecksum !== checksumFor("BOT_RUNNER_ACCESS_KEY")) {
+      fail("Deployment/reticulum runner key checksum must match Secret/configs");
+    }
+    if (botOrchestratorRunnerKeyChecksum) {
+      fail("bot-orchestrator must not receive the master runner key checksum");
+    }
+    if (
+      reticulumOrchestratorKeyChecksum !== checksumFor("BOT_ORCHESTRATOR_ACCESS_KEY") ||
+      botOrchestratorAccessKeyChecksum !== reticulumOrchestratorKeyChecksum
+    ) {
+      fail("Reticulum and bot-orchestrator access key checksums must match Secret/configs");
+    }
+    if (reticulumDashboardKeyChecksum !== checksumFor("DASHBOARD_ACCESS_KEY")) {
+      fail("Deployment/reticulum dashboard key checksum must match Secret/configs");
+    }
+    if (
+      botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-access-key-checksum"] ||
+      botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/bot-runner-access-key-checksum"] ||
+      botOrchestrator?.spec?.template?.metadata?.annotations?.["yenhubs.org/dashboard-access-key-checksum"]
+    ) {
+      fail("bot-orchestrator must not receive legacy integration or dashboard key checksums");
+    }
   }
 
   const databaseConsumers = ["reticulum", "pgbouncer", "pgbouncer-t", "coturn"];
@@ -494,13 +554,15 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   if (!botContainer) {
     fail("missing bot-orchestrator container");
   } else {
-    verifyBotOrchestratorSecretEnv(botContainer).forEach(fail);
     verifyBotOrchestratorSecurityContext(botContainer).forEach(fail);
-    verifyBotOrchestratorRuntimeEnv(botContainer, manifestNamespace).forEach(fail);
+    if (!legacyProfile) {
+      verifyBotOrchestratorSecretEnv(botContainer).forEach(fail);
+      verifyBotOrchestratorRuntimeEnv(botContainer, manifestNamespace).forEach(fail);
+    }
     const botEnv = Object.fromEntries(
       (botContainer.env || []).filter(entry => entry && entry.name).map(entry => [entry.name, entry.value])
     );
-    if (!isDigestPinnedImage(botEnv.BOT_RUNNER_IMAGE)) {
+    if (!legacyProfile && !isDigestPinnedImage(botEnv.BOT_RUNNER_IMAGE)) {
       fail("bot-orchestrator BOT_RUNNER_IMAGE must pin the dedicated runner image by digest");
     }
     if (botEnv.RUNNER_BACKEND !== "ghost" || botEnv.RUNNER_AUTOSTART !== "true") {
@@ -686,50 +748,52 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   );
   verifyHaproxyClusterRole(haproxyRole).forEach(fail);
 
-  verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
-  verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
-  verifyBotRunnerAdmissionResources(resources, manifestNamespace).forEach(fail);
-  const botRunnerDefaultDeny = findExactResource(
-    resources,
-    "networking.k8s.io",
-    "NetworkPolicy",
-    "hcce-bot-runners",
-    "bot-runner-default-deny"
-  );
-  verifyBotRunnerDefaultDenyNetworkPolicy(botRunnerDefaultDeny).forEach(fail);
-  const botRunnerNetworkPolicy = findExactResource(
-    resources,
-    "networking.k8s.io",
-    "NetworkPolicy",
-    "hcce-bot-runners",
-    "bot-runner-egress"
-  );
-  verifyBotRunnerNetworkPolicy(botRunnerNetworkPolicy, manifestNamespace).forEach(fail);
+  if (!legacyProfile) {
+    verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
+    verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
+    verifyBotRunnerAdmissionResources(resources, manifestNamespace).forEach(fail);
+    const botRunnerDefaultDeny = findExactResource(
+      resources,
+      "networking.k8s.io",
+      "NetworkPolicy",
+      "hcce-bot-runners",
+      "bot-runner-default-deny"
+    );
+    verifyBotRunnerDefaultDenyNetworkPolicy(botRunnerDefaultDeny).forEach(fail);
+    const botRunnerNetworkPolicy = findExactResource(
+      resources,
+      "networking.k8s.io",
+      "NetworkPolicy",
+      "hcce-bot-runners",
+      "bot-runner-egress"
+    );
+    verifyBotRunnerNetworkPolicy(botRunnerNetworkPolicy, manifestNamespace).forEach(fail);
 
-  verifyIngressPolicy(
-    resources,
-    manifestNamespace,
-    "bot-orchestrator-ingress",
-    "bot-orchestrator",
-    [],
-    5001,
-    [
-      { podSelector: { matchLabels: { app: "reticulum" } } },
-      {
-        namespaceSelector: {
-          matchLabels: {
-            "kubernetes.io/metadata.name": "hcce-bot-runners"
-          }
-        },
-        podSelector: {
-          matchLabels: {
-            app: "bot-runner",
-            "yenhubs.org/managed-by": "bot-orchestrator"
+    verifyIngressPolicy(
+      resources,
+      manifestNamespace,
+      "bot-orchestrator-ingress",
+      "bot-orchestrator",
+      [],
+      5001,
+      [
+        { podSelector: { matchLabels: { app: "reticulum" } } },
+        {
+          namespaceSelector: {
+            matchLabels: {
+              "kubernetes.io/metadata.name": "hcce-bot-runners"
+            }
+          },
+          podSelector: {
+            matchLabels: {
+              app: "bot-runner",
+              "yenhubs.org/managed-by": "bot-orchestrator"
+            }
           }
         }
-      }
-    ]
-  );
+      ]
+    );
+  }
   verifyIngressPolicy(resources, manifestNamespace, "pgsql-ingress", "pgsql", ["pgbouncer", "pgbouncer-t"], 5432);
   verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-ingress", "pgbouncer", ["reticulum"], 5432);
   verifyIngressPolicy(resources, manifestNamespace, "pgbouncer-t-ingress", "pgbouncer-t", ["reticulum"], 5432);
@@ -845,7 +909,11 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   }
 
   if (!errors.length) {
-    console.log(`Manifest verification passed (${resources.length} resources).`);
+    console.log(
+      legacyProfile
+        ? `Manifest verification passed for ${LEGACY_ABSENT_COLD_REBIND_PROFILE} (${resources.length} resources).`
+        : `Manifest verification passed (${resources.length} resources).`
+    );
   }
 }
 

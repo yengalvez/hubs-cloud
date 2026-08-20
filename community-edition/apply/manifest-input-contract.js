@@ -4,6 +4,10 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const utils = require("../utils");
+const {
+  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  targetProfileFromEnvironment
+} = require("../generate_script/legacy-absent-cold-rebind-profile");
 const { readActivationPlan } = require("./runner-activation");
 
 const communityEditionDir = path.resolve(__dirname, "..");
@@ -16,9 +20,13 @@ const subprocessTimeoutMs = 120_000;
 const subprocessMaxBuffer = 4 * 1024 * 1024;
 
 function runNode(scriptPath, environment) {
+  const childEnvironment = { ...process.env, ...environment };
+  for (const [name, value] of Object.entries(childEnvironment)) {
+    if (value === undefined) delete childEnvironment[name];
+  }
   return spawnSync(process.execPath, [scriptPath], {
     cwd: communityEditionDir,
-    env: { ...process.env, ...environment },
+    env: childEnvironment,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: subprocessTimeoutMs,
@@ -67,16 +75,64 @@ function verifyActivePlanAndConfig(plan, config) {
   }
 }
 
-function verifyManifestAgainstInputValues(inputPath, manifestPath) {
+function verifyLegacyAbsentPlanAndConfig(plan, config) {
+  if (String(config?.BOT_RUNNER_ACTIVATION_PHASE || "") !== "active") {
+    throw new Error("legacy_live_verifier_requires_config_activation_active");
+  }
+  if (String(config?.BOT_RUNNER_RECOVERY_PHASE || "") !== "active") {
+    throw new Error("legacy_live_verifier_requires_config_recovery_active");
+  }
+  if (plan?.activationPhase !== "legacy-absent") {
+    throw new Error("legacy_live_verifier_requires_manifest_activation_absent");
+  }
+  if (plan?.recoveryPhase !== "legacy-absent") {
+    throw new Error("legacy_live_verifier_requires_manifest_recovery_absent");
+  }
+  if (plan?.recoveryEpoch !== "legacy-absent") {
+    throw new Error("legacy_live_verifier_requires_manifest_recovery_epoch_absent");
+  }
+  const namespaces = (plan?.resources || []).filter(resource =>
+    resource?.apiVersion === "v1" &&
+    resource?.kind === "Namespace" &&
+    resource?.metadata?.name !== "hcce-bot-runners"
+  );
+  if (
+    namespaces.length !== 1 ||
+    namespaces[0]?.metadata?.annotations?.["yenhubs.org/target-profile"] !==
+      LEGACY_ABSENT_COLD_REBIND_PROFILE
+  ) {
+    throw new Error("legacy_live_verifier_target_profile_mismatch");
+  }
+}
+
+function verifyTargetPlanAndConfig(plan, config, targetProfile) {
+  if (targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE) {
+    verifyLegacyAbsentPlanAndConfig(plan, config);
+    return;
+  }
+  if (targetProfile !== null) throw new Error("live_verifier_target_profile_invalid");
+  verifyActivePlanAndConfig(plan, config);
+}
+
+function verifyManifestAgainstInputValues(
+  inputPath,
+  manifestPath,
+  environment = process.env
+) {
   const resolvedInputPath = path.resolve(inputPath);
   const resolvedManifestPath = path.resolve(manifestPath);
+  const targetProfile = targetProfileFromEnvironment(environment);
+  const targetEnvironment = {
+    HCCE_TARGET_PROFILE: targetProfile || undefined
+  };
   const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-live-contract-"));
   fs.chmodSync(temporaryDirectory, 0o700);
   const expectedManifestPath = path.join(temporaryDirectory, "hcce.yaml");
   try {
     const generated = runNode(generatorPath, {
       HCCE_INPUT_VALUES_PATH: resolvedInputPath,
-      HCCE_OUTPUT_PATH: expectedManifestPath
+      HCCE_OUTPUT_PATH: expectedManifestPath,
+      ...targetEnvironment
     });
     requireSuccessfulSubprocess(generated, "canonical_manifest_generation_failed");
     if ((fs.statSync(expectedManifestPath).mode & 0o777) !== 0o600) {
@@ -87,7 +143,8 @@ function verifyManifestAgainstInputValues(inputPath, manifestPath) {
     }
 
     const structurallyVerified = runNode(structuralVerifierPath, {
-      HCCE_MANIFEST_PATH: resolvedManifestPath
+      HCCE_MANIFEST_PATH: resolvedManifestPath,
+      ...targetEnvironment
     });
     requireSuccessfulSubprocess(
       structurallyVerified,
@@ -96,8 +153,8 @@ function verifyManifestAgainstInputValues(inputPath, manifestPath) {
 
     const config = utils.readConfig(resolvedInputPath);
     const plan = readActivationPlan(resolvedManifestPath);
-    verifyActivePlanAndConfig(plan, config);
-    return { config, plan };
+    verifyTargetPlanAndConfig(plan, config, targetProfile);
+    return { config, plan, targetProfile };
   } finally {
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
@@ -106,5 +163,7 @@ function verifyManifestAgainstInputValues(inputPath, manifestPath) {
 module.exports = {
   exactFileContent,
   verifyActivePlanAndConfig,
+  verifyLegacyAbsentPlanAndConfig,
+  verifyTargetPlanAndConfig,
   verifyManifestAgainstInputValues
 };
