@@ -13,10 +13,12 @@
     "express": "^4.21.2",
     "gl-matrix": "^3.4.4",
     "phoenix": "https://github.com/gfodor/phoenix-js/archive/5cdfb1643f25d5620d03152d05134bdf7046d80e.tar.gz",
-    "puppeteer-core": "^24.28.0",
     "query-string": "^9.3.1",
     "three": "^0.141.0",
     "three-pathfinding": "^1.2.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.28.0"
   }
 }
