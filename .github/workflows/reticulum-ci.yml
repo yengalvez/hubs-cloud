@@ -65,7 +65,10 @@ jobs:
           mix local.rebar --force
 
       - name: Fetch dependencies
-        run: mix deps.get --only test
+        run: mix deps.get --only test --check-locked
+
+      - name: Verify pinned Cowlib security contract
+        run: ./scripts/verify-cowlib-security-contract.sh
 
       - name: Check dependency advisories
         run: mix hex.audit

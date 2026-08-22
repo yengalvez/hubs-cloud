@@ -40,3 +40,4 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" -shellcheck=shellcheck -color=false
           shellcheck community-edition/services/coturn/*.sh
           shellcheck community-edition/services/reticulum/scripts/hab-wrap-and-push.sh
+          shellcheck community-edition/services/reticulum/scripts/verify-cowlib-security-contract.sh
