@@ -9,9 +9,6 @@ defmodule Ret.Mixfile do
       deps: deps(),
       elixir: "~> 1.18.4",
       elixirc_paths: elixirc_paths(Mix.env()),
-      # These two upstream advisories remain unfixed in cowlib 2.19.0; every
-      # additional advisory remains fatal in CI.
-      hex: [ignore_advisories: ["CVE-2026-43966", "CVE-2026-43969"]],
       releases: releases(),
       start_permanent: Mix.env() == :prod,
       version: System.get_env("RELEASE_VERSION", "1.0.0")
@@ -53,6 +50,13 @@ defmodule Ret.Mixfile do
       {:phoenix_live_reload, "~> 1.2", only: :dev},
       {:gettext, "~> 0.26.2"},
       {:cowboy, "~> 2.18.0"},
+      # Hex 2.19.0 predates the upstream fix for CVE-2026-43971. The exact
+      # Git source, ancestry and live advisory set are enforced separately by
+      # scripts/verify-cowlib-security-contract.sh.
+      {:cowlib,
+       git: "https://github.com/ninenines/cowlib.git",
+       ref: "89da27ee4c241f5d649ba7d9b7f2188918af6cea",
+       override: true},
       {:plug_cowboy, "~> 2.8.1"},
       {:peerage, "~> 1.0"},
       {:httpoison, "~> 3.0.0", override: true},
