@@ -13,6 +13,18 @@ function packageManifest(name) {
   return JSON.parse(fs.readFileSync(path.join(serviceRoot, name), "utf8"));
 }
 
+test("keeps the manual Chromium diagnostic outside both production dependency sets", () => {
+  const aggregate = packageManifest("package.json");
+  const parent = packageManifest("package.parent.json");
+  const runner = packageManifest("package.runner.json");
+
+  assert.equal(aggregate.scripts.runner, "node run-bot.js");
+  assert.equal(aggregate.dependencies["puppeteer-core"], undefined);
+  assert.equal(aggregate.devDependencies["puppeteer-core"], "^24.28.0");
+  assert.equal(parent.dependencies["puppeteer-core"], undefined);
+  assert.equal(runner.dependencies["puppeteer-core"], undefined);
+});
+
 test("parent image contains only the control plane sources and no Chromium runtime", () => {
   const source = dockerfile("Dockerfile");
 

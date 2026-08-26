@@ -10,6 +10,7 @@ const communityEditionDir = path.resolve(__dirname, "../..");
 const generatorPath = path.join(communityEditionDir, "generate_script/index.js");
 const verifierPath = path.join(communityEditionDir, "generate_script/verify-generated-manifest.js");
 const ciInput = YAML.parse(fs.readFileSync(path.join(communityEditionDir, "input-values.ci.yaml"), "utf8"));
+const legacyProfile = "cold-rebind-legacy-absent-v1";
 
 function runNode(script, env) {
   return spawnSync(process.execPath, [script], {
@@ -90,6 +91,245 @@ test("generator and verifier support dynamic and retained manual storage only", 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, expectedError);
   }
+});
+
+test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the default durable profile unchanged", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-legacy-cold-rebind-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  const legacyDockerConfig = JSON.parse(
+    Buffer.from(ciInput.BOT_IMAGE_PULL_CONFIG_JSON_BASE64, "base64").toString("utf8")
+  );
+  legacyDockerConfig.auths["ghcr.io"] = {
+    auth: Buffer.from("ci-user:ci-token", "utf8").toString("base64")
+  };
+  const legacyInput = {
+    ...ciInput,
+    OVERRIDE_BOT_RUNNER_IMAGE: "No",
+    OVERRIDE_HUBS_IMAGE: `ghcr.io/yengalvez/hubs@sha256:${"9".repeat(64)}`,
+    BOT_IMAGE_PULL_CONFIG_JSON_BASE64: Buffer.from(
+      JSON.stringify(legacyDockerConfig), "utf8"
+    ).toString("base64")
+  };
+  fs.writeFileSync(inputPath, YAML.stringify(legacyInput), { mode: 0o600 });
+  const legacyEnv = {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyProfile
+  };
+  const generated = runNode(generatorPath, legacyEnv);
+  assert.equal(generated.status, 0, generated.stderr);
+  const verified = runNode(verifierPath, {
+    HCCE_MANIFEST_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyProfile
+  });
+  assert.equal(verified.status, 0, verified.stderr);
+  assert.match(verified.stdout, new RegExp(legacyProfile));
+
+  const originalManifest = fs.readFileSync(outputPath, "utf8");
+  const resources = YAML.parseAllDocuments(originalManifest)
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const namespaces = resources.filter(resource => resource.kind === "Namespace");
+  assert.equal(namespaces.length, 1);
+  assert.equal(namespaces[0].metadata.name, ciInput.Namespace);
+  assert.equal(namespaces[0].metadata.annotations["yenhubs.org/target-profile"], legacyProfile);
+  assert.deepEqual(
+    resources.filter(resource => resource.kind === "PersistentVolumeClaim")
+      .map(resource => resource.metadata.name).sort(),
+    ["pgsql-pvc", "ret-pvc"]
+  );
+  const deployments = resources.filter(resource => resource.kind === "Deployment");
+  assert.equal(deployments.length, 12);
+  const legacyBotContainer = deployments.find(
+    deployment => deployment.metadata.name === "bot-orchestrator"
+  ).spec.template.spec.containers[0];
+  assert.equal(legacyBotContainer.readinessProbe.httpGet.path, "/health");
+  assert.equal(legacyBotContainer.livenessProbe.httpGet.path, "/health");
+  assert.equal(
+    legacyBotContainer.env.find(entry => entry.name === "RET_INTERNAL_ACCESS_HEADER").value,
+    "x-ret-dashboard-access-key"
+  );
+  for (const name of ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]) {
+    assert.equal(
+      deployments.find(deployment => deployment.metadata.name === name).spec.replicas,
+      0,
+      `${name} must start fenced`
+    );
+  }
+  const pgsql = deployments.find(deployment => deployment.metadata.name === "pgsql");
+  assert.equal(pgsql.spec.replicas, 1);
+  assert.deepEqual(pgsql.spec.template.spec.containers.map(container => container.name), ["postgresql"]);
+  assert.equal(deployments.flatMap(deployment => deployment.spec.template.spec.containers).length, 13);
+  assert.equal(resources.some(resource => resource.metadata?.namespace === "hcce-bot-runners"), false);
+  assert.equal(resources.some(resource => resource.metadata?.name === "hcce-bot-runners"), false);
+  assert.equal(resources.some(resource => resource.kind === "ValidatingAdmissionPolicy"), false);
+  assert.equal(resources.some(resource => resource.kind === "ValidatingAdmissionPolicyBinding"), false);
+  const pullSecret = resources.find(resource =>
+    resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull"
+  );
+  assert.equal(pullSecret.type, "kubernetes.io/dockerconfigjson");
+  for (const deployment of deployments) {
+    const usesGhcr = deployment.spec.template.spec.containers.some(container =>
+      container.image.startsWith("ghcr.io/")
+    );
+    assert.deepEqual(
+      deployment.spec.template.spec.imagePullSecrets,
+      usesGhcr ? [{ name: "bot-images-pull" }] : undefined
+    );
+  }
+  const processLocalSection =
+    '[ret."Elixir.Ret.BotOrchestrator"]\n' +
+    'endpoint = "http://bot-orchestrator.<POD_NS>:5001"\n' +
+    'access_key = "<BOT_ACCESS_KEY>"';
+  const retConfigText = resources.find(resource =>
+    resource.kind === "ConfigMap" && resource.metadata.name === "ret-config"
+  ).data["config.toml.template"];
+  assert.equal((retConfigText.match(/\[ret\."Elixir\.Ret\.BotOrchestrator"\]/g) || []).length, 1);
+  assert.equal(retConfigText.includes(processLocalSection), true);
+  assert.equal(retConfigText.includes("<BOT_ORCHESTRATOR_ACCESS_KEY>"), false);
+
+  function rejectMutation(name, mutate, expectedError) {
+    const changed = YAML.parseAllDocuments(originalManifest)
+      .map(document => document.toJS())
+      .filter(Boolean);
+    mutate(changed);
+    fs.writeFileSync(
+      outputPath,
+      changed.map(resource => YAML.stringify(resource)).join("---\n")
+    );
+    const rejected = runNode(verifierPath, {
+      HCCE_MANIFEST_PATH: outputPath,
+      HCCE_TARGET_PROFILE: legacyProfile
+    });
+    assert.notEqual(rejected.status, 0, `${name} unexpectedly passed`);
+    assert.match(rejected.stderr, expectedError);
+  }
+
+  rejectMutation("durable residual", changed => {
+    changed.push({ apiVersion: "v1", kind: "Namespace", metadata: { name: "hcce-bot-runners" } });
+  }, /exactly one target Namespace/);
+  rejectMutation("writer nonzero", changed => {
+    changed.find(resource => resource.kind === "Deployment" && resource.metadata.name === "reticulum")
+      .spec.replicas = 1;
+  }, /reticulum.*replicas=0/);
+  rejectMutation("missing pull credential", changed => {
+    changed.splice(changed.findIndex(resource =>
+      resource.kind === "Secret" && resource.metadata?.name === "bot-images-pull"
+    ), 1);
+  }, /missing.*bot-images-pull|Secret\/bot-images-pull/);
+  rejectMutation("missing GHCR pull binding", changed => {
+    delete changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "hubs"
+    ).spec.template.spec.imagePullSecrets;
+  }, /hubs must bind the legacy pull Secret/);
+  rejectMutation("image drift", changed => {
+    changed.find(resource => resource.kind === "Deployment" && resource.metadata.name === "hubs")
+      .spec.template.spec.containers[0].image =
+        `registry.invalid/yenhubs/hubs@sha256:${"f".repeat(64)}`;
+  }, /image-map annotations/);
+  rejectMutation("binding drift", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.spec.template.spec.containers[0].env.find(entry => entry.name === "BOT_ACCESS_KEY")
+      .valueFrom.secretKeyRef.key = "OPENAI_API_KEY";
+  }, /process-local parent contract/);
+  rejectMutation("modern readiness on legacy runtime", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.spec.template.spec.containers[0].readinessProbe.httpGet.path = "/transport-ready";
+  }, /process-local parent contract|process-local \/health readiness/);
+  rejectMutation("modern Reticulum header on legacy runtime", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.spec.template.spec.containers[0].env
+      .find(entry => entry.name === "RET_INTERNAL_ACCESS_HEADER").value =
+        "x-ret-bot-orchestrator-access-key";
+  }, /process-local parent contract|historical Reticulum dashboard header/);
+  rejectMutation("annotation drift", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.metadata.annotations["yenhubs.org/runner-activation-phase"] = "active";
+  }, /residual runner annotation/);
+  rejectMutation("missing process-local orchestrator section", changed => {
+    const config = changed.find(resource =>
+      resource.kind === "ConfigMap" && resource.metadata.name === "ret-config"
+    );
+    config.data["config.toml.template"] =
+      config.data["config.toml.template"].replace(`${processLocalSection}\n\n`, "");
+  }, /process-local bot orchestrator, runtime and dashboard bindings/);
+  rejectMutation("duplicate process-local orchestrator section", changed => {
+    const config = changed.find(resource =>
+      resource.kind === "ConfigMap" && resource.metadata.name === "ret-config"
+    );
+    config.data["config.toml.template"] += `\n${processLocalSection}\n`;
+  }, /process-local bot orchestrator, runtime and dashboard bindings/);
+  rejectMutation("durable orchestrator access key", changed => {
+    const config = changed.find(resource =>
+      resource.kind === "ConfigMap" && resource.metadata.name === "ret-config"
+    );
+    config.data["config.toml.template"] = config.data["config.toml.template"].replace(
+      'access_key = "<BOT_ACCESS_KEY>"',
+      'access_key = "<BOT_ORCHESTRATOR_ACCESS_KEY>"'
+    );
+  }, /process-local bot orchestrator, runtime and dashboard bindings/);
+  rejectMutation("hubs service-account token", changed => {
+    const hubs = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "hubs"
+    );
+    hubs.spec.template.spec.automountServiceAccountToken = true;
+  }, /hubs must disable service-account token automounting/);
+  rejectMutation("widened NetworkPolicy", changed => {
+    const policy = changed.find(resource =>
+      resource.kind === "NetworkPolicy" && resource.metadata.name === "pgsql-ingress"
+    );
+    policy.spec.ingress[0].from.push({ ipBlock: { cidr: "0.0.0.0/0" } });
+  }, /pgsql-ingress must exactly match its single audited ingress rule/);
+  for (const [field, value] of [
+    ["command", ["/bin/sh"]],
+    ["args", ["-c", "exit 0"]],
+    ["envFrom", [{ secretRef: { name: "configs" } }]]
+  ]) {
+    rejectMutation(`parent ${field}`, changed => {
+      const parent = changed.find(resource =>
+        resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+      );
+      parent.spec.template.spec.containers[0][field] = value;
+    }, /process-local parent contract/);
+  }
+
+  const defaultOutputPath = path.join(directory, "hcce-default.yaml");
+  fs.writeFileSync(inputPath, YAML.stringify(ciInput), { mode: 0o600 });
+  const defaultGenerated = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: defaultOutputPath
+  });
+  assert.equal(defaultGenerated.status, 0, defaultGenerated.stderr);
+  const defaultVerified = runNode(verifierPath, { HCCE_MANIFEST_PATH: defaultOutputPath });
+  assert.equal(defaultVerified.status, 0, defaultVerified.stderr);
+  const defaultResources = YAML.parseAllDocuments(fs.readFileSync(defaultOutputPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  assert.equal(defaultResources.length, 68);
+  assert.equal(
+    defaultResources.some(resource => resource.kind === "Namespace" && resource.metadata.name === "hcce-bot-runners"),
+    true
+  );
+  assert.equal(
+    defaultResources.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    ).spec.replicas,
+    1
+  );
+  const durableBotContainer = defaultResources.find(resource =>
+    resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+  ).spec.template.spec.containers[0];
+  assert.equal(durableBotContainer.readinessProbe.httpGet.path, "/transport-ready");
+  assert.equal(durableBotContainer.livenessProbe.httpGet.path, "/health");
 });
 
 test("generator requires four independent access-key trust domains", () => {

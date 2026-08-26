@@ -21,7 +21,8 @@ checks locally against a disposable PostgreSQL instance:
 ```bash
 export DB_HOST=127.0.0.1
 export DB_CREDENTIALS=postgres
-mix deps.get
+mix deps.get --check-locked
+./scripts/verify-cowlib-security-contract.sh
 mix hex.audit
 mix format --check-formatted
 MIX_ENV=test mix ecto.create
@@ -32,9 +33,21 @@ MIX_ENV=turkey mix compile --warnings-as-errors
 MIX_ENV=turkey mix release --overwrite
 ```
 
-`mix.exs` acknowledges only two advisories in the latest available cowlib
-2.18.0. Remove those acknowledgements as soon as a fixed cowlib release is
-available; any additional advisory remains a CI failure.
+Cowlib uses the exact upstream commit
+`89da27ee4c241f5d649ba7d9b7f2188918af6cea`, which descends from Hex 2.19.0
+and fixes CVE-2026-43971. This is deliberately temporary until a fixed Hex
+release exists. The pin contains exactly three upstream commits after 2.19.0,
+affecting six Cowlib files; it is not described as a one-file patch.
+
+Because `mix hex.audit` does not audit Git dependencies, CI also runs
+`scripts/verify-cowlib-security-contract.sh`. That gate proves the repository,
+lock, fetched SHA and three-commit ancestry, checks that OSV still binds
+CVE-2026-43971 to the exact fix, and audits both Hex 2.19.0 and the pinned
+commit. Only CVE-2026-43966 and CVE-2026-43969 remain accepted for this runtime;
+the former is stopped server-side by Cowboy's response-header validation and
+the latter requires passing attacker-controlled bytes to the unused
+`cow_cookie:cookie/1` encoder. Every new Cowlib advisory fails the expiring
+advisories gate. `mix hex.audit` remains mandatory for all other Hex packages.
 
 ### YenHubs fencing and reservation protocol
 

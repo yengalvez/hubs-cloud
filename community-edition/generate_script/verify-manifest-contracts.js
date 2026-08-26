@@ -2,6 +2,17 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const YAML = require("yaml");
+const {
+  DEPLOYMENT_CONTAINERS: LEGACY_DEPLOYMENT_CONTAINERS,
+  FORBIDDEN_PARENT_ENV,
+  FORBIDDEN_RETICULUM_ENV,
+  FORBIDDEN_RUNNER_ANNOTATIONS,
+  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  WRITER_DEPLOYMENTS,
+  deploymentImageMap,
+  imageMapSha256,
+  isLegacyRemovedIdentity
+} = require("./legacy-absent-cold-rebind-profile");
 
 function hasExactOwnKeys(value, expectedKeys) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -433,6 +444,261 @@ function expectedManifestInventory(namespace, { includeManualVolumes = false } =
     );
   }
   return inventory;
+}
+
+function expectedLegacyAbsentColdRebindInventory(namespace, options = {}) {
+  return expectedManifestInventory(namespace, options).filter(identity =>
+    !isLegacyRemovedIdentity(identity, namespace)
+  );
+}
+
+function verifyLegacyAbsentColdRebindInventory(resources) {
+  const namespaceResources = (Array.isArray(resources) ? resources : []).filter(resource => {
+    const identity = resourceIdentity(resource);
+    return identity && identity[0] === "" && identity[1] === "Namespace" && identity[2] === "";
+  });
+  if (namespaceResources.length !== 1 || namespaceResources[0].metadata?.name === "hcce-bot-runners") {
+    return [
+      `legacy cold-rebind manifest must contain exactly one target Namespace ` +
+      `(found ${namespaceResources.length})`
+    ];
+  }
+  const namespace = namespaceResources[0].metadata.name;
+  const includeManualVolumes = resources.some(resource => resourceIdentity(resource)?.[1] === "PersistentVolume");
+  const expected = expectedLegacyAbsentColdRebindInventory(namespace, { includeManualVolumes });
+  const expectedSet = new Set(expected.map(identity => JSON.stringify(identity)));
+  const actual = resources.map(resourceIdentity);
+  const actualSet = new Set(actual.filter(Boolean).map(identity => JSON.stringify(identity)));
+  const errors = [];
+  for (const identity of expected) {
+    if (!actualSet.has(JSON.stringify(identity))) {
+      errors.push(`legacy cold-rebind inventory is missing ${identity.join("/")}`);
+    }
+  }
+  for (const identity of actual.filter(Boolean)) {
+    if (!expectedSet.has(JSON.stringify(identity))) {
+      errors.push(`legacy cold-rebind inventory contains unexpected resource ${identity.join("/")}`);
+    }
+  }
+  for (const resource of resources) {
+    const identity = resourceIdentity(resource);
+    if (!identity || !expectedSet.has(JSON.stringify(identity))) continue;
+    const expectedApiVersion = EXPECTED_API_VERSION_BY_GROUP[identity[0]];
+    if (resource.apiVersion !== expectedApiVersion) {
+      errors.push(
+        `legacy cold-rebind resource ${identity.join("/")} must use exact apiVersion ${expectedApiVersion}`
+      );
+    }
+  }
+  if (resources.length !== expected.length) {
+    errors.push(
+      `legacy cold-rebind manifest must contain exactly ${expected.length} audited resources ` +
+      `(found ${resources.length})`
+    );
+  }
+  return errors;
+}
+
+function verifyLegacyAbsentColdRebindProfile(resources) {
+  const errors = verifyLegacyAbsentColdRebindInventory(resources);
+  const namespaceResource = resources.find(resource =>
+    resource?.apiVersion === "v1" && resource?.kind === "Namespace"
+  );
+  const namespace = namespaceResource?.metadata?.name || "";
+  if (!namespace || namespace === "hcce-bot-runners") return errors;
+
+  const images = deploymentImageMap(resources, namespace);
+  const expectedImagePairs = Object.entries(LEGACY_DEPLOYMENT_CONTAINERS)
+    .flatMap(([deployment, containers]) => containers.map(container => `${deployment}/${container}`))
+    .sort();
+  if (
+    JSON.stringify(Object.keys(images).sort()) !== JSON.stringify(expectedImagePairs) ||
+    Object.values(images).some(image => !/^.+@sha256:[0-9a-f]{64}$/i.test(image || ""))
+  ) {
+    errors.push("legacy cold-rebind target must bind exactly thirteen digest-pinned deployment images");
+  }
+  const namespaceAnnotations = namespaceResource.metadata?.annotations;
+  if (
+    !hasExactOwnKeys(namespaceAnnotations, [
+      "domain",
+      "adm",
+      "yenhubs.org/target-profile",
+      "yenhubs.org/target-image-map-sha256"
+    ]) ||
+    typeof namespaceAnnotations.domain !== "string" || !namespaceAnnotations.domain ||
+    typeof namespaceAnnotations.adm !== "string" || !namespaceAnnotations.adm ||
+    namespaceAnnotations["yenhubs.org/target-profile"] !== LEGACY_ABSENT_COLD_REBIND_PROFILE ||
+    namespaceAnnotations["yenhubs.org/target-image-map-sha256"] !== imageMapSha256(images)
+  ) {
+    errors.push("legacy cold-rebind Namespace profile and exact image-map annotations must be intact");
+  }
+
+  verifyAuditedDeploymentContainers(resources, namespace).forEach(error => errors.push(error));
+  const deployments = resources.filter(resource =>
+    resource?.apiVersion === "apps/v1" && resource?.kind === "Deployment" &&
+    resource?.metadata?.namespace === namespace
+  );
+  if (deployments.length !== 12) {
+    errors.push(`legacy cold-rebind target must contain exactly twelve Deployments (found ${deployments.length})`);
+  }
+  for (const deployment of deployments) {
+    const expectedReplicas = WRITER_DEPLOYMENTS.includes(deployment.metadata.name)
+      ? 0
+      : deployment.metadata.name === "pgsql" ? 1 : null;
+    if (expectedReplicas !== null && deployment.spec?.replicas !== expectedReplicas) {
+      errors.push(`Deployment/${deployment.metadata.name} must use replicas=${expectedReplicas} in legacy cold-rebind`);
+    }
+    for (const metadata of [deployment.metadata, deployment.spec?.template?.metadata]) {
+      const drift = Object.keys(metadata?.annotations || {}).filter(name =>
+        FORBIDDEN_RUNNER_ANNOTATIONS.has(name)
+      );
+      if (drift.length > 0) {
+        errors.push(`Deployment/${deployment.metadata.name} contains residual runner annotation ${drift[0]}`);
+      }
+    }
+  }
+
+  const configs = findExactResource(resources, "", "Secret", namespace, "configs");
+  const configsData = configs?.stringData || {};
+  if (
+    typeof configsData.BOT_ACCESS_KEY !== "string" || configsData.BOT_ACCESS_KEY.length < 32 ||
+    ["BOT_RUNNER_ACCESS_KEY", "BOT_ORCHESTRATOR_ACCESS_KEY", "DASHBOARD_ACCESS_KEY"]
+      .some(name => Object.prototype.hasOwnProperty.call(configsData, name))
+  ) {
+    errors.push("legacy cold-rebind Secret/configs must retain only the process-local bot trust domain");
+  }
+
+  const pullSecret = findExactResource(resources, "", "Secret", namespace, "bot-images-pull");
+  const pullSecretShapeIsExact =
+    pullSecret &&
+    hasExactOwnKeys(pullSecret, ["apiVersion", "kind", "metadata", "type", "data"]) &&
+    pullSecret.apiVersion === "v1" &&
+    pullSecret.kind === "Secret" &&
+    exactStructuredValue(pullSecret.metadata, { name: "bot-images-pull", namespace }) &&
+    pullSecret.type === "kubernetes.io/dockerconfigjson" &&
+    hasExactOwnKeys(pullSecret.data, [".dockerconfigjson"]) &&
+    typeof pullSecret.data[".dockerconfigjson"] === "string";
+  try {
+    if (!pullSecretShapeIsExact) throw new Error("pull-secret-shape");
+    verifyDockerConfigCredentials(
+      pullSecret.data[".dockerconfigjson"],
+      Object.values(images).filter(image => String(image).toLowerCase().startsWith("ghcr.io/"))
+    );
+  } catch (_error) {
+    errors.push("legacy cold-rebind Secret/bot-images-pull must authenticate every GHCR Deployment image");
+  }
+
+  for (const deployment of deployments) {
+    const usesGhcr = deployment.spec?.template?.spec?.containers?.some(container =>
+      String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
+    );
+    const expectedPullSecrets = usesGhcr ? [{ name: "bot-images-pull" }] : undefined;
+    if (!exactStructuredValue(deployment.spec?.template?.spec?.imagePullSecrets, expectedPullSecrets)) {
+      errors.push(
+        `Deployment/${deployment.metadata.name} must bind the legacy pull Secret exactly when using GHCR`
+      );
+    }
+  }
+
+  const parent = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
+  const parentPodSpec = parent?.spec?.template?.spec;
+  const parentContainer = parentPodSpec?.containers?.find(container => container.name === "bot-orchestrator");
+  const parentPullSecrets = String(parentContainer?.image || "").toLowerCase().startsWith("ghcr.io/")
+    ? [{ name: "bot-images-pull" }]
+    : undefined;
+  const parentEnv = parentContainer?.env || [];
+  const botAccessEntries = parentEnv.filter(entry => entry?.name === "BOT_ACCESS_KEY");
+  if (
+    !hasExactOwnKeys(parent?.spec?.strategy, ["type"]) || parent.spec.strategy.type !== "Recreate" ||
+    parentPodSpec?.automountServiceAccountToken !== false ||
+    ![undefined, "default"].includes(parentPodSpec?.serviceAccountName) ||
+    !exactStructuredValue(parentPodSpec?.imagePullSecrets, parentPullSecrets) ||
+    (parentPodSpec?.initContainers || []).length !== 0 ||
+    (parentPodSpec?.ephemeralContainers || []).length !== 0 ||
+    (parentContainer?.command || []).length !== 0 ||
+    (parentContainer?.args || []).length !== 0 ||
+    (parentContainer?.envFrom || []).length !== 0 ||
+    botAccessEntries.length !== 1 ||
+    !exactStructuredValue(botAccessEntries[0], {
+      name: "BOT_ACCESS_KEY",
+      valueFrom: { secretKeyRef: { name: "configs", key: "BOT_ACCESS_KEY" } }
+    }) ||
+    parentEnv.some(entry => FORBIDDEN_PARENT_ENV.has(entry?.name)) ||
+    parentEnv.filter(entry => entry?.name === "RUNNER_AUTOSTART").length !== 1 ||
+    parentEnv.find(entry => entry?.name === "RUNNER_AUTOSTART")?.value !== "true" ||
+    parentEnv.filter(entry => entry?.name === "RUNNER_BACKEND").length !== 1 ||
+    parentEnv.find(entry => entry?.name === "RUNNER_BACKEND")?.value !== "ghost" ||
+    parentEnv.filter(entry => entry?.name === "RET_INTERNAL_ACCESS_HEADER").length !== 1 ||
+    parentEnv.find(entry => entry?.name === "RET_INTERNAL_ACCESS_HEADER")?.value !==
+      "x-ret-dashboard-access-key" ||
+    parentEnv.filter(entry => entry?.name === "GHOST_RUNNER_SCRIPT").length !== 1 ||
+    parentEnv.find(entry => entry?.name === "GHOST_RUNNER_SCRIPT")?.value !== "/app/run-ghost-runner.js" ||
+    parentContainer?.readinessProbe?.httpGet?.path !== "/health" ||
+    parentContainer?.livenessProbe?.httpGet?.path !== "/health" ||
+    !exactStructuredValue(parentContainer?.securityContext, BOT_ORCHESTRATOR_SECURITY_CONTEXT) ||
+    !exactStructuredValue(parentContainer?.volumeMounts, [{
+      name: "bot-orchestrator-tmp",
+      mountPath: "/tmp"
+    }]) ||
+    !exactStructuredValue(parentPodSpec?.volumes, [{
+      name: "bot-orchestrator-tmp",
+      emptyDir: { sizeLimit: "256Mi" }
+    }])
+  ) {
+    errors.push("Deployment/bot-orchestrator must exactly match the process-local parent contract");
+  }
+
+  const reticulum = findExactResource(resources, "apps", "Deployment", namespace, "reticulum");
+  const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
+    container => container.name === "reticulum"
+  );
+  const reticulumEnv = reticulumContainer?.env || [];
+  const retConfig = findExactResource(resources, "", "ConfigMap", namespace, "ret-config");
+  const retConfigText = retConfig?.data?.["config.toml.template"] || "";
+  const forbiddenRetConfigMarkers = [
+    "<BOT_RUNNER_ACCESS_KEY>",
+    "<BOT_ORCHESTRATOR_ACCESS_KEY>",
+    "<DASHBOARD_ACCESS_KEY>",
+    "<BOT_RUNNER_RECOVERY_EPOCH>"
+  ];
+  const processLocalBotOrchestratorSection =
+    '[ret."Elixir.Ret.BotOrchestrator"]\n' +
+    'endpoint = "http://bot-orchestrator.<POD_NS>:5001"\n' +
+    'access_key = "<BOT_ACCESS_KEY>"';
+  if (
+    reticulumEnv.some(entry => FORBIDDEN_RETICULUM_ENV.has(entry?.name)) ||
+    forbiddenRetConfigMarkers.some(marker => retConfigText.includes(marker)) ||
+    (retConfigText.match(/\[ret\."Elixir\.Ret\.BotOrchestrator"\]/g) || []).length !== 1 ||
+    (retConfigText.match(/endpoint = "http:\/\/bot-orchestrator\.<POD_NS>:5001"/g) || []).length !== 1 ||
+    (retConfigText.match(/^access_key = "<BOT_ACCESS_KEY>"$/gm) || []).length !== 1 ||
+    !retConfigText.includes(processLocalBotOrchestratorSection) ||
+    (retConfigText.match(/dashboard_access_key = "<BOT_ACCESS_KEY>"/g) || []).length !== 1 ||
+    (retConfigText.match(/header_value = "<BOT_ACCESS_KEY>"/g) || []).length !== 1 ||
+    (retConfigText.match(/bot_access_key = "<BOT_ACCESS_KEY>"/g) || []).length !== 1
+  ) {
+    errors.push(
+      "Reticulum must exactly preserve the process-local bot orchestrator, runtime and dashboard bindings"
+    );
+  }
+
+  const pgsql = findExactResource(resources, "apps", "Deployment", namespace, "pgsql");
+  if (
+    pgsql?.spec?.replicas !== 1 ||
+    pgsql?.spec?.template?.spec?.containers?.length !== 1 ||
+    pgsql.spec.template.spec.containers[0].name !== "postgresql"
+  ) {
+    errors.push("Deployment/pgsql must preserve the process-local pgsql/postgresql singleton contract");
+  }
+
+  const claims = resources.filter(resource => resource?.kind === "PersistentVolumeClaim");
+  if (
+    claims.length !== 2 ||
+    JSON.stringify(claims.map(claim => claim.metadata?.name).sort()) !==
+      JSON.stringify(["pgsql-pvc", "ret-pvc"])
+  ) {
+    errors.push("legacy cold-rebind target must contain exactly pgsql-pvc and ret-pvc");
+  }
+  return errors;
 }
 
 function verifyBotOrchestratorSecretEnv(container) {
@@ -1428,6 +1694,7 @@ module.exports = {
   apiGroup,
   expectedBotRunnerAdmissionResources,
   expectedBotRunnerControlPlaneResources,
+  expectedLegacyAbsentColdRebindInventory,
   expectedManifestInventory,
   findExactResource,
   hasExactOwnKeys,
@@ -1450,6 +1717,8 @@ module.exports = {
   verifyHaproxyClusterRole,
   verifyManifestResourceIdentities,
   verifyManifestResourceInventory,
+  verifyLegacyAbsentColdRebindInventory,
+  verifyLegacyAbsentColdRebindProfile,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
   verifyReticulumBotRunnerAuthorityContract
