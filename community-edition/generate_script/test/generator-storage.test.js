@@ -141,6 +141,15 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   );
   const deployments = resources.filter(resource => resource.kind === "Deployment");
   assert.equal(deployments.length, 12);
+  const legacyBotContainer = deployments.find(
+    deployment => deployment.metadata.name === "bot-orchestrator"
+  ).spec.template.spec.containers[0];
+  assert.equal(legacyBotContainer.readinessProbe.httpGet.path, "/health");
+  assert.equal(legacyBotContainer.livenessProbe.httpGet.path, "/health");
+  assert.equal(
+    legacyBotContainer.env.find(entry => entry.name === "RET_INTERNAL_ACCESS_HEADER").value,
+    "x-ret-dashboard-access-key"
+  );
   for (const name of ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]) {
     assert.equal(
       deployments.find(deployment => deployment.metadata.name === name).spec.replicas,
@@ -226,6 +235,20 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
     parent.spec.template.spec.containers[0].env.find(entry => entry.name === "BOT_ACCESS_KEY")
       .valueFrom.secretKeyRef.key = "OPENAI_API_KEY";
   }, /process-local parent contract/);
+  rejectMutation("modern readiness on legacy runtime", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.spec.template.spec.containers[0].readinessProbe.httpGet.path = "/transport-ready";
+  }, /process-local parent contract|process-local \/health readiness/);
+  rejectMutation("modern Reticulum header on legacy runtime", changed => {
+    const parent = changed.find(resource =>
+      resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+    );
+    parent.spec.template.spec.containers[0].env
+      .find(entry => entry.name === "RET_INTERNAL_ACCESS_HEADER").value =
+        "x-ret-bot-orchestrator-access-key";
+  }, /process-local parent contract|historical Reticulum dashboard header/);
   rejectMutation("annotation drift", changed => {
     const parent = changed.find(resource =>
       resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
@@ -302,6 +325,11 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
     ).spec.replicas,
     1
   );
+  const durableBotContainer = defaultResources.find(resource =>
+    resource.kind === "Deployment" && resource.metadata.name === "bot-orchestrator"
+  ).spec.template.spec.containers[0];
+  assert.equal(durableBotContainer.readinessProbe.httpGet.path, "/transport-ready");
+  assert.equal(durableBotContainer.livenessProbe.httpGet.path, "/health");
 });
 
 test("generator requires four independent access-key trust domains", () => {

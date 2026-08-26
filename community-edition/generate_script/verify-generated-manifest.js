@@ -572,6 +572,12 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
       fail("bot-orchestrator production runtime must not use Chromium canary routing");
     }
     if (
+      legacyProfile &&
+      botEnv.RET_INTERNAL_ACCESS_HEADER !== "x-ret-dashboard-access-key"
+    ) {
+      fail("legacy bot-orchestrator must use the historical Reticulum dashboard header");
+    }
+    if (
       botEnv.OPENAI_MODEL !== "gpt-5-nano" ||
       Number(botEnv.OPENAI_TOTAL_BUDGET_MS) !== 4000
     ) {
@@ -595,8 +601,13 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
     }
     const botReadinessPath = botContainer.readinessProbe?.httpGet?.path;
     const botLivenessPath = botContainer.livenessProbe?.httpGet?.path;
-    if (botReadinessPath !== "/transport-ready" || botLivenessPath !== "/health") {
-      fail("bot-orchestrator must expose transport readiness separately from authoritative /ready");
+    const expectedBotReadinessPath = legacyProfile ? "/health" : "/transport-ready";
+    if (botReadinessPath !== expectedBotReadinessPath || botLivenessPath !== "/health") {
+      fail(
+        legacyProfile
+          ? "legacy bot-orchestrator must use process-local /health readiness and liveness"
+          : "bot-orchestrator must expose transport readiness separately from authoritative /ready"
+      );
     }
     if (
       Number(botEnv.GHOST_NAVMESH_MAX_TRIANGLES) !== 50000 ||
