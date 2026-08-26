@@ -335,6 +335,15 @@ function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
   delete podSpec.serviceAccountName;
   podSpec.automountServiceAccountToken = false;
   const parentContainer = podSpec.containers[0];
+  const internalHeaderEntries = parentContainer.env.filter(
+    entry => entry?.name === "RET_INTERNAL_ACCESS_HEADER"
+  );
+  if (
+    internalHeaderEntries.length !== 1 ||
+    internalHeaderEntries[0].value !== "x-ret-bot-orchestrator-access-key"
+  ) {
+    throw new Error("legacy profile precondition rejected modern Reticulum access header drift");
+  }
   const botAccessEntry = {
     name: "BOT_ACCESS_KEY",
     valueFrom: { secretKeyRef: { name: "configs", key: "BOT_ACCESS_KEY" } }
@@ -343,6 +352,15 @@ function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
     botAccessEntry,
     ...parentContainer.env.filter(entry => !FORBIDDEN_PARENT_ENV.has(entry?.name))
   ];
+  parentContainer.env.find(entry => entry.name === "RET_INTERNAL_ACCESS_HEADER").value =
+    "x-ret-dashboard-access-key";
+  if (
+    parentContainer.readinessProbe?.httpGet?.path !== "/transport-ready" ||
+    parentContainer.livenessProbe?.httpGet?.path !== "/health"
+  ) {
+    throw new Error("legacy profile precondition rejected bot parent probe drift");
+  }
+  parentContainer.readinessProbe.httpGet.path = "/health";
 
   const finalImages = deploymentImageMap(resources, namespace);
   if (JSON.stringify(finalImages) !== JSON.stringify(expectedImages)) {

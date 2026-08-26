@@ -628,8 +628,13 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
     parentEnv.find(entry => entry?.name === "RUNNER_AUTOSTART")?.value !== "true" ||
     parentEnv.filter(entry => entry?.name === "RUNNER_BACKEND").length !== 1 ||
     parentEnv.find(entry => entry?.name === "RUNNER_BACKEND")?.value !== "ghost" ||
+    parentEnv.filter(entry => entry?.name === "RET_INTERNAL_ACCESS_HEADER").length !== 1 ||
+    parentEnv.find(entry => entry?.name === "RET_INTERNAL_ACCESS_HEADER")?.value !==
+      "x-ret-dashboard-access-key" ||
     parentEnv.filter(entry => entry?.name === "GHOST_RUNNER_SCRIPT").length !== 1 ||
     parentEnv.find(entry => entry?.name === "GHOST_RUNNER_SCRIPT")?.value !== "/app/run-ghost-runner.js" ||
+    parentContainer?.readinessProbe?.httpGet?.path !== "/health" ||
+    parentContainer?.livenessProbe?.httpGet?.path !== "/health" ||
     !exactStructuredValue(parentContainer?.securityContext, BOT_ORCHESTRATOR_SECURITY_CONTEXT) ||
     !exactStructuredValue(parentContainer?.volumeMounts, [{
       name: "bot-orchestrator-tmp",
