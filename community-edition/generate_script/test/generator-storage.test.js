@@ -303,7 +303,15 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   }
 
   const defaultOutputPath = path.join(directory, "hcce-default.yaml");
-  fs.writeFileSync(inputPath, YAML.stringify(ciInput), { mode: 0o600 });
+  const defaultInput = structuredClone(ciInput);
+  const ghcrDigest = suffix => `ghcr.io/yenhubs-test/${suffix}@sha256:${"a".repeat(64)}`;
+  defaultInput.OVERRIDE_HUBS_IMAGE = ghcrDigest("hubs");
+  defaultInput.OVERRIDE_BOT_ORCHESTRATOR_IMAGE = ghcrDigest("bot-orchestrator");
+  defaultInput.OVERRIDE_BOT_RUNNER_IMAGE = ghcrDigest("bot-runner");
+  defaultInput.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 = Buffer.from(JSON.stringify({
+    auths: { "ghcr.io": { auth: Buffer.from("ci-user:ci-token").toString("base64") } }
+  })).toString("base64");
+  fs.writeFileSync(inputPath, YAML.stringify(defaultInput), { mode: 0o600 });
   const defaultGenerated = runNode(generatorPath, {
     HCCE_INPUT_VALUES_PATH: inputPath,
     HCCE_OUTPUT_PATH: defaultOutputPath
@@ -330,6 +338,37 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   ).spec.template.spec.containers[0];
   assert.equal(durableBotContainer.readinessProbe.httpGet.path, "/transport-ready");
   assert.equal(durableBotContainer.livenessProbe.httpGet.path, "/health");
+  for (const deployment of defaultResources.filter(resource => resource.kind === "Deployment")) {
+    const usesGhcr = deployment.spec.template.spec.containers.some(container =>
+      container.image.startsWith("ghcr.io/")
+    );
+    assert.deepEqual(
+      deployment.spec.template.spec.imagePullSecrets,
+      usesGhcr || deployment.metadata.name === "bot-orchestrator"
+        ? [{ name: "bot-images-pull" }]
+        : undefined,
+      `${deployment.metadata.name} must bind private registry auth exactly when required`
+    );
+  }
+
+  const missingWorkloadPullPath = path.join(directory, "hcce-missing-workload-pull.yaml");
+  const missingWorkloadPullResources = structuredClone(defaultResources);
+  const ghcrWorkload = missingWorkloadPullResources.find(resource =>
+    resource.kind === "Deployment" &&
+    resource.metadata.name !== "bot-orchestrator" &&
+    resource.spec.template.spec.containers.some(container => container.image.startsWith("ghcr.io/"))
+  );
+  assert.ok(ghcrWorkload, "fixture must contain a non-bot GHCR workload");
+  delete ghcrWorkload.spec.template.spec.imagePullSecrets;
+  fs.writeFileSync(
+    missingWorkloadPullPath,
+    missingWorkloadPullResources.map(resource => YAML.stringify(resource)).join("---\n")
+  );
+  const missingWorkloadPullVerified = runNode(verifierPath, {
+    HCCE_MANIFEST_PATH: missingWorkloadPullPath
+  });
+  assert.notEqual(missingWorkloadPullVerified.status, 0);
+  assert.match(missingWorkloadPullVerified.stderr, /must bind the pull Secret exactly when using GHCR/);
 });
 
 test("generator requires four independent access-key trust domains", () => {

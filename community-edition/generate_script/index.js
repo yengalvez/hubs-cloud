@@ -201,6 +201,24 @@ function handleImageOverrides(processedConfig, replacedContent) {
     }
   });
 
+  // Every private GHCR workload needs the generated kubelet-only credential.
+  // Bind it directly on the Pod template so clean clusters do not depend on a
+  // mutable default ServiceAccount or on images left in a node cache.
+  yamlDocuments.forEach((doc, index) => {
+    const jsDoc = doc.toJS();
+    if (jsDoc.kind !== "Deployment") return;
+    const podSpec = jsDoc.spec?.template?.spec;
+    const usesGhcr = podSpec?.containers?.some(container =>
+      String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
+    );
+    if (usesGhcr) {
+      podSpec.imagePullSecrets = [{ name: "bot-images-pull" }];
+    } else if (jsDoc.metadata?.name !== "bot-orchestrator") {
+      delete podSpec.imagePullSecrets;
+    }
+    yamlDocuments[index] = new YAML.Document(jsDoc);
+  });
+
   return `${yamlDocuments.map(doc => YAML.stringify(doc, {"lineWidth": 0, "directives": false})).join('---\n')}`;
 }
 

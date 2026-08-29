@@ -13,6 +13,7 @@ const {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyWorkloadImagePullSecrets,
   verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
   verifyBotRunnerDefaultDenyNetworkPolicy,
@@ -761,6 +762,7 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
 
   if (!legacyProfile) {
     verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
+    verifyWorkloadImagePullSecrets(resources, manifestNamespace).forEach(fail);
     verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
     verifyBotRunnerAdmissionResources(resources, manifestNamespace).forEach(fail);
     const botRunnerDefaultDeny = findExactResource(

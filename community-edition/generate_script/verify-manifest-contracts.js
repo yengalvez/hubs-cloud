@@ -1131,13 +1131,38 @@ function verifyBotImagePullSecret(resources, namespace) {
     const deployment = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
     const container = deployment?.spec?.template?.spec?.containers?.find(value => value?.name === "bot-orchestrator");
     const runnerImage = container?.env?.find(value => value?.name === "BOT_RUNNER_IMAGE")?.value;
-    verifyDockerConfigCredentials(encoded, [container?.image, runnerImage]);
+    const workloadImages = resources
+      .filter(resource => resource?.kind === "Deployment" && resource?.metadata?.namespace === namespace)
+      .flatMap(resource => resource.spec?.template?.spec?.containers || [])
+      .map(value => value?.image)
+      .filter(value => String(value || "").toLowerCase().startsWith("ghcr.io/"));
+    verifyDockerConfigCredentials(encoded, [...workloadImages, container?.image, runnerImage]);
   } catch (_error) {
     return [
-      "Secret/bot-images-pull Docker config must contain canonical credentials for both bot image registries"
+      "Secret/bot-images-pull Docker config must contain canonical credentials for every GHCR workload registry"
     ];
   }
   return [];
+}
+
+function verifyWorkloadImagePullSecrets(resources, namespace) {
+  const errors = [];
+  for (const deployment of resources.filter(resource =>
+    resource?.kind === "Deployment" && resource?.metadata?.namespace === namespace
+  )) {
+    const podSpec = deployment.spec?.template?.spec;
+    const usesGhcr = podSpec?.containers?.some(container =>
+      String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
+    );
+    const requiresPullSecret = usesGhcr || deployment.metadata?.name === "bot-orchestrator";
+    const expected = requiresPullSecret ? [{ name: "bot-images-pull" }] : undefined;
+    if (!exactStructuredValue(podSpec?.imagePullSecrets, expected)) {
+      errors.push(
+        `Deployment/${deployment.metadata?.name} must bind the pull Secret exactly when using GHCR`
+      );
+    }
+  }
+  return errors;
 }
 
 function expectedBotRunnerControlPlaneResources(
@@ -1708,6 +1733,7 @@ module.exports = {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyWorkloadImagePullSecrets,
   verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
   verifyBotRunnerDefaultDenyNetworkPolicy,
