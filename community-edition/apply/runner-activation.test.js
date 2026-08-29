@@ -1137,8 +1137,6 @@ test("deployment target snapshots ignore status churn but reject spec drift and 
     spec: { replicas: 1, selector: { matchLabels: { app: "reticulum" } } }
   };
   const live = {
-    apiVersion: "apps/v1",
-    kind: "Deployment",
     metadata: {
       name: "reticulum",
       namespace: "hcce",

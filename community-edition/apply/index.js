@@ -2453,8 +2453,14 @@ function normalizedDeploymentTargetSnapshot() {
     liveDeployments?.kind !== "DeploymentList" ||
     !Array.isArray(liveDeployments.items)
   ) throw new Error("deployment_target_snapshot_live_inventory_invalid");
+  const typedItems = liveDeployments.items.map(deployment =>
+    namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+  );
+  if (typedItems.some(deployment => deployment === null)) {
+    throw new Error("deployment_target_snapshot_live_item_invalid");
+  }
   const liveByName = new Map(
-    liveDeployments.items.map(deployment => [deployment?.metadata?.name, deployment])
+    typedItems.map(deployment => [deployment.metadata.name, deployment])
   );
   const expected = expectedDeployments();
   if (
@@ -2511,14 +2517,19 @@ function legacyAbsentDeploymentsMatchGeneratedDesiredState() {
   assertOperationLeaseProcessHealthy();
   const deployments = legacyAbsentDeploymentList();
   const expected = expectedDeployments();
+  const typedItems = Array.isArray(deployments?.items)
+    ? deployments.items.map(deployment =>
+        namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+      )
+    : [];
   const liveByName = new Map(
-    Array.isArray(deployments?.items)
-      ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
-      : []
+    typedItems.filter(deployment => deployment !== null)
+      .map(deployment => [deployment.metadata.name, deployment])
   );
   if (
     deployments?.apiVersion !== "apps/v1" ||
     deployments?.kind !== "DeploymentList" ||
+    typedItems.some(deployment => deployment === null) ||
     liveByName.size !== expected.length ||
     expected.some(deployment => !liveByName.has(deployment.metadata.name))
   ) {
@@ -2604,13 +2615,18 @@ function deploymentsMatchExpectedDesiredState(expected, { exactInventory = false
   const deployments = kubectlJson([
     "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
   ]);
+  const typedItems = Array.isArray(deployments?.items)
+    ? deployments.items.map(deployment =>
+        namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+      )
+    : [];
   const liveByName = new Map(
-    Array.isArray(deployments?.items)
-      ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
-      : []
+    typedItems.filter(deployment => deployment !== null)
+      .map(deployment => [deployment.metadata.name, deployment])
   );
   if (
     deployments?.kind !== "DeploymentList" ||
+    typedItems.some(deployment => deployment === null) ||
     (exactInventory && liveByName.size !== expected.length) ||
     expected.some(deployment => !liveByName.has(deployment.metadata.name))
   ) {

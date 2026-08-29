@@ -902,8 +902,16 @@ function exactDeploymentTargetSnapshot(deploymentList, snapshot) {
     snapshot.length === 0 ||
     deploymentList.items.length !== snapshot.length
   ) return false;
+  const typedItems = deploymentList.items.map(deployment => {
+    if (
+      (deployment?.apiVersion !== undefined && deployment.apiVersion !== "apps/v1") ||
+      (deployment?.kind !== undefined && deployment.kind !== "Deployment")
+    ) return null;
+    return { ...deployment, apiVersion: "apps/v1", kind: "Deployment" };
+  });
+  if (typedItems.some(deployment => deployment === null)) return false;
   const liveByName = new Map(
-    deploymentList.items.map(deployment => [deployment?.metadata?.name, deployment])
+    typedItems.map(deployment => [deployment?.metadata?.name, deployment])
   );
   if (liveByName.size !== snapshot.length) return false;
   return snapshot.every(expected => {
