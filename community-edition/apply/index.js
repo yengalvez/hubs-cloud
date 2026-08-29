@@ -98,6 +98,7 @@ const {
   exactRecoveryOperationFencePolicy,
   exactRunnerProtocolBinding,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
   parentFencePolicyProtectsLiveOrTarget,
@@ -135,6 +136,7 @@ const manifestVerifierPath = path.resolve(__dirname, "../generate_script/verify-
 let operationLeaseGuard = null;
 let failClosedRefenceRequired = false;
 let legacyFailClosedRefenceRequired = false;
+let legacyCompatibilityFenceSnapshot = null;
 let recoveryLockIdentityGuard = null;
 let pristineLegacyCutoverRequired = false;
 let cutoverPreflightClassification = null;
@@ -2444,6 +2446,61 @@ function expectedDeployments() {
   );
 }
 
+function normalizedDeploymentTargetSnapshot() {
+  const liveDeployments = legacyAbsentDeploymentList();
+  if (
+    liveDeployments?.apiVersion !== "apps/v1" ||
+    liveDeployments?.kind !== "DeploymentList" ||
+    !Array.isArray(liveDeployments.items)
+  ) throw new Error("deployment_target_snapshot_live_inventory_invalid");
+  const liveByName = new Map(
+    liveDeployments.items.map(deployment => [deployment?.metadata?.name, deployment])
+  );
+  const expected = expectedDeployments();
+  if (
+    liveByName.size > expected.length ||
+    [...liveByName.keys()].some(name => !expected.some(resource => resource.metadata.name === name))
+  ) throw new Error("deployment_target_snapshot_live_inventory_unexpected");
+
+  return expected.map(deployment => {
+    const initialLive = liveByName.get(deployment.metadata.name) || null;
+    const pair = initialLive === null
+      ? {
+          live: null,
+          normalized: serverNormalizedCutoverDeployment(deployment, null)
+        }
+      : stableServerNormalizedDeployment(deployment, initialLive);
+    if (pair === null || pair.normalized === null) {
+      throw new Error(`deployment_target_snapshot_normalization_failed:${deployment.metadata.name}`);
+    }
+    return {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      uid: pair.live?.metadata?.uid || null,
+      metadata: {
+        name: deployment.metadata.name,
+        namespace: parentNamespace,
+        annotations: pair.normalized?.metadata?.annotations || {},
+        labels: pair.normalized?.metadata?.labels || {}
+      },
+      spec: pair.normalized.spec
+    };
+  });
+}
+
+function legacyCompatibilityFenceTargetSnapshot(activeSnapshot) {
+  return activeSnapshot.map(deployment => {
+    const fenced = structuredClone(deployment);
+    if (RECOVERY_CONSUMERS.includes(fenced.metadata.name)) fenced.spec.replicas = 0;
+    return fenced;
+  });
+}
+
+function liveDeploymentsMatchTargetSnapshot(snapshot) {
+  assertOperationLeaseProcessHealthy();
+  return exactDeploymentTargetSnapshot(legacyAbsentDeploymentList(), snapshot);
+}
+
 function legacyAbsentDeploymentList() {
   return kubectlJson([
     "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
@@ -2710,6 +2767,9 @@ function legacyCompatibilityFenceDeploymentsAreExact() {
 }
 
 async function refenceLegacyCompatibilityRuntime() {
+  if (legacyCompatibilityFenceSnapshot === null) {
+    throw new Error("legacy_compatibility_refence_snapshot_missing");
+  }
   const failures = await retryBestEffortFenceAttempt(
     async () => runBestEffortFenceSteps(
       legacyCompatibilityFenceDeployments().map(deployment => ({
@@ -2727,7 +2787,7 @@ async function refenceLegacyCompatibilityRuntime() {
   try {
     await waitFor(
       "legacy_compatibility_deployment_fences_exact",
-      legacyCompatibilityFenceDeploymentsAreExact
+      () => liveDeploymentsMatchTargetSnapshot(legacyCompatibilityFenceSnapshot)
     );
   } catch (_error) {
     failures.push("deployment-fences-exact");
@@ -2736,6 +2796,7 @@ async function refenceLegacyCompatibilityRuntime() {
     throw new Error(`legacy_compatibility_refence_incomplete:${[...new Set(failures)].join(",")}`);
   }
   legacyFailClosedRefenceRequired = false;
+  legacyCompatibilityFenceSnapshot = null;
 }
 
 function activeStagingFenceDeployments() {
@@ -2936,17 +2997,21 @@ async function applyLegacyActiveCompatibility() {
   if (recoveryLockExists() || !legacyDurableControlPlaneIsAbsent()) {
     throw new Error("legacy_active_compatibility_precondition_changed_under_lease");
   }
+  verifyLegacyActiveCompatibilityPreflight("apply");
+  const targetSnapshot = normalizedDeploymentTargetSnapshot();
+  legacyCompatibilityFenceSnapshot = legacyCompatibilityFenceTargetSnapshot(targetSnapshot);
   legacyFailClosedRefenceRequired = true;
   applyManifest();
   await waitFor(
     "legacy_active_deployments_exact",
-    legacyAbsentDeploymentsMatchGeneratedDesiredState
+    () => liveDeploymentsMatchTargetSnapshot(targetSnapshot)
   );
   await waitFor("legacy_active_deployments_ready", legacyAbsentDeploymentsAreReady);
   if (recoveryLockExists() || !legacyDurableControlPlaneIsAbsent()) {
     throw new Error("legacy_active_compatibility_control_plane_appeared");
   }
   legacyFailClosedRefenceRequired = false;
+  legacyCompatibilityFenceSnapshot = null;
   console.log("legacy-active compatibility gate passed; all deployments ready without durable bot migration");
 }
 
@@ -3266,8 +3331,12 @@ async function applyUnderOperationLease(commandMode) {
   if (legacyAbsentGreenfield) {
     if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
     if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_present");
+    const targetSnapshot = normalizedDeploymentTargetSnapshot();
     applyManifest();
-    await waitFor("legacy_absent_deployments_exact", legacyAbsentDeploymentsMatchGeneratedDesiredState);
+    await waitFor(
+      "legacy_absent_deployments_exact",
+      () => liveDeploymentsMatchTargetSnapshot(targetSnapshot)
+    );
     await waitFor("legacy_absent_deployments_ready", legacyAbsentDeploymentsAreReady);
     if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_appeared");
     console.log("legacy-absent greenfield gate passed; five consumers remain stopped");

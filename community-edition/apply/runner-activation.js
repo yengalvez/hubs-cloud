@@ -893,6 +893,29 @@ function retryServerNormalizedDeployment({
   return null;
 }
 
+function exactDeploymentTargetSnapshot(deploymentList, snapshot) {
+  if (
+    deploymentList?.apiVersion !== "apps/v1" ||
+    deploymentList?.kind !== "DeploymentList" ||
+    !Array.isArray(deploymentList.items) ||
+    !Array.isArray(snapshot) ||
+    snapshot.length === 0 ||
+    deploymentList.items.length !== snapshot.length
+  ) return false;
+  const liveByName = new Map(
+    deploymentList.items.map(deployment => [deployment?.metadata?.name, deployment])
+  );
+  if (liveByName.size !== snapshot.length) return false;
+  return snapshot.every(expected => {
+    const live = liveByName.get(expected?.metadata?.name);
+    if (
+      typeof live?.metadata?.uid !== "string" || !live.metadata.uid ||
+      (expected.uid !== null && live.metadata.uid !== expected.uid)
+    ) return false;
+    return exactDeploymentDesiredState(live, expected);
+  });
+}
+
 function exactFoundationalNamespace(live, expected) {
   const expectedAnnotations = expected?.metadata?.annotations || {};
   const expectedLabels = expected?.metadata?.labels || {};
@@ -984,6 +1007,7 @@ module.exports = {
   exactRunnerProtocolBinding,
   fenceAwareDeploymentImages,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
   manifestResources,

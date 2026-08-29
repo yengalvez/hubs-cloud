@@ -14,6 +14,7 @@ const {
   decideApplyMode,
   exactAdmissionBinding,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationFenceBinding,
   exactRecoveryOperationFencePolicy,
@@ -1120,6 +1121,53 @@ test("server normalization retries a stale status resourceVersion but rejects re
     normalize: () => null,
     readCurrent: () => replacement
   }), null);
+});
+
+test("deployment target snapshots ignore status churn but reject spec drift and replacement", () => {
+  const expected = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    uid: "deployment-uid",
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      labels: { app: "reticulum" },
+      annotations: { "yenhubs.org/target": "legacy-active" }
+    },
+    spec: { replicas: 1, selector: { matchLabels: { app: "reticulum" } } }
+  };
+  const live = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      uid: "deployment-uid",
+      resourceVersion: "50",
+      labels: { app: "reticulum" },
+      annotations: {
+        "yenhubs.org/target": "legacy-active",
+        "deployment.kubernetes.io/revision": "9"
+      }
+    },
+    spec: structuredClone(expected.spec),
+    status: { observedGeneration: 4, readyReplicas: 0 }
+  };
+  const list = { apiVersion: "apps/v1", kind: "DeploymentList", items: [live] };
+  assert.equal(exactDeploymentTargetSnapshot(list, [expected]), true);
+
+  const statusChurn = structuredClone(list);
+  statusChurn.items[0].metadata.resourceVersion = "51";
+  statusChurn.items[0].status.readyReplicas = 1;
+  assert.equal(exactDeploymentTargetSnapshot(statusChurn, [expected]), true);
+
+  const specDrift = structuredClone(statusChurn);
+  specDrift.items[0].spec.replicas = 0;
+  assert.equal(exactDeploymentTargetSnapshot(specDrift, [expected]), false);
+
+  const replacement = structuredClone(statusChurn);
+  replacement.items[0].metadata.uid = "replacement-uid";
+  assert.equal(exactDeploymentTargetSnapshot(replacement, [expected]), false);
 });
 
 test("clean-install Lease bootstrap accepts only the exact active parent Namespace", () => {
