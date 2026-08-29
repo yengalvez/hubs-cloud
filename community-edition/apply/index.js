@@ -3023,6 +3023,18 @@ async function applyActiveTransition(mode) {
     await waitFor("parent_quiesced_before_activation", liveParentIsQuiesced);
     await waitFor("runner_runtime_quiesced_before_activation", runnerRuntimeIsQuiesced);
     await waitFor("runner_admission_observed_before_activation", liveAdmissionIsObserved);
+    await prepareExactPreGrantControlPlane();
+    await waitForAdmissionDenialProbe();
+    await runWithStablePodAbsence(
+      "stable_pod_absence_before_active_runner_authority",
+      async () => {
+        if (recoveryLockExists()) {
+          throw new Error("active_lock_appeared_before_runner_grant");
+        }
+        applyResource(runnerRole());
+      },
+      async () => neutralizeRunnerAuthority()
+    );
     await waitFor("runner_control_plane_exact_before_activation", liveRunnerControlPlaneIsExact);
     if (!exactRunnerAuthority(true)) throw new Error("admission_runner_rbac_not_effective");
     await waitForAdmissionDenialProbe();

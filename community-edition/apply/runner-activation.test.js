@@ -1358,6 +1358,25 @@ test("active reapply with control-plane drift refences and requires the staged b
   }), "active");
 });
 
+test("admission to active reconciles the target control plane while authority is inert", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const branch = source.slice(
+    source.indexOf("} else if (live.activationPhase === \"admission\""),
+    source.indexOf("} else {", source.indexOf("} else if (live.activationPhase === \"admission\""))
+  );
+  const prepare = branch.indexOf("await prepareExactPreGrantControlPlane()");
+  const stable = branch.indexOf('"stable_pod_absence_before_active_runner_authority"');
+  const grant = branch.indexOf("applyResource(runnerRole())");
+  const exact = branch.indexOf(
+    'waitFor("runner_control_plane_exact_before_activation", liveRunnerControlPlaneIsExact)'
+  );
+  assert.ok(prepare >= 0 && prepare < stable);
+  assert.ok(stable < grant && grant < exact);
+  assert.match(branch, /active_lock_appeared_before_runner_grant/);
+  assert.match(branch, /async \(\) => neutralizeRunnerAuthority\(\)/);
+  assert.match(branch, /await waitForAdmissionDenialProbe\(\)/);
+});
+
 test("live control-plane exactness rejects terminating, owner-bound, finalized, and immutable Secrets", () => {
   const expected = {
     apiVersion: "v1",
