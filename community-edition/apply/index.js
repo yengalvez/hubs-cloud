@@ -1176,9 +1176,12 @@ function liveEffectiveRbacIsExact(runnerAuthorityEnabled) {
 }
 
 function listPodsBySelector(namespace, selector) {
-  const args = ["-n", namespace, "get", "pods"];
-  if (selector) args.push("-l", selector);
-  args.push("-o", "json");
+  const args = [
+    "--request-timeout=30s",
+    "get",
+    "--raw",
+    podListRawPath(namespace, selector || "")
+  ];
   const result = runLeaseGuardedRead(() => spawnSync(
     "kubectl",
     contextArgs(args),

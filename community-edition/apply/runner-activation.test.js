@@ -675,6 +675,11 @@ test("stable window resets with injected time and never treats a gap as continuo
 test("event-backed pod evidence catches transient Pods and fails closed on resourceVersion 410", () => {
   assert.equal(podListRawPath("hcce"), "/api/v1/namespaces/hcce/pods");
   assert.equal(
+    podListRawPath("hcce-bot-runners", "yenhubs.org/managed-by=bot-orchestrator"),
+    "/api/v1/namespaces/hcce-bot-runners/pods?labelSelector=" +
+      "yenhubs.org%2Fmanaged-by%3Dbot-orchestrator"
+  );
+  assert.equal(
     replicaSetListRawPath("hcce"),
     "/apis/apps/v1/namespaces/hcce/replicasets"
   );
