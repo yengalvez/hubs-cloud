@@ -89,3 +89,39 @@ test("live runner control-plane verification requires the exact fifth parameter-
     /recovery-operation-pod-fence|recovery_operation_fence/
   );
 });
+
+test("live runner verification normalizes only server-omitted empty lists", () => {
+  const generated = generatedResources();
+  const live = liveResourcesFromGenerated(generated);
+  for (const role of live.filter(resource =>
+    resource.kind === "Role" && Array.isArray(resource.rules) && resource.rules.length === 0
+  )) {
+    role.rules = null;
+  }
+  const defaultDeny = live.find(resource =>
+    resource.kind === "NetworkPolicy" &&
+    resource.metadata?.name === "bot-runner-default-deny"
+  );
+  delete defaultDeny.spec.ingress;
+  delete defaultDeny.spec.egress;
+  assert.deepEqual(verifyLiveRunnerControlPlane(live, generated, NAMESPACE), []);
+
+  const extraAuthority = structuredClone(live);
+  extraAuthority.find(resource =>
+    resource.kind === "Role" && resource.metadata?.namespace === NAMESPACE
+  ).rules = [{ apiGroups: [""], resources: ["secrets"], verbs: ["get"] }];
+  assert.match(
+    verifyLiveRunnerControlPlane(extraAuthority, generated, NAMESPACE).join("\n"),
+    /live_runner_control_plane_drift/
+  );
+
+  const openIngress = structuredClone(live);
+  openIngress.find(resource =>
+    resource.kind === "NetworkPolicy" &&
+    resource.metadata?.name === "bot-runner-default-deny"
+  ).spec.ingress = [{}];
+  assert.match(
+    verifyLiveRunnerControlPlane(openIngress, generated, NAMESPACE).join("\n"),
+    /live_runner_control_plane_drift/
+  );
+});
