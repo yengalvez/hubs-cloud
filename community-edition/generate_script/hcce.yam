@@ -384,7 +384,7 @@ data:
     # ^^^ has to be string or elixir throws (ArgumentError) argument error:erlang.byte_size(#), but why
 
     [ret."Elixir.RetWeb.Email"]
-    from = "noreply@<HUB_DOMAIN>"
+    from = "<SMTP_FROM_ADDRESS>"
 
     [ret."Elixir.Ret.Mailer"]
     relay = "<SMTP_SERVER>"
@@ -613,6 +613,8 @@ spec:
             secretKeyRef:
               name: configs
               key: SMTP_PASS
+        - name: turkeyCfg_SMTP_FROM_ADDRESS
+          value: "$SMTP_FROM_ADDRESS"
         - name: turkeyCfg_ADM_EMAIL
           valueFrom:
             secretKeyRef:

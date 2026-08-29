@@ -94,6 +94,51 @@ test("generator and verifier support dynamic and retained manual storage only", 
   }
 });
 
+test("SMTP sender defaults to the hub domain and accepts an explicit verified address", () => {
+  for (const [name, smtpFromAddress, expectedAddress] of [
+    ["default", undefined, `noreply@${ciInput.HUB_DOMAIN}`],
+    ["verified-parent", "noreply@meta-hubs.org", "noreply@meta-hubs.org"]
+  ]) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `hcce-smtp-from-${name}-`));
+    const inputPath = path.join(directory, "input-values.yaml");
+    const outputPath = path.join(directory, "hcce.yaml");
+    const input = { ...ciInput };
+    if (smtpFromAddress) input.SMTP_FROM_ADDRESS = smtpFromAddress;
+    fs.writeFileSync(inputPath, YAML.stringify(input), { mode: 0o600 });
+
+    const generated = runNode(generatorPath, {
+      HCCE_INPUT_VALUES_PATH: inputPath,
+      HCCE_OUTPUT_PATH: outputPath
+    });
+    assert.equal(generated.status, 0, generated.stderr);
+
+    const documents = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8")).map(doc => doc.toJS());
+    const reticulum = documents.find(doc => doc.kind === "Deployment" && doc.metadata?.name === "reticulum");
+    assert.ok(reticulum, "reticulum Deployment must exist");
+    assert.deepEqual(
+      reticulum.spec.template.spec.containers[0].env.find(
+        entry => entry.name === "turkeyCfg_SMTP_FROM_ADDRESS"
+      ),
+      { name: "turkeyCfg_SMTP_FROM_ADDRESS", value: expectedAddress }
+    );
+  }
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-smtp-from-invalid-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  fs.writeFileSync(
+    inputPath,
+    YAML.stringify({ ...ciInput, SMTP_FROM_ADDRESS: "not-an-email" }),
+    { mode: 0o600 }
+  );
+  const rejected = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath
+  });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /SMTP_FROM_ADDRESS must be a valid email address/);
+});
+
 test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the default durable profile unchanged", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-legacy-cold-rebind-"));
   const inputPath = path.join(directory, "input-values.yaml");

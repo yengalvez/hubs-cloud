@@ -302,6 +302,17 @@ function main() {
     // strings as templates: a secret containing `$NAME` must remain literal.
     const processedConfig = utils.readConfig(inputPath);
 
+    // Staging hosts commonly live below a web subdomain while the SMTP
+    // provider authorizes only the parent sender domain. Keep the historical
+    // noreply@HUB_DOMAIN behavior unless an explicit verified address is set.
+    const smtpFromAddress = String(
+      processedConfig.SMTP_FROM_ADDRESS || `noreply@${processedConfig.HUB_DOMAIN || ""}`
+    ).trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(smtpFromAddress)) {
+      throw new Error("SMTP_FROM_ADDRESS must be a valid email address");
+    }
+    processedConfig.SMTP_FROM_ADDRESS = smtpFromAddress;
+
     const runnerActivationPhase = String(
       processedConfig.BOT_RUNNER_ACTIVATION_PHASE || "bootstrap"
     );
