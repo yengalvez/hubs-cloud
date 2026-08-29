@@ -1423,7 +1423,7 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
     : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
 }
 
-const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "693da80b5d85e1d5bbbaa17f5b2ec0affdc7e9b1466fb22ad047a6c6f672e1a7";
+const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "32fdb20e835772493257ecc221797b06e749d1b4189b0dfd89db1e9932630f24";
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

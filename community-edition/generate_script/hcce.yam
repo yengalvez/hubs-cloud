@@ -1813,7 +1813,7 @@ spec:
        has(object.spec.template.spec.containers[0].env) &&
        object.spec.template.spec.containers[0].env.exists(e, e.name == 'BOT_RUNNER_IMAGE' && has(e.value) && e.value == '$BOT_RUNNER_IMAGE') &&
        object.spec.template.spec.containers[0].env.exists(e, e.name == 'BOT_RUNNER_RECOVERY_EPOCH' && has(e.value) && e.value == object.metadata.annotations['yenhubs.org/bot-runner-recovery-epoch']) &&
-       object.spec.template.spec.containers[0].env.exists(e, e.name == 'KUBERNETES_RUNNER_NAMESPACE' && has(e.value) && e.value == 'hcce-bot-runners'))
+       object.spec.template.spec.containers[0].env.exists(e, e.name == 'RUNNER_POD_NAMESPACE' && has(e.value) && e.value == 'hcce-bot-runners'))
     message: bot-orchestrator CREATE and UPDATE require the durable intent-fence protocol and exact isolated-parent shape
     reason: Forbidden
 ---

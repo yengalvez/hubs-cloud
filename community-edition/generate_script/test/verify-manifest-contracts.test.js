@@ -789,6 +789,9 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
     /request\.operation == 'DELETE' && request\.name == ''/,
     "Deployment DeleteCollection also uses an empty request.name and must fail closed"
   );
+  const parentShape = parentFencePolicy.spec.validations.at(-1).expression;
+  assert.match(parentShape, /e\.name == 'RUNNER_POD_NAMESPACE'/);
+  assert.doesNotMatch(parentShape, /KUBERNETES_RUNNER_NAMESPACE/);
   const scalableParent = clone(resources);
   scalableParent.find(resource =>
     resource.kind === "ValidatingAdmissionPolicy" &&
