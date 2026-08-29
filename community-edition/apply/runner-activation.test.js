@@ -1377,6 +1377,18 @@ test("admission to active reconciles the target control plane while authority is
   assert.match(branch, /await waitForAdmissionDenialProbe\(\)/);
 });
 
+test("the admission canary reaches policy evaluation independently of RBAC propagation", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const probe = source.slice(
+    source.indexOf("function admissionDenialProbe()"),
+    source.indexOf("function recoveryOperationParentWriterProbePod()")
+  );
+  assert.match(probe, /--as-group=system:masters/);
+  assert.match(probe, /exactRunnerAuthority\(\)/);
+  assert.match(probe, /phase-bound parent or shape-limited recovery operator principal/);
+  assert.match(probe, /!diagnostic\.includes\("violates PodSecurity"\)/);
+});
+
 test("live control-plane exactness rejects terminating, owner-bound, finalized, and immutable Secrets", () => {
   const expected = {
     apiVersion: "v1",

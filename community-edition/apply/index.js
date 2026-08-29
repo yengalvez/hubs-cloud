@@ -1736,9 +1736,16 @@ function admissionProbePod() {
 
 function admissionDenialProbe() {
   const username = `system:serviceaccount:${parentNamespace}:bot-orchestrator`;
+  // RBAC is verified independently by exactRunnerAuthority(). Give this
+  // server-side dry-run an authorization-only group so it always reaches the
+  // admission policy; the policy must still reject the bare ServiceAccount
+  // principal because it has no bound parent Pod identity extras.
   const result = runLeaseGuardedRead(() => spawnSync(
     "kubectl",
-    contextArgs(["create", "--dry-run=server", "-f", "-", `--as=${username}`]),
+    contextArgs([
+      "create", "--dry-run=server", "-f", "-", `--as=${username}`,
+      "--as-group=system:masters"
+    ]),
     {
       input: JSON.stringify(admissionProbePod()),
       encoding: "utf8",
