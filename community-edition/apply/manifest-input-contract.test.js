@@ -289,7 +289,7 @@ test("activation planning rejects scale and Pod-subresource bypasses of durable 
   );
   assert.equal(
     policy.spec.validations.some(validation =>
-      validation.expression === "request.subResource != 'scale'"
+      validation.expression === "!has(request.subResource) || request.subResource != 'scale'"
     ),
     true
   );

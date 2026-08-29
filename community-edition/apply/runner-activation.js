@@ -161,7 +161,7 @@ function activationPlanFromResources(resources) {
       scope: "Namespaced"
     }) ||
     !parentFenceExpressions.includes("request.operation != 'DELETE'") ||
-    !parentFenceExpressions.includes("request.subResource != 'scale'") ||
+    !parentFenceExpressions.includes("!has(request.subResource) || request.subResource != 'scale'") ||
     !parentFenceExpressions.includes(FENCE_PROTOCOL_ANNOTATION) ||
     !parentFenceExpressions.includes(FENCE_PROTOCOL_VALUE) ||
     !exactParentFenceBinding(parentFenceBinding, deployment.metadata.namespace) ||
@@ -181,7 +181,7 @@ function activationPlanFromResources(resources) {
         scope: "Namespaced"
       }
     ]) ||
-    !runnerProtocolExpressions.includes("request.subResource == ''") ||
+    !runnerProtocolExpressions.includes("!has(request.subResource) || request.subResource == ''") ||
     !runnerProtocolExpressions.includes("yenhubs.org/runner-protocol") ||
     !runnerProtocolExpressions.includes("durable-fence-v2") ||
     !exactRunnerProtocolBinding(runnerProtocolBinding) ||

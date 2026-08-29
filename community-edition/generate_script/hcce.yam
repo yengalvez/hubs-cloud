@@ -1150,7 +1150,7 @@ spec:
     expression: >-
       variables.activationPhase != 'bootstrap' && variables.recoveryPhase != 'restore-fence'
   validations:
-  - expression: request.subResource == ''
+  - expression: "!has(request.subResource) || request.subResource == ''"
     message: runner Pod eviction, executable access, ephemeral-container injection and in-place resize subresources are disabled; use the guarded stop or break-glass workflow
     reason: Forbidden
   - expression: >-
@@ -1662,7 +1662,7 @@ spec:
   - name: recoveryOperator
     expression: "!request.userInfo.username.startsWith('system:serviceaccount:')"
   validations:
-  - expression: request.subResource == ''
+  - expression: "!has(request.subResource) || request.subResource == ''"
     message: durable runner identities cannot be evicted, entered, proxied, injected with ephemeral containers or resized through Pod subresources
     reason: Forbidden
   - expression: >-
@@ -1784,7 +1784,7 @@ spec:
   - expression: request.operation != 'DELETE'
     message: the fence-aware bot-orchestrator Deployment is durable; DELETE and Deployment DeleteCollection require explicit break-glass removal of this policy
     reason: Forbidden
-  - expression: request.subResource != 'scale'
+  - expression: "!has(request.subResource) || request.subResource != 'scale'"
     message: the fence-aware bot-orchestrator replica count cannot be changed through deployments/scale; regenerate and apply the complete guarded manifest
     reason: Forbidden
   - expression: >-
