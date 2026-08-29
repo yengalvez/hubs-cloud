@@ -2069,7 +2069,8 @@ function applyResource(resource) {
     resource?.metadata?.namespace === parentNamespace &&
     resource?.metadata?.name === "bot-orchestrator" &&
     Number(resource?.spec?.replicas || 0) > 0;
-  if (startsRunnerParent && !exactRunnerAuthority(true)) {
+  const startsDurableRunnerParent = startsRunnerParent && !legacyActiveCompatibility;
+  if (startsDurableRunnerParent && !exactRunnerAuthority(true)) {
     throw new Error("effective_rbac_not_exact_before_parent_start");
   }
   const applied = runLeaseGuardedMutation(
@@ -2085,7 +2086,7 @@ function applyResource(resource) {
     )
   );
   if (applied.status !== 0) throw new Error(`kubectl_resource_apply_failed:${applied.status}`);
-  if (startsRunnerParent && !exactRunnerAuthority(true)) {
+  if (startsDurableRunnerParent && !exactRunnerAuthority(true)) {
     throw new Error("effective_rbac_changed_during_parent_start");
   }
 }
@@ -2713,7 +2714,10 @@ async function refenceLegacyCompatibilityRuntime() {
     failures.push("recovery-consumers-quiesced");
   }
   try {
-    if (!legacyCompatibilityFenceDeploymentsAreExact()) failures.push("deployment-fences-exact");
+    await waitFor(
+      "legacy_compatibility_deployment_fences_exact",
+      legacyCompatibilityFenceDeploymentsAreExact
+    );
   } catch (_error) {
     failures.push("deployment-fences-exact");
   }

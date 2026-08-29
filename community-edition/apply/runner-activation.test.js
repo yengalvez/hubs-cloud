@@ -1398,8 +1398,14 @@ test("legacy-active compatibility is gated, exact, and fail-closed without durab
   assert.match(source, /async function applyLegacyActiveCompatibility\(\)/);
   assert.match(source, /legacy_active_deployments_exact/);
   assert.match(source, /legacy_active_deployments_ready/);
+  assert.match(
+    source,
+    /const startsDurableRunnerParent = startsRunnerParent && !legacyActiveCompatibility;/
+  );
+  assert.match(source, /if \(startsDurableRunnerParent && !exactRunnerAuthority\(true\)\)/);
   assert.match(source, /async function refenceLegacyCompatibilityRuntime\(\)/);
   assert.match(source, /legacy_compatibility_consumers_quiesced/);
+  assert.match(source, /legacy_compatibility_deployment_fences_exact/);
   assert.match(source, /legacy_compatibility_refence_incomplete/);
   const mainCatch = source.slice(
     source.indexOf("let failure = null;"),
