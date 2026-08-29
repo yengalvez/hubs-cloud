@@ -1389,6 +1389,28 @@ test("the admission canary reaches policy evaluation independently of RBAC propa
   assert.match(probe, /!diagnostic\.includes\("violates PodSecurity"\)/);
 });
 
+test("legacy-active compatibility is gated, exact, and fail-closed without durable bot migration", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  assert.match(source, /LEGACY_ACTIVE_COLD_REBIND_PROFILE/);
+  assert.match(source, /function verifyLegacyActiveCompatibilityPreflight\(/);
+  assert.match(source, /legacyDurableControlPlaneIsAbsent\(\)/);
+  assert.match(source, /legacy_active_compatibility_live_runtime_not_exact_boundary/);
+  assert.match(source, /async function applyLegacyActiveCompatibility\(\)/);
+  assert.match(source, /legacy_active_deployments_exact/);
+  assert.match(source, /legacy_active_deployments_ready/);
+  assert.match(source, /async function refenceLegacyCompatibilityRuntime\(\)/);
+  assert.match(source, /legacy_compatibility_consumers_quiesced/);
+  assert.match(source, /legacy_compatibility_refence_incomplete/);
+  const mainCatch = source.slice(
+    source.indexOf("let failure = null;"),
+    source.indexOf("try {\n    await releaseOperationLeaseGuard();")
+  );
+  assert.ok(
+    mainCatch.indexOf("legacyFailClosedRefenceRequired") <
+      mainCatch.indexOf("failClosedRefenceRequired")
+  );
+});
+
 test("live control-plane exactness rejects terminating, owner-bound, finalized, and immutable Secrets", () => {
   const expected = {
     apiVersion: "v1",

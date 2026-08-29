@@ -7,6 +7,7 @@ const {
   FORBIDDEN_PARENT_ENV,
   FORBIDDEN_RETICULUM_ENV,
   FORBIDDEN_RUNNER_ANNOTATIONS,
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
   LEGACY_ABSENT_COLD_REBIND_PROFILE,
   WRITER_DEPLOYMENTS,
   deploymentImageMap,
@@ -499,7 +500,11 @@ function verifyLegacyAbsentColdRebindInventory(resources) {
   return errors;
 }
 
-function verifyLegacyAbsentColdRebindProfile(resources) {
+function verifyLegacyColdRebindProfile(resources, targetProfile) {
+  if (![LEGACY_ABSENT_COLD_REBIND_PROFILE, LEGACY_ACTIVE_COLD_REBIND_PROFILE].includes(targetProfile)) {
+    return ["legacy cold-rebind target profile is invalid"];
+  }
+  const writersActive = targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE;
   const errors = verifyLegacyAbsentColdRebindInventory(resources);
   const namespaceResource = resources.find(resource =>
     resource?.apiVersion === "v1" && resource?.kind === "Namespace"
@@ -527,7 +532,7 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
     ]) ||
     typeof namespaceAnnotations.domain !== "string" || !namespaceAnnotations.domain ||
     typeof namespaceAnnotations.adm !== "string" || !namespaceAnnotations.adm ||
-    namespaceAnnotations["yenhubs.org/target-profile"] !== LEGACY_ABSENT_COLD_REBIND_PROFILE ||
+    namespaceAnnotations["yenhubs.org/target-profile"] !== targetProfile ||
     namespaceAnnotations["yenhubs.org/target-image-map-sha256"] !== imageMapSha256(images)
   ) {
     errors.push("legacy cold-rebind Namespace profile and exact image-map annotations must be intact");
@@ -543,7 +548,7 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
   }
   for (const deployment of deployments) {
     const expectedReplicas = WRITER_DEPLOYMENTS.includes(deployment.metadata.name)
-      ? 0
+      ? (writersActive ? 1 : 0)
       : deployment.metadata.name === "pgsql" ? 1 : null;
     if (expectedReplicas !== null && deployment.spec?.replicas !== expectedReplicas) {
       errors.push(`Deployment/${deployment.metadata.name} must use replicas=${expectedReplicas} in legacy cold-rebind`);
@@ -699,6 +704,14 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
     errors.push("legacy cold-rebind target must contain exactly pgsql-pvc and ret-pvc");
   }
   return errors;
+}
+
+function verifyLegacyAbsentColdRebindProfile(resources) {
+  return verifyLegacyColdRebindProfile(resources, LEGACY_ABSENT_COLD_REBIND_PROFILE);
+}
+
+function verifyLegacyActiveColdRebindProfile(resources) {
+  return verifyLegacyColdRebindProfile(resources, LEGACY_ACTIVE_COLD_REBIND_PROFILE);
 }
 
 function verifyBotOrchestratorSecretEnv(container) {
@@ -1745,6 +1758,8 @@ module.exports = {
   verifyManifestResourceInventory,
   verifyLegacyAbsentColdRebindInventory,
   verifyLegacyAbsentColdRebindProfile,
+  verifyLegacyActiveColdRebindProfile,
+  verifyLegacyColdRebindProfile,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
   verifyReticulumBotRunnerAuthorityContract

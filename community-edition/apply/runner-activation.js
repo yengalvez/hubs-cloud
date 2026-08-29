@@ -1,6 +1,10 @@
 const fs = require("node:fs");
 const { isDeepStrictEqual } = require("node:util");
 const YAML = require("yaml");
+const {
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
+  LEGACY_ABSENT_COLD_REBIND_PROFILE
+} = require("../generate_script/legacy-absent-cold-rebind-profile");
 
 const RUNNER_NAMESPACE = "hcce-bot-runners";
 const ADMISSION_POLICY_NAME = "bot-runner-pods.yenhubs.org";
@@ -98,7 +102,7 @@ function activationPlanFromResources(resources) {
     resource?.kind === "ValidatingAdmissionPolicyBinding" &&
     resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
   );
-  const legacyAbsent =
+  const legacyCompatible =
     activationPhase === undefined &&
     recoveryPhase === undefined &&
     recoveryEpoch === undefined &&
@@ -110,25 +114,35 @@ function activationPlanFromResources(resources) {
       CUTOVER_JOURNAL_POLICY_NAME,
       RECOVERY_OPERATION_FENCE_POLICY_NAME
     ].some(name => resources.some(resource => resource?.metadata?.name === name));
-  if (legacyAbsent) {
+  if (legacyCompatible) {
     const consumers = RECOVERY_CONSUMERS.map(name => findDeployment(resources, name));
     const pgsql = findDeployment(resources, "pgsql");
+    const namespaceResource = resources.find(resource =>
+      resource?.apiVersion === "v1" &&
+      resource?.kind === "Namespace" &&
+      resource?.metadata?.name === deployment?.metadata?.namespace
+    );
+    const targetProfile = namespaceResource?.metadata?.annotations?.["yenhubs.org/target-profile"];
+    const legacyActive = targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE;
+    const legacyAbsent = targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE;
     if (
+      (!legacyAbsent && !legacyActive) ||
       consumers.some(consumer =>
         !consumer ||
         consumer?.metadata?.namespace !== deployment?.metadata?.namespace ||
-        consumer?.spec?.replicas !== 0
+        consumer?.spec?.replicas !== (legacyActive ? 1 : 0)
       ) ||
       !pgsql ||
       pgsql?.metadata?.namespace !== deployment?.metadata?.namespace ||
       pgsql?.spec?.replicas !== 1
     ) {
-      throw new Error("generated_manifest_legacy_absent_recovery_boundary_invalid");
+      throw new Error("generated_manifest_legacy_recovery_boundary_invalid");
     }
+    const phase = legacyActive ? "legacy-active" : "legacy-absent";
     return {
-      activationPhase: "legacy-absent",
-      recoveryPhase: "legacy-absent",
-      recoveryEpoch: "legacy-absent",
+      activationPhase: phase,
+      recoveryPhase: phase,
+      recoveryEpoch: phase,
       resources
     };
   }

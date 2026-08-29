@@ -5,8 +5,8 @@ const pemJwk = require("pem-jwk");
 const utils = require("../utils");
 const { verifyDockerConfigCredentials } = require("./verify-manifest-contracts");
 const {
-  LEGACY_ABSENT_COLD_REBIND_PROFILE,
-  applyLegacyAbsentColdRebindProfile,
+  applyLegacyColdRebindProfile,
+  isLegacyColdRebindProfile,
   targetProfileFromEnvironment
 } = require("./legacy-absent-cold-rebind-profile");
 
@@ -439,7 +439,7 @@ function main() {
     try {
       verifyDockerConfigCredentials(
         pullConfigBase64,
-        targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE
+        isLegacyColdRebindProfile(targetProfile)
           ? [botOrchestratorImage]
           : [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]
       );
@@ -476,8 +476,12 @@ function main() {
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
     replacedContent = handleRunnerActivation(processedConfig, replacedContent);
-    if (targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE) {
-      replacedContent = applyLegacyAbsentColdRebindProfile(processedConfig, replacedContent);
+    if (isLegacyColdRebindProfile(targetProfile)) {
+      replacedContent = applyLegacyColdRebindProfile(
+        processedConfig,
+        replacedContent,
+        targetProfile
+      );
     }
 
     utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);

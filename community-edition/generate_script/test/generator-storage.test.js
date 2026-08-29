@@ -11,6 +11,7 @@ const generatorPath = path.join(communityEditionDir, "generate_script/index.js")
 const verifierPath = path.join(communityEditionDir, "generate_script/verify-generated-manifest.js");
 const ciInput = YAML.parse(fs.readFileSync(path.join(communityEditionDir, "input-values.ci.yaml"), "utf8"));
 const legacyProfile = "cold-rebind-legacy-absent-v1";
+const legacyActiveProfile = "cold-rebind-legacy-active-v1";
 
 function runNode(script, env) {
   return spawnSync(process.execPath, [script], {
@@ -369,6 +370,63 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   });
   assert.notEqual(missingWorkloadPullVerified.status, 0);
   assert.match(missingWorkloadPullVerified.stderr, /must bind the pull Secret exactly when using GHCR/);
+});
+
+test("legacy-active cold-rebind keeps the audited legacy contract and activates exactly five writers", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-legacy-active-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  const dockerConfig = JSON.parse(
+    Buffer.from(ciInput.BOT_IMAGE_PULL_CONFIG_JSON_BASE64, "base64").toString("utf8")
+  );
+  dockerConfig.auths["ghcr.io"] = {
+    auth: Buffer.from("ci-user:ci-token", "utf8").toString("base64")
+  };
+  fs.writeFileSync(inputPath, YAML.stringify({
+    ...ciInput,
+    OVERRIDE_BOT_RUNNER_IMAGE: "No",
+    OVERRIDE_HUBS_IMAGE: `ghcr.io/yengalvez/hubs@sha256:${"8".repeat(64)}`,
+    BOT_IMAGE_PULL_CONFIG_JSON_BASE64: Buffer.from(
+      JSON.stringify(dockerConfig), "utf8"
+    ).toString("base64")
+  }), { mode: 0o600 });
+
+  const generated = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyActiveProfile
+  });
+  assert.equal(generated.status, 0, generated.stderr);
+  const verified = runNode(verifierPath, {
+    HCCE_MANIFEST_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyActiveProfile
+  });
+  assert.equal(verified.status, 0, verified.stderr);
+  assert.match(verified.stdout, new RegExp(legacyActiveProfile));
+
+  const resources = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const namespace = resources.find(resource => resource.kind === "Namespace");
+  assert.equal(namespace.metadata.annotations["yenhubs.org/target-profile"], legacyActiveProfile);
+  const deployments = resources.filter(resource => resource.kind === "Deployment");
+  for (const name of ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]) {
+    assert.equal(
+      deployments.find(deployment => deployment.metadata.name === name).spec.replicas,
+      1,
+      `${name} must be active`
+    );
+  }
+  assert.equal(resources.some(resource => resource.metadata?.name === "hcce-bot-runners"), false);
+  assert.equal(resources.some(resource => resource.kind === "ValidatingAdmissionPolicy"), false);
+  const parent = deployments.find(deployment => deployment.metadata.name === "bot-orchestrator");
+  assert.equal(parent.spec.template.spec.automountServiceAccountToken, false);
+  assert.equal(parent.spec.template.spec.containers[0].env.some(
+    entry => entry.name === "BOT_ACCESS_KEY"
+  ), true);
+  assert.equal(parent.spec.template.spec.containers[0].env.some(
+    entry => entry.name === "BOT_ORCHESTRATOR_ACCESS_KEY"
+  ), false);
 });
 
 test("generator requires four independent access-key trust domains", () => {

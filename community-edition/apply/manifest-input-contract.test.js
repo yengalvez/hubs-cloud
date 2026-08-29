@@ -9,6 +9,7 @@ const YAML = require("yaml");
 const { readActivationPlan, readActivationPlanText } = require("./runner-activation");
 const {
   verifyActivePlanAndConfig,
+  verifyLegacyActivePlanAndConfig,
   verifyLegacyAbsentPlanAndConfig,
   verifyManifestAgainstInputValues
 } = require("./manifest-input-contract");
@@ -20,6 +21,7 @@ const generatedManifestVerifierPath = path.resolve(
   "generate_script/verify-generated-manifest.js"
 );
 const legacyProfile = "cold-rebind-legacy-absent-v1";
+const legacyActiveProfile = "cold-rebind-legacy-active-v1";
 const ciInput = YAML.parse(fs.readFileSync(
   path.resolve(communityEditionDir, "input-values.ci.yaml"),
   "utf8"
@@ -83,6 +85,21 @@ test("standalone live verifier accepts only the exact reproducible legacy-absent
   assert.equal(result.plan.activationPhase, "legacy-absent");
   assert.equal(result.plan.recoveryPhase, "legacy-absent");
   assert.equal(result.plan.recoveryEpoch, "legacy-absent");
+});
+
+test("standalone live verifier accepts only the exact reproducible legacy-active target", t => {
+  const environment = { HCCE_TARGET_PROFILE: legacyActiveProfile };
+  const fixture = generatedFixture(t, legacyInputOverrides(), environment);
+  const result = verifyManifestAgainstInputValues(
+    fixture.inputPath,
+    fixture.manifestPath,
+    environment
+  );
+  assert.equal(result.targetProfile, legacyActiveProfile);
+  assert.equal(result.plan.activationPhase, "legacy-active");
+  assert.equal(result.plan.recoveryPhase, "legacy-active");
+  assert.equal(result.plan.recoveryEpoch, "legacy-active");
+  assert.doesNotThrow(() => verifyLegacyActivePlanAndConfig(result.plan, result.config));
 });
 
 test("standalone live verifier keeps durable and legacy target profiles disjoint", async t => {
@@ -400,7 +417,14 @@ test("activation planning accepts only an exact stopped legacy-absent greenfield
     spec: { replicas: 1 }
   });
   const resources = [
-    { apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } },
+    {
+      apiVersion: "v1",
+      kind: "Namespace",
+      metadata: {
+        name: namespace,
+        annotations: { "yenhubs.org/target-profile": legacyProfile }
+      }
+    },
     ...deployments
   ];
   const serialize = values => values.map(resource => YAML.stringify(resource)).join("---\n");
@@ -409,11 +433,24 @@ test("activation planning accepts only an exact stopped legacy-absent greenfield
   assert.equal(plan.recoveryPhase, "legacy-absent");
   assert.equal(plan.resources.length, resources.length);
 
+  const active = structuredClone(resources);
+  active[0].metadata.annotations["yenhubs.org/target-profile"] = legacyActiveProfile;
+  for (const deployment of active.filter(resource =>
+    ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]
+      .includes(resource?.metadata?.name)
+  )) {
+    deployment.spec.replicas = 1;
+  }
+  const activePlan = readActivationPlanText(serialize(active));
+  assert.equal(activePlan.activationPhase, "legacy-active");
+  assert.equal(activePlan.recoveryPhase, "legacy-active");
+  assert.equal(activePlan.recoveryEpoch, "legacy-active");
+
   const unsafe = structuredClone(resources);
   unsafe.find(resource => resource?.metadata?.name === "reticulum").spec.replicas = 1;
   assert.throws(
     () => readActivationPlanText(serialize(unsafe)),
-    /generated_manifest_legacy_absent_recovery_boundary_invalid/
+    /generated_manifest_legacy_recovery_boundary_invalid/
   );
 });
 

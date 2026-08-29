@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const utils = require("../utils");
 const {
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
   LEGACY_ABSENT_COLD_REBIND_PROFILE,
   targetProfileFromEnvironment
 } = require("../generate_script/legacy-absent-cold-rebind-profile");
@@ -105,9 +106,40 @@ function verifyLegacyAbsentPlanAndConfig(plan, config) {
   }
 }
 
+function verifyLegacyActivePlanAndConfig(plan, config) {
+  if (String(config?.BOT_RUNNER_ACTIVATION_PHASE || "") !== "active") {
+    throw new Error("legacy_active_live_verifier_requires_config_activation_active");
+  }
+  if (String(config?.BOT_RUNNER_RECOVERY_PHASE || "") !== "active") {
+    throw new Error("legacy_active_live_verifier_requires_config_recovery_active");
+  }
+  if (plan?.activationPhase !== "legacy-active") {
+    throw new Error("legacy_active_live_verifier_requires_manifest_activation_active");
+  }
+  if (plan?.recoveryPhase !== "legacy-active" || plan?.recoveryEpoch !== "legacy-active") {
+    throw new Error("legacy_active_live_verifier_requires_manifest_recovery_active");
+  }
+  const namespaces = (plan?.resources || []).filter(resource =>
+    resource?.apiVersion === "v1" &&
+    resource?.kind === "Namespace" &&
+    resource?.metadata?.name !== "hcce-bot-runners"
+  );
+  if (
+    namespaces.length !== 1 ||
+    namespaces[0]?.metadata?.annotations?.["yenhubs.org/target-profile"] !==
+      LEGACY_ACTIVE_COLD_REBIND_PROFILE
+  ) {
+    throw new Error("legacy_active_live_verifier_target_profile_mismatch");
+  }
+}
+
 function verifyTargetPlanAndConfig(plan, config, targetProfile) {
   if (targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE) {
     verifyLegacyAbsentPlanAndConfig(plan, config);
+    return;
+  }
+  if (targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE) {
+    verifyLegacyActivePlanAndConfig(plan, config);
     return;
   }
   if (targetProfile !== null) throw new Error("live_verifier_target_profile_invalid");
@@ -163,6 +195,7 @@ function verifyManifestAgainstInputValues(
 module.exports = {
   exactFileContent,
   verifyActivePlanAndConfig,
+  verifyLegacyActivePlanAndConfig,
   verifyLegacyAbsentPlanAndConfig,
   verifyTargetPlanAndConfig,
   verifyManifestAgainstInputValues
