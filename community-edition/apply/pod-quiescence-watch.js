@@ -110,6 +110,13 @@ function replicaSetListRawPath(namespace) {
   return `/apis/apps/v1/namespaces/${encodeURIComponent(namespace)}/replicasets`;
 }
 
+function deploymentListRawPath(namespace) {
+  if (typeof namespace !== "string" || !namespace) {
+    throw new Error("deployment_list_path_input_invalid");
+  }
+  return `/apis/apps/v1/namespaces/${encodeURIComponent(namespace)}/deployments`;
+}
+
 function podWatchRawPath(namespace, resourceVersion, timeoutSeconds = 600) {
   if (
     typeof namespace !== "string" || !namespace ||
@@ -290,6 +297,7 @@ module.exports = {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemIsValid,
   namespacedListItemWithTypeMeta,

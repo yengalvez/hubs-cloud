@@ -46,6 +46,7 @@ const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemWithTypeMeta,
   namespacedWatchObjectIsValid,
@@ -387,7 +388,9 @@ function liveParentIsQuiesced() {
   const deployment = kubectlJson([
     "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
   ]);
-  const pods = kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]);
+  const pods = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+  ]);
   return parentIsQuiesced(deployment, pods);
 }
 
@@ -815,7 +818,7 @@ function pristineLegacyCutoverLiveEvidence() {
       "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
     ]),
     parentReplicaSetList: kubectlJson([
-      "-n", parentNamespace, "get", "replicasets", "-o", "json"
+      "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
     ]),
     authority
   };
@@ -1656,13 +1659,13 @@ async function waitForStableFirstCutoverParentAbsence(label, finalPredicate) {
 
 function liveRecoveryConsumersAreQuiesced() {
   const deployments = kubectlJson([
-    "-n", parentNamespace, "get", "deployments", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
   ]);
   const pods = kubectlJson([
-    "-n", parentNamespace, "get", "pods", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
   ]);
   const replicaSets = kubectlJson([
-    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
   ]);
   return recoveryConsumersAreQuiesced(deployments, pods, replicaSets);
 }
@@ -2168,9 +2171,11 @@ function liveFirstCutoverParentIsQuiesced(journal) {
     "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
   ], "first-cutover-parent-deployment-quiescence");
   if (deployment === null) return false;
-  const pods = kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]);
+  const pods = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+  ]);
   const replicaSets = kubectlJson([
-    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
   ]);
   return parentIsQuiesced(
     deployment,
@@ -2353,7 +2358,7 @@ function expectedDeployments() {
 
 function legacyAbsentDeploymentList() {
   return kubectlJson([
-    "get", "--raw", `/apis/apps/v1/namespaces/${parentNamespace}/deployments`
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
   ]);
 }
 
@@ -2441,7 +2446,9 @@ function serverNormalizedCutoverDeployment(expected, live) {
 
 function deploymentsMatchExpectedDesiredState(expected, { exactInventory = false } = {}) {
   assertOperationLeaseProcessHealthy();
-  const deployments = kubectlJson(["-n", parentNamespace, "get", "deployment", "-o", "json"]);
+  const deployments = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
+  ]);
   const liveByName = new Map(
     Array.isArray(deployments?.items)
       ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
@@ -2466,7 +2473,9 @@ function deploymentsMatchGeneratedDesiredState() {
 }
 
 function deploymentsAreReady() {
-  const deployments = kubectlJson(["-n", parentNamespace, "get", "deployment", "-o", "json"]);
+  const deployments = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
+  ]);
   const expectedNames = expectedDeployments().map(resource => resource.metadata.name).sort();
   const actualNames = Array.isArray(deployments?.items)
     ? deployments.items.map(deployment => deployment?.metadata?.name).sort()

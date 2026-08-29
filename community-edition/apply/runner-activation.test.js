@@ -31,6 +31,7 @@ const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemIsValid,
   namespacedListItemWithTypeMeta,
@@ -683,6 +684,10 @@ test("event-backed pod evidence catches transient Pods and fails closed on resou
     replicaSetListRawPath("hcce"),
     "/apis/apps/v1/namespaces/hcce/replicasets"
   );
+  assert.equal(
+    deploymentListRawPath("hcce"),
+    "/apis/apps/v1/namespaces/hcce/deployments"
+  );
   const completePods = {
     apiVersion: "v1",
     kind: "PodList",
@@ -1207,6 +1212,9 @@ test("watch handoffs require an in-band causal bookmark and retain the proven su
     cutoverPreflight,
     /get", "--raw", podListRawPath\(parentNamespace\)/
   );
+  assert.doesNotMatch(source, /"get", "pods", "-o", "json"/);
+  assert.doesNotMatch(source, /"get", "replicasets", "-o", "json"/);
+  assert.doesNotMatch(source, /"get", "deployment", "-o", "json"/);
 
   const successor = source.slice(
     source.indexOf("function startBookmarkedSuccessorWatch"),
