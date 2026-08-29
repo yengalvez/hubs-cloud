@@ -107,6 +107,7 @@ const {
   recoveryConsumersAreQuiesced,
   recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   readActivationPlanText,
   runBestEffortFenceSteps,
   uniqueRunnerPods
@@ -2468,8 +2469,8 @@ function legacyAbsentDeploymentsMatchGeneratedDesiredState() {
   }
   return expected.every(deployment => {
     const live = liveByName.get(deployment.metadata.name);
-    const normalized = serverNormalizedDeployment(deployment, live);
-    return normalized !== null && exactDeploymentDesiredState(live, normalized);
+    const pair = stableServerNormalizedDeployment(deployment, live);
+    return pair !== null && exactDeploymentDesiredState(pair.live, pair.normalized);
   });
 }
 
@@ -2514,6 +2515,16 @@ function serverNormalizedDeployment(expected, live) {
   }
 }
 
+function stableServerNormalizedDeployment(expected, initialLive) {
+  return retryServerNormalizedDeployment({
+    initialLive,
+    normalize: live => serverNormalizedDeployment(expected, live),
+    readCurrent: () => kubectlAbsentOnlyJson([
+      "-n", parentNamespace, "get", "deployment", expected.metadata.name, "-o", "json"
+    ], `deployment-normalization-${expected.metadata.name}`)
+  });
+}
+
 function serverNormalizedCutoverDeployment(expected, live) {
   if (live !== null) return serverNormalizedDeployment(expected, live);
   const candidate = structuredClone(expected);
@@ -2550,8 +2561,8 @@ function deploymentsMatchExpectedDesiredState(expected, { exactInventory = false
   }
   return expected.every(deployment => {
     const live = liveByName.get(deployment.metadata.name);
-    const normalized = serverNormalizedDeployment(deployment, live);
-    return normalized !== null && exactDeploymentDesiredState(live, normalized);
+    const pair = stableServerNormalizedDeployment(deployment, live);
+    return pair !== null && exactDeploymentDesiredState(pair.live, pair.normalized);
   });
 }
 

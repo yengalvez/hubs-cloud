@@ -845,6 +845,54 @@ function exactDeploymentDesiredState(live, normalizedExpected) {
     isDeepStrictEqual(live?.spec, normalizedExpected?.spec);
 }
 
+function retryServerNormalizedDeployment({
+  initialLive,
+  normalize,
+  readCurrent,
+  maxAttempts = 4
+}) {
+  if (
+    typeof normalize !== "function" ||
+    typeof readCurrent !== "function" ||
+    !Number.isInteger(maxAttempts) ||
+    maxAttempts < 1 ||
+    maxAttempts > 8
+  ) {
+    throw new Error("deployment_normalization_retry_arguments_invalid");
+  }
+  const identity = {
+    apiVersion: initialLive?.apiVersion,
+    kind: initialLive?.kind,
+    name: initialLive?.metadata?.name,
+    namespace: initialLive?.metadata?.namespace,
+    uid: initialLive?.metadata?.uid
+  };
+  if (
+    identity.apiVersion !== "apps/v1" ||
+    identity.kind !== "Deployment" ||
+    typeof identity.name !== "string" || !identity.name ||
+    typeof identity.namespace !== "string" || !identity.namespace ||
+    typeof identity.uid !== "string" || !identity.uid
+  ) return null;
+
+  let live = initialLive;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const normalized = normalize(live);
+    if (normalized !== null) return { live, normalized };
+    if (attempt + 1 >= maxAttempts) break;
+    const current = readCurrent();
+    if (
+      current?.apiVersion !== identity.apiVersion ||
+      current?.kind !== identity.kind ||
+      current?.metadata?.name !== identity.name ||
+      current?.metadata?.namespace !== identity.namespace ||
+      current?.metadata?.uid !== identity.uid
+    ) return null;
+    live = current;
+  }
+  return null;
+}
+
 function exactFoundationalNamespace(live, expected) {
   const expectedAnnotations = expected?.metadata?.annotations || {};
   const expectedLabels = expected?.metadata?.labels || {};
@@ -956,6 +1004,7 @@ module.exports = {
   recoveryConsumersAreQuiesced,
   recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   runBestEffortFenceSteps,
   uniqueRunnerPods
 };

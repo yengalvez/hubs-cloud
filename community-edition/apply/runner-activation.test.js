@@ -25,6 +25,7 @@ const {
   podIsRecoveryConsumer,
   recoveryConsumersAreQuiesced,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   runBestEffortFenceSteps
 } = require("./runner-activation");
 const {
@@ -1082,6 +1083,43 @@ test("reentry requires the server-normalized Deployment spec, image, and recover
     mutate(drifted);
     assert.equal(exactDeploymentDesiredState(drifted, expected), false);
   }
+});
+
+test("server normalization retries a stale status resourceVersion but rejects replacement", () => {
+  const live = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      uid: "deployment-uid",
+      resourceVersion: "10"
+    },
+    spec: { replicas: 1 }
+  };
+  const refreshed = structuredClone(live);
+  refreshed.metadata.resourceVersion = "11";
+  const normalized = structuredClone(refreshed);
+  const attempts = [];
+  const accepted = retryServerNormalizedDeployment({
+    initialLive: live,
+    normalize: current => {
+      attempts.push(current.metadata.resourceVersion);
+      return current.metadata.resourceVersion === "11" ? normalized : null;
+    },
+    readCurrent: () => refreshed
+  });
+  assert.deepEqual(attempts, ["10", "11"]);
+  assert.equal(accepted.live, refreshed);
+  assert.equal(accepted.normalized, normalized);
+
+  const replacement = structuredClone(refreshed);
+  replacement.metadata.uid = "replacement-uid";
+  assert.equal(retryServerNormalizedDeployment({
+    initialLive: live,
+    normalize: () => null,
+    readCurrent: () => replacement
+  }), null);
 });
 
 test("clean-install Lease bootstrap accepts only the exact active parent Namespace", () => {
