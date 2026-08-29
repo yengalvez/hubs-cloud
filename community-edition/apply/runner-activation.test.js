@@ -1199,6 +1199,15 @@ test("watch handoffs require an in-band causal bookmark and retain the proven su
   assert.match(rawLists, /get", "--raw", podListRawPath\(namespace\)/);
   assert.match(rawLists, /completeWatchListResourceVersion\(podList, "PodList", "v1"\)/);
 
+  const cutoverPreflight = source.slice(
+    source.indexOf("function pristineLegacyCutoverLiveEvidence"),
+    source.indexOf("function verifyPristineLegacyCutoverEvidence")
+  );
+  assert.match(
+    cutoverPreflight,
+    /get", "--raw", podListRawPath\(parentNamespace\)/
+  );
+
   const successor = source.slice(
     source.indexOf("function startBookmarkedSuccessorWatch"),
     source.indexOf("async function waitForInitialBookmarkedWatchBoundary")

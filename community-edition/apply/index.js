@@ -811,7 +811,9 @@ function pristineLegacyCutoverLiveEvidence() {
     liveDeployment,
     runnerNamespace,
     isolatedResources,
-    parentPodList: kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]),
+    parentPodList: kubectlJson([
+      "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+    ]),
     parentReplicaSetList: kubectlJson([
       "-n", parentNamespace, "get", "replicasets", "-o", "json"
     ]),
