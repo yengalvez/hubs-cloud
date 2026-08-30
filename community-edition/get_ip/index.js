@@ -1,13 +1,16 @@
-const utils = require("../utils");
 const { spawnSync } = require("node:child_process");
 
-const config = utils.readConfig();
-const { stdout } = spawnSync(
+const context = process.env.KUBECTL_CONTEXT;
+if (typeof context !== "string" || !context || context !== context.trim()) {
+  throw new Error("KUBECTL_CONTEXT_must_be_one_exact_nonempty_context");
+}
+const result = spawnSync(
   "kubectl",
-  ["get", "svc", "--field-selector", "spec.type=LoadBalancer", "-A", "-o", "json"],
+  ["--context", context, "get", "svc", "--field-selector", "spec.type=LoadBalancer", "-A", "-o", "json"],
   { stdio: ["pipe", "pipe", "inherit"] }
 );
-const output = JSON.parse(stdout);
+if (result.status !== 0) throw new Error(`load_balancer_inventory_failed:${result.status}`);
+const output = JSON.parse(result.stdout);
 if (output.items.length === 0) {
   console.warn("can't determine external IP address: no load balancers in cluster");
   process.exit(1);

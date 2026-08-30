@@ -658,7 +658,7 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
   assert.deepEqual(admission.spec.matchConstraints.resourceRules, exactPodSubresourceRules);
   assert.equal(validations.get(
     "runner Pod eviction, executable access, ephemeral-container injection and in-place resize subresources are disabled; use the guarded stop or break-glass workflow"
-  ), "request.subResource == ''");
+  ), "!has(request.subResource) || request.subResource == ''");
   const mutationAuthorization = validations.get(
     "runner Pod mutations require the exact phase-bound parent or shape-limited recovery operator principal"
   );
@@ -712,7 +712,7 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
   assert.deepEqual(durablePolicy.spec.matchConstraints.resourceRules, exactPodSubresourceRules);
   assert.equal(
     durablePolicy.spec.validations[0].expression,
-    "request.subResource == ''"
+    "!has(request.subResource) || request.subResource == ''"
   );
   const protectedSubresources = durablePolicy.spec.matchConstraints.resourceRules
     .flatMap(rule => rule.resources);
@@ -779,7 +779,7 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
   );
   assert.equal(
     parentFencePolicy.spec.validations.some(validation =>
-      validation.expression === "request.subResource != 'scale'"
+      validation.expression === "!has(request.subResource) || request.subResource != 'scale'"
     ),
     true,
     "all deployments/scale updates must fail closed"
@@ -789,6 +789,9 @@ test("pins the fail-closed runner admission policy and rejects policy bypass mut
     /request\.operation == 'DELETE' && request\.name == ''/,
     "Deployment DeleteCollection also uses an empty request.name and must fail closed"
   );
+  const parentShape = parentFencePolicy.spec.validations.at(-1).expression;
+  assert.match(parentShape, /e\.name == 'RUNNER_POD_NAMESPACE'/);
+  assert.doesNotMatch(parentShape, /KUBERNETES_RUNNER_NAMESPACE/);
   const scalableParent = clone(resources);
   scalableParent.find(resource =>
     resource.kind === "ValidatingAdmissionPolicy" &&

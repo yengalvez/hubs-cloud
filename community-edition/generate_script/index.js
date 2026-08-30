@@ -5,8 +5,8 @@ const pemJwk = require("pem-jwk");
 const utils = require("../utils");
 const { verifyDockerConfigCredentials } = require("./verify-manifest-contracts");
 const {
-  LEGACY_ABSENT_COLD_REBIND_PROFILE,
-  applyLegacyAbsentColdRebindProfile,
+  applyLegacyColdRebindProfile,
+  isLegacyColdRebindProfile,
   targetProfileFromEnvironment
 } = require("./legacy-absent-cold-rebind-profile");
 
@@ -201,6 +201,24 @@ function handleImageOverrides(processedConfig, replacedContent) {
     }
   });
 
+  // Every private GHCR workload needs the generated kubelet-only credential.
+  // Bind it directly on the Pod template so clean clusters do not depend on a
+  // mutable default ServiceAccount or on images left in a node cache.
+  yamlDocuments.forEach((doc, index) => {
+    const jsDoc = doc.toJS();
+    if (jsDoc.kind !== "Deployment") return;
+    const podSpec = jsDoc.spec?.template?.spec;
+    const usesGhcr = podSpec?.containers?.some(container =>
+      String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
+    );
+    if (usesGhcr) {
+      podSpec.imagePullSecrets = [{ name: "bot-images-pull" }];
+    } else if (jsDoc.metadata?.name !== "bot-orchestrator") {
+      delete podSpec.imagePullSecrets;
+    }
+    yamlDocuments[index] = new YAML.Document(jsDoc);
+  });
+
   return `${yamlDocuments.map(doc => YAML.stringify(doc, {"lineWidth": 0, "directives": false})).join('---\n')}`;
 }
 
@@ -283,6 +301,17 @@ function main() {
     // Values are already parsed YAML scalars. Do not reinterpret user-provided
     // strings as templates: a secret containing `$NAME` must remain literal.
     const processedConfig = utils.readConfig(inputPath);
+
+    // Staging hosts commonly live below a web subdomain while the SMTP
+    // provider authorizes only the parent sender domain. Keep the historical
+    // noreply@HUB_DOMAIN behavior unless an explicit verified address is set.
+    const smtpFromAddress = String(
+      processedConfig.SMTP_FROM_ADDRESS || `noreply@${processedConfig.HUB_DOMAIN || ""}`
+    ).trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(smtpFromAddress)) {
+      throw new Error("SMTP_FROM_ADDRESS must be a valid email address");
+    }
+    processedConfig.SMTP_FROM_ADDRESS = smtpFromAddress;
 
     const runnerActivationPhase = String(
       processedConfig.BOT_RUNNER_ACTIVATION_PHASE || "bootstrap"
@@ -421,7 +450,7 @@ function main() {
     try {
       verifyDockerConfigCredentials(
         pullConfigBase64,
-        targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE
+        isLegacyColdRebindProfile(targetProfile)
           ? [botOrchestratorImage]
           : [botOrchestratorImage, processedConfig.BOT_RUNNER_IMAGE]
       );
@@ -458,8 +487,12 @@ function main() {
 
     replacedContent = handleImageOverrides(processedConfig, replacedContent);
     replacedContent = handleRunnerActivation(processedConfig, replacedContent);
-    if (targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE) {
-      replacedContent = applyLegacyAbsentColdRebindProfile(processedConfig, replacedContent);
+    if (isLegacyColdRebindProfile(targetProfile)) {
+      replacedContent = applyLegacyColdRebindProfile(
+        processedConfig,
+        replacedContent,
+        targetProfile
+      );
     }
 
     utils.writeOutputFile(replacedContent, "", "hcce.yaml", outputPath);

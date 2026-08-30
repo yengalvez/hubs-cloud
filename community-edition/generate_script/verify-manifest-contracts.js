@@ -7,6 +7,7 @@ const {
   FORBIDDEN_PARENT_ENV,
   FORBIDDEN_RETICULUM_ENV,
   FORBIDDEN_RUNNER_ANNOTATIONS,
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
   LEGACY_ABSENT_COLD_REBIND_PROFILE,
   WRITER_DEPLOYMENTS,
   deploymentImageMap,
@@ -499,7 +500,11 @@ function verifyLegacyAbsentColdRebindInventory(resources) {
   return errors;
 }
 
-function verifyLegacyAbsentColdRebindProfile(resources) {
+function verifyLegacyColdRebindProfile(resources, targetProfile) {
+  if (![LEGACY_ABSENT_COLD_REBIND_PROFILE, LEGACY_ACTIVE_COLD_REBIND_PROFILE].includes(targetProfile)) {
+    return ["legacy cold-rebind target profile is invalid"];
+  }
+  const writersActive = targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE;
   const errors = verifyLegacyAbsentColdRebindInventory(resources);
   const namespaceResource = resources.find(resource =>
     resource?.apiVersion === "v1" && resource?.kind === "Namespace"
@@ -527,7 +532,7 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
     ]) ||
     typeof namespaceAnnotations.domain !== "string" || !namespaceAnnotations.domain ||
     typeof namespaceAnnotations.adm !== "string" || !namespaceAnnotations.adm ||
-    namespaceAnnotations["yenhubs.org/target-profile"] !== LEGACY_ABSENT_COLD_REBIND_PROFILE ||
+    namespaceAnnotations["yenhubs.org/target-profile"] !== targetProfile ||
     namespaceAnnotations["yenhubs.org/target-image-map-sha256"] !== imageMapSha256(images)
   ) {
     errors.push("legacy cold-rebind Namespace profile and exact image-map annotations must be intact");
@@ -543,7 +548,7 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
   }
   for (const deployment of deployments) {
     const expectedReplicas = WRITER_DEPLOYMENTS.includes(deployment.metadata.name)
-      ? 0
+      ? (writersActive ? 1 : 0)
       : deployment.metadata.name === "pgsql" ? 1 : null;
     if (expectedReplicas !== null && deployment.spec?.replicas !== expectedReplicas) {
       errors.push(`Deployment/${deployment.metadata.name} must use replicas=${expectedReplicas} in legacy cold-rebind`);
@@ -699,6 +704,14 @@ function verifyLegacyAbsentColdRebindProfile(resources) {
     errors.push("legacy cold-rebind target must contain exactly pgsql-pvc and ret-pvc");
   }
   return errors;
+}
+
+function verifyLegacyAbsentColdRebindProfile(resources) {
+  return verifyLegacyColdRebindProfile(resources, LEGACY_ABSENT_COLD_REBIND_PROFILE);
+}
+
+function verifyLegacyActiveColdRebindProfile(resources) {
+  return verifyLegacyColdRebindProfile(resources, LEGACY_ACTIVE_COLD_REBIND_PROFILE);
 }
 
 function verifyBotOrchestratorSecretEnv(container) {
@@ -1131,13 +1144,38 @@ function verifyBotImagePullSecret(resources, namespace) {
     const deployment = findExactResource(resources, "apps", "Deployment", namespace, "bot-orchestrator");
     const container = deployment?.spec?.template?.spec?.containers?.find(value => value?.name === "bot-orchestrator");
     const runnerImage = container?.env?.find(value => value?.name === "BOT_RUNNER_IMAGE")?.value;
-    verifyDockerConfigCredentials(encoded, [container?.image, runnerImage]);
+    const workloadImages = resources
+      .filter(resource => resource?.kind === "Deployment" && resource?.metadata?.namespace === namespace)
+      .flatMap(resource => resource.spec?.template?.spec?.containers || [])
+      .map(value => value?.image)
+      .filter(value => String(value || "").toLowerCase().startsWith("ghcr.io/"));
+    verifyDockerConfigCredentials(encoded, [...workloadImages, container?.image, runnerImage]);
   } catch (_error) {
     return [
-      "Secret/bot-images-pull Docker config must contain canonical credentials for both bot image registries"
+      "Secret/bot-images-pull Docker config must contain canonical credentials for every GHCR workload registry"
     ];
   }
   return [];
+}
+
+function verifyWorkloadImagePullSecrets(resources, namespace) {
+  const errors = [];
+  for (const deployment of resources.filter(resource =>
+    resource?.kind === "Deployment" && resource?.metadata?.namespace === namespace
+  )) {
+    const podSpec = deployment.spec?.template?.spec;
+    const usesGhcr = podSpec?.containers?.some(container =>
+      String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
+    );
+    const requiresPullSecret = usesGhcr || deployment.metadata?.name === "bot-orchestrator";
+    const expected = requiresPullSecret ? [{ name: "bot-images-pull" }] : undefined;
+    if (!exactStructuredValue(podSpec?.imagePullSecrets, expected)) {
+      errors.push(
+        `Deployment/${deployment.metadata?.name} must bind the pull Secret exactly when using GHCR`
+      );
+    }
+  }
+  return errors;
 }
 
 function expectedBotRunnerControlPlaneResources(
@@ -1423,7 +1461,7 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
     : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
 }
 
-const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "b6b46f6d9cfde523b231fddc6a1448722d0fe8836d269322ea4cc5710f568810";
+const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "32fdb20e835772493257ecc221797b06e749d1b4189b0dfd89db1e9932630f24";
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1708,6 +1746,7 @@ module.exports = {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyWorkloadImagePullSecrets,
   verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
   verifyBotRunnerDefaultDenyNetworkPolicy,
@@ -1719,6 +1758,8 @@ module.exports = {
   verifyManifestResourceInventory,
   verifyLegacyAbsentColdRebindInventory,
   verifyLegacyAbsentColdRebindProfile,
+  verifyLegacyActiveColdRebindProfile,
+  verifyLegacyColdRebindProfile,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
   verifyReticulumBotRunnerAuthorityContract

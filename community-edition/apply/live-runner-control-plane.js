@@ -62,6 +62,24 @@ function serverProjection(actual, expected) {
   for (const key of Object.keys(expected || {})) {
     if (!["apiVersion", "kind", "metadata"].includes(key)) projected[key] = actual?.[key];
   }
+  if (
+    expected?.kind === "Role" &&
+    Array.isArray(expected.rules) && expected.rules.length === 0 &&
+    actual?.rules == null
+  ) {
+    projected.rules = [];
+  }
+  if (expected?.kind === "NetworkPolicy" && projected.spec && expected?.spec) {
+    projected.spec = { ...projected.spec };
+    for (const key of ["ingress", "egress"]) {
+      if (
+        Array.isArray(expected.spec[key]) && expected.spec[key].length === 0 &&
+        actual?.spec?.[key] === undefined
+      ) {
+        projected.spec[key] = [];
+      }
+    }
+  }
   return projected;
 }
 

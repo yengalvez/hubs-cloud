@@ -11,6 +11,7 @@ const generatorPath = path.join(communityEditionDir, "generate_script/index.js")
 const verifierPath = path.join(communityEditionDir, "generate_script/verify-generated-manifest.js");
 const ciInput = YAML.parse(fs.readFileSync(path.join(communityEditionDir, "input-values.ci.yaml"), "utf8"));
 const legacyProfile = "cold-rebind-legacy-absent-v1";
+const legacyActiveProfile = "cold-rebind-legacy-active-v1";
 
 function runNode(script, env) {
   return spawnSync(process.execPath, [script], {
@@ -91,6 +92,51 @@ test("generator and verifier support dynamic and retained manual storage only", 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, expectedError);
   }
+});
+
+test("SMTP sender defaults to the hub domain and accepts an explicit verified address", () => {
+  for (const [name, smtpFromAddress, expectedAddress] of [
+    ["default", undefined, `noreply@${ciInput.HUB_DOMAIN}`],
+    ["verified-parent", "noreply@meta-hubs.org", "noreply@meta-hubs.org"]
+  ]) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `hcce-smtp-from-${name}-`));
+    const inputPath = path.join(directory, "input-values.yaml");
+    const outputPath = path.join(directory, "hcce.yaml");
+    const input = { ...ciInput };
+    if (smtpFromAddress) input.SMTP_FROM_ADDRESS = smtpFromAddress;
+    fs.writeFileSync(inputPath, YAML.stringify(input), { mode: 0o600 });
+
+    const generated = runNode(generatorPath, {
+      HCCE_INPUT_VALUES_PATH: inputPath,
+      HCCE_OUTPUT_PATH: outputPath
+    });
+    assert.equal(generated.status, 0, generated.stderr);
+
+    const documents = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8")).map(doc => doc.toJS());
+    const reticulum = documents.find(doc => doc.kind === "Deployment" && doc.metadata?.name === "reticulum");
+    assert.ok(reticulum, "reticulum Deployment must exist");
+    assert.deepEqual(
+      reticulum.spec.template.spec.containers[0].env.find(
+        entry => entry.name === "turkeyCfg_SMTP_FROM_ADDRESS"
+      ),
+      { name: "turkeyCfg_SMTP_FROM_ADDRESS", value: expectedAddress }
+    );
+  }
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-smtp-from-invalid-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  fs.writeFileSync(
+    inputPath,
+    YAML.stringify({ ...ciInput, SMTP_FROM_ADDRESS: "not-an-email" }),
+    { mode: 0o600 }
+  );
+  const rejected = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath
+  });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /SMTP_FROM_ADDRESS must be a valid email address/);
 });
 
 test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the default durable profile unchanged", () => {
@@ -303,7 +349,15 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   }
 
   const defaultOutputPath = path.join(directory, "hcce-default.yaml");
-  fs.writeFileSync(inputPath, YAML.stringify(ciInput), { mode: 0o600 });
+  const defaultInput = structuredClone(ciInput);
+  const ghcrDigest = suffix => `ghcr.io/yenhubs-test/${suffix}@sha256:${"a".repeat(64)}`;
+  defaultInput.OVERRIDE_HUBS_IMAGE = ghcrDigest("hubs");
+  defaultInput.OVERRIDE_BOT_ORCHESTRATOR_IMAGE = ghcrDigest("bot-orchestrator");
+  defaultInput.OVERRIDE_BOT_RUNNER_IMAGE = ghcrDigest("bot-runner");
+  defaultInput.BOT_IMAGE_PULL_CONFIG_JSON_BASE64 = Buffer.from(JSON.stringify({
+    auths: { "ghcr.io": { auth: Buffer.from("ci-user:ci-token").toString("base64") } }
+  })).toString("base64");
+  fs.writeFileSync(inputPath, YAML.stringify(defaultInput), { mode: 0o600 });
   const defaultGenerated = runNode(generatorPath, {
     HCCE_INPUT_VALUES_PATH: inputPath,
     HCCE_OUTPUT_PATH: defaultOutputPath
@@ -330,6 +384,94 @@ test("opt-in legacy cold-rebind profile is exact, fail-closed, and leaves the de
   ).spec.template.spec.containers[0];
   assert.equal(durableBotContainer.readinessProbe.httpGet.path, "/transport-ready");
   assert.equal(durableBotContainer.livenessProbe.httpGet.path, "/health");
+  for (const deployment of defaultResources.filter(resource => resource.kind === "Deployment")) {
+    const usesGhcr = deployment.spec.template.spec.containers.some(container =>
+      container.image.startsWith("ghcr.io/")
+    );
+    assert.deepEqual(
+      deployment.spec.template.spec.imagePullSecrets,
+      usesGhcr || deployment.metadata.name === "bot-orchestrator"
+        ? [{ name: "bot-images-pull" }]
+        : undefined,
+      `${deployment.metadata.name} must bind private registry auth exactly when required`
+    );
+  }
+
+  const missingWorkloadPullPath = path.join(directory, "hcce-missing-workload-pull.yaml");
+  const missingWorkloadPullResources = structuredClone(defaultResources);
+  const ghcrWorkload = missingWorkloadPullResources.find(resource =>
+    resource.kind === "Deployment" &&
+    resource.metadata.name !== "bot-orchestrator" &&
+    resource.spec.template.spec.containers.some(container => container.image.startsWith("ghcr.io/"))
+  );
+  assert.ok(ghcrWorkload, "fixture must contain a non-bot GHCR workload");
+  delete ghcrWorkload.spec.template.spec.imagePullSecrets;
+  fs.writeFileSync(
+    missingWorkloadPullPath,
+    missingWorkloadPullResources.map(resource => YAML.stringify(resource)).join("---\n")
+  );
+  const missingWorkloadPullVerified = runNode(verifierPath, {
+    HCCE_MANIFEST_PATH: missingWorkloadPullPath
+  });
+  assert.notEqual(missingWorkloadPullVerified.status, 0);
+  assert.match(missingWorkloadPullVerified.stderr, /must bind the pull Secret exactly when using GHCR/);
+});
+
+test("legacy-active cold-rebind keeps the audited legacy contract and activates exactly five writers", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-legacy-active-"));
+  const inputPath = path.join(directory, "input-values.yaml");
+  const outputPath = path.join(directory, "hcce.yaml");
+  const dockerConfig = JSON.parse(
+    Buffer.from(ciInput.BOT_IMAGE_PULL_CONFIG_JSON_BASE64, "base64").toString("utf8")
+  );
+  dockerConfig.auths["ghcr.io"] = {
+    auth: Buffer.from("ci-user:ci-token", "utf8").toString("base64")
+  };
+  fs.writeFileSync(inputPath, YAML.stringify({
+    ...ciInput,
+    OVERRIDE_BOT_RUNNER_IMAGE: "No",
+    OVERRIDE_HUBS_IMAGE: `ghcr.io/yengalvez/hubs@sha256:${"8".repeat(64)}`,
+    BOT_IMAGE_PULL_CONFIG_JSON_BASE64: Buffer.from(
+      JSON.stringify(dockerConfig), "utf8"
+    ).toString("base64")
+  }), { mode: 0o600 });
+
+  const generated = runNode(generatorPath, {
+    HCCE_INPUT_VALUES_PATH: inputPath,
+    HCCE_OUTPUT_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyActiveProfile
+  });
+  assert.equal(generated.status, 0, generated.stderr);
+  const verified = runNode(verifierPath, {
+    HCCE_MANIFEST_PATH: outputPath,
+    HCCE_TARGET_PROFILE: legacyActiveProfile
+  });
+  assert.equal(verified.status, 0, verified.stderr);
+  assert.match(verified.stdout, new RegExp(legacyActiveProfile));
+
+  const resources = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8"))
+    .map(document => document.toJS())
+    .filter(Boolean);
+  const namespace = resources.find(resource => resource.kind === "Namespace");
+  assert.equal(namespace.metadata.annotations["yenhubs.org/target-profile"], legacyActiveProfile);
+  const deployments = resources.filter(resource => resource.kind === "Deployment");
+  for (const name of ["reticulum", "pgbouncer", "pgbouncer-t", "bot-orchestrator", "coturn"]) {
+    assert.equal(
+      deployments.find(deployment => deployment.metadata.name === name).spec.replicas,
+      1,
+      `${name} must be active`
+    );
+  }
+  assert.equal(resources.some(resource => resource.metadata?.name === "hcce-bot-runners"), false);
+  assert.equal(resources.some(resource => resource.kind === "ValidatingAdmissionPolicy"), false);
+  const parent = deployments.find(deployment => deployment.metadata.name === "bot-orchestrator");
+  assert.equal(parent.spec.template.spec.automountServiceAccountToken, false);
+  assert.equal(parent.spec.template.spec.containers[0].env.some(
+    entry => entry.name === "BOT_ACCESS_KEY"
+  ), true);
+  assert.equal(parent.spec.template.spec.containers[0].env.some(
+    entry => entry.name === "BOT_ORCHESTRATOR_ACCESS_KEY"
+  ), false);
 });
 
 test("generator requires four independent access-key trust domains", () => {

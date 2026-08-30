@@ -1,6 +1,10 @@
 const fs = require("node:fs");
 const { isDeepStrictEqual } = require("node:util");
 const YAML = require("yaml");
+const {
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
+  LEGACY_ABSENT_COLD_REBIND_PROFILE
+} = require("../generate_script/legacy-absent-cold-rebind-profile");
 
 const RUNNER_NAMESPACE = "hcce-bot-runners";
 const ADMISSION_POLICY_NAME = "bot-runner-pods.yenhubs.org";
@@ -98,7 +102,7 @@ function activationPlanFromResources(resources) {
     resource?.kind === "ValidatingAdmissionPolicyBinding" &&
     resource?.metadata?.name === RECOVERY_OPERATION_FENCE_POLICY_NAME
   );
-  const legacyAbsent =
+  const legacyCompatible =
     activationPhase === undefined &&
     recoveryPhase === undefined &&
     recoveryEpoch === undefined &&
@@ -110,25 +114,35 @@ function activationPlanFromResources(resources) {
       CUTOVER_JOURNAL_POLICY_NAME,
       RECOVERY_OPERATION_FENCE_POLICY_NAME
     ].some(name => resources.some(resource => resource?.metadata?.name === name));
-  if (legacyAbsent) {
+  if (legacyCompatible) {
     const consumers = RECOVERY_CONSUMERS.map(name => findDeployment(resources, name));
     const pgsql = findDeployment(resources, "pgsql");
+    const namespaceResource = resources.find(resource =>
+      resource?.apiVersion === "v1" &&
+      resource?.kind === "Namespace" &&
+      resource?.metadata?.name === deployment?.metadata?.namespace
+    );
+    const targetProfile = namespaceResource?.metadata?.annotations?.["yenhubs.org/target-profile"];
+    const legacyActive = targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE;
+    const legacyAbsent = targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE;
     if (
+      (!legacyAbsent && !legacyActive) ||
       consumers.some(consumer =>
         !consumer ||
         consumer?.metadata?.namespace !== deployment?.metadata?.namespace ||
-        consumer?.spec?.replicas !== 0
+        consumer?.spec?.replicas !== (legacyActive ? 1 : 0)
       ) ||
       !pgsql ||
       pgsql?.metadata?.namespace !== deployment?.metadata?.namespace ||
       pgsql?.spec?.replicas !== 1
     ) {
-      throw new Error("generated_manifest_legacy_absent_recovery_boundary_invalid");
+      throw new Error("generated_manifest_legacy_recovery_boundary_invalid");
     }
+    const phase = legacyActive ? "legacy-active" : "legacy-absent";
     return {
-      activationPhase: "legacy-absent",
-      recoveryPhase: "legacy-absent",
-      recoveryEpoch: "legacy-absent",
+      activationPhase: phase,
+      recoveryPhase: phase,
+      recoveryEpoch: phase,
       resources
     };
   }
@@ -161,7 +175,7 @@ function activationPlanFromResources(resources) {
       scope: "Namespaced"
     }) ||
     !parentFenceExpressions.includes("request.operation != 'DELETE'") ||
-    !parentFenceExpressions.includes("request.subResource != 'scale'") ||
+    !parentFenceExpressions.includes("!has(request.subResource) || request.subResource != 'scale'") ||
     !parentFenceExpressions.includes(FENCE_PROTOCOL_ANNOTATION) ||
     !parentFenceExpressions.includes(FENCE_PROTOCOL_VALUE) ||
     !exactParentFenceBinding(parentFenceBinding, deployment.metadata.namespace) ||
@@ -181,7 +195,7 @@ function activationPlanFromResources(resources) {
         scope: "Namespaced"
       }
     ]) ||
-    !runnerProtocolExpressions.includes("request.subResource == ''") ||
+    !runnerProtocolExpressions.includes("!has(request.subResource) || request.subResource == ''") ||
     !runnerProtocolExpressions.includes("yenhubs.org/runner-protocol") ||
     !runnerProtocolExpressions.includes("durable-fence-v2") ||
     !exactRunnerProtocolBinding(runnerProtocolBinding) ||
@@ -831,6 +845,85 @@ function exactDeploymentDesiredState(live, normalizedExpected) {
     isDeepStrictEqual(live?.spec, normalizedExpected?.spec);
 }
 
+function retryServerNormalizedDeployment({
+  initialLive,
+  normalize,
+  readCurrent,
+  maxAttempts = 4
+}) {
+  if (
+    typeof normalize !== "function" ||
+    typeof readCurrent !== "function" ||
+    !Number.isInteger(maxAttempts) ||
+    maxAttempts < 1 ||
+    maxAttempts > 8
+  ) {
+    throw new Error("deployment_normalization_retry_arguments_invalid");
+  }
+  const identity = {
+    apiVersion: initialLive?.apiVersion,
+    kind: initialLive?.kind,
+    name: initialLive?.metadata?.name,
+    namespace: initialLive?.metadata?.namespace,
+    uid: initialLive?.metadata?.uid
+  };
+  if (
+    identity.apiVersion !== "apps/v1" ||
+    identity.kind !== "Deployment" ||
+    typeof identity.name !== "string" || !identity.name ||
+    typeof identity.namespace !== "string" || !identity.namespace ||
+    typeof identity.uid !== "string" || !identity.uid
+  ) return null;
+
+  let live = initialLive;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const normalized = normalize(live);
+    if (normalized !== null) return { live, normalized };
+    if (attempt + 1 >= maxAttempts) break;
+    const current = readCurrent();
+    if (
+      current?.apiVersion !== identity.apiVersion ||
+      current?.kind !== identity.kind ||
+      current?.metadata?.name !== identity.name ||
+      current?.metadata?.namespace !== identity.namespace ||
+      current?.metadata?.uid !== identity.uid
+    ) return null;
+    live = current;
+  }
+  return null;
+}
+
+function exactDeploymentTargetSnapshot(deploymentList, snapshot) {
+  if (
+    deploymentList?.apiVersion !== "apps/v1" ||
+    deploymentList?.kind !== "DeploymentList" ||
+    !Array.isArray(deploymentList.items) ||
+    !Array.isArray(snapshot) ||
+    snapshot.length === 0 ||
+    deploymentList.items.length !== snapshot.length
+  ) return false;
+  const typedItems = deploymentList.items.map(deployment => {
+    if (
+      (deployment?.apiVersion !== undefined && deployment.apiVersion !== "apps/v1") ||
+      (deployment?.kind !== undefined && deployment.kind !== "Deployment")
+    ) return null;
+    return { ...deployment, apiVersion: "apps/v1", kind: "Deployment" };
+  });
+  if (typedItems.some(deployment => deployment === null)) return false;
+  const liveByName = new Map(
+    typedItems.map(deployment => [deployment?.metadata?.name, deployment])
+  );
+  if (liveByName.size !== snapshot.length) return false;
+  return snapshot.every(expected => {
+    const live = liveByName.get(expected?.metadata?.name);
+    if (
+      typeof live?.metadata?.uid !== "string" || !live.metadata.uid ||
+      (expected.uid !== null && live.metadata.uid !== expected.uid)
+    ) return false;
+    return exactDeploymentDesiredState(live, expected);
+  });
+}
+
 function exactFoundationalNamespace(live, expected) {
   const expectedAnnotations = expected?.metadata?.annotations || {};
   const expectedLabels = expected?.metadata?.labels || {};
@@ -922,6 +1015,7 @@ module.exports = {
   exactRunnerProtocolBinding,
   fenceAwareDeploymentImages,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
   manifestResources,
@@ -942,6 +1036,7 @@ module.exports = {
   recoveryConsumersAreQuiesced,
   recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   runBestEffortFenceSteps,
   uniqueRunnerPods
 };

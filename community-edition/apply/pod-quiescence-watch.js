@@ -89,11 +89,18 @@ function namespacedWatchObjectIsValid(object, expectedKind, expectedApiVersion, 
     namespacedResourceMetadataIsValid(object, namespace);
 }
 
-function podListRawPath(namespace) {
-  if (typeof namespace !== "string" || !namespace) {
+function podListRawPath(namespace, labelSelector = "") {
+  if (
+    typeof namespace !== "string" || !namespace ||
+    typeof labelSelector !== "string" ||
+    /[\u0000-\u001f\u007f]/u.test(labelSelector)
+  ) {
     throw new Error("pod_list_path_input_invalid");
   }
-  return `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
+  const base = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
+  return labelSelector
+    ? `${base}?labelSelector=${encodeURIComponent(labelSelector)}`
+    : base;
 }
 
 function replicaSetListRawPath(namespace) {
@@ -101,6 +108,13 @@ function replicaSetListRawPath(namespace) {
     throw new Error("replicaset_list_path_input_invalid");
   }
   return `/apis/apps/v1/namespaces/${encodeURIComponent(namespace)}/replicasets`;
+}
+
+function deploymentListRawPath(namespace) {
+  if (typeof namespace !== "string" || !namespace) {
+    throw new Error("deployment_list_path_input_invalid");
+  }
+  return `/apis/apps/v1/namespaces/${encodeURIComponent(namespace)}/deployments`;
 }
 
 function podWatchRawPath(namespace, resourceVersion, timeoutSeconds = 600) {
@@ -283,6 +297,7 @@ module.exports = {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemIsValid,
   namespacedListItemWithTypeMeta,
