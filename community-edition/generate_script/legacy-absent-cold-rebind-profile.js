@@ -2,6 +2,11 @@ const crypto = require("node:crypto");
 const YAML = require("yaml");
 
 const LEGACY_ABSENT_COLD_REBIND_PROFILE = "cold-rebind-legacy-absent-v1";
+const LEGACY_ACTIVE_COLD_REBIND_PROFILE = "cold-rebind-legacy-active-v1";
+const LEGACY_COLD_REBIND_PROFILES = new Set([
+  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE
+]);
 
 const DURABLE_ADMISSION_NAMES = new Set([
   "bot-runner-pods.yenhubs.org",
@@ -69,10 +74,14 @@ const FORBIDDEN_RUNNER_ANNOTATIONS = new Set([
 function targetProfileFromEnvironment(environment = process.env) {
   if (!Object.prototype.hasOwnProperty.call(environment, "HCCE_TARGET_PROFILE")) return null;
   const requested = String(environment.HCCE_TARGET_PROFILE || "").trim();
-  if (requested === LEGACY_ABSENT_COLD_REBIND_PROFILE) return requested;
+  if (LEGACY_COLD_REBIND_PROFILES.has(requested)) return requested;
   throw new Error(
-    `HCCE_TARGET_PROFILE must be unset or exactly ${LEGACY_ABSENT_COLD_REBIND_PROFILE}`
+    "HCCE_TARGET_PROFILE must be unset or exactly one audited legacy cold-rebind profile"
   );
+}
+
+function isLegacyColdRebindProfile(profile) {
+  return LEGACY_COLD_REBIND_PROFILES.has(profile);
 }
 
 function apiGroup(apiVersion) {
@@ -238,7 +247,11 @@ function transformReticulumConfig(configMap) {
   configMap.data["config.toml.template"] = text;
 }
 
-function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
+function applyLegacyColdRebindProfile(processedConfig, renderedManifest, targetProfile) {
+  if (!isLegacyColdRebindProfile(targetProfile)) {
+    throw new Error("legacy cold-rebind target profile is invalid");
+  }
+  const writersActive = targetProfile === LEGACY_ACTIVE_COLD_REBIND_PROFILE;
   const documents = YAML.parseAllDocuments(renderedManifest);
   const parseErrors = documents.flatMap(document => document.errors);
   if (parseErrors.length > 0) throw parseErrors[0];
@@ -290,7 +303,7 @@ function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
   namespaceResource.metadata.annotations = {
     domain: processedConfig.HUB_DOMAIN,
     adm: processedConfig.ADM_EMAIL,
-    "yenhubs.org/target-profile": LEGACY_ABSENT_COLD_REBIND_PROFILE,
+    "yenhubs.org/target-profile": targetProfile,
     "yenhubs.org/target-image-map-sha256": imageMapSha256(expectedImages)
   };
 
@@ -307,7 +320,9 @@ function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
     const deployment = findResource(resources, "Deployment", namespace, deploymentName);
     removeRunnerAnnotations(deployment.metadata);
     removeRunnerAnnotations(deployment.spec?.template?.metadata);
-    if (WRITER_DEPLOYMENTS.includes(deploymentName)) deployment.spec.replicas = 0;
+    if (WRITER_DEPLOYMENTS.includes(deploymentName)) {
+      deployment.spec.replicas = writersActive ? 1 : 0;
+    }
     if (deploymentName === "pgsql") deployment.spec.replicas = 1;
     const usesGhcr = deployment.spec.template.spec.containers.some(container =>
       String(container?.image || "").toLowerCase().startsWith("ghcr.io/")
@@ -371,16 +386,36 @@ function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
     .join("---\n");
 }
 
+function applyLegacyAbsentColdRebindProfile(processedConfig, renderedManifest) {
+  return applyLegacyColdRebindProfile(
+    processedConfig,
+    renderedManifest,
+    LEGACY_ABSENT_COLD_REBIND_PROFILE
+  );
+}
+
+function applyLegacyActiveColdRebindProfile(processedConfig, renderedManifest) {
+  return applyLegacyColdRebindProfile(
+    processedConfig,
+    renderedManifest,
+    LEGACY_ACTIVE_COLD_REBIND_PROFILE
+  );
+}
+
 module.exports = {
   DEPLOYMENT_CONTAINERS,
   FORBIDDEN_PARENT_ENV,
   FORBIDDEN_RETICULUM_ENV,
   FORBIDDEN_RUNNER_ANNOTATIONS,
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
   LEGACY_ABSENT_COLD_REBIND_PROFILE,
   WRITER_DEPLOYMENTS,
+  applyLegacyActiveColdRebindProfile,
   applyLegacyAbsentColdRebindProfile,
+  applyLegacyColdRebindProfile,
   deploymentImageMap,
   imageMapSha256,
+  isLegacyColdRebindProfile,
   isLegacyRemovedIdentity,
   targetProfileFromEnvironment
 };

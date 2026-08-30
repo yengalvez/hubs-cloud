@@ -13,6 +13,7 @@ const {
   verifyBotOrchestratorSecurityContext,
   verifyBotOrchestratorSecretEnv,
   verifyBotImagePullSecret,
+  verifyWorkloadImagePullSecrets,
   verifyBotRunnerAdmissionResources,
   verifyBotRunnerControlPlaneResources,
   verifyBotRunnerDefaultDenyNetworkPolicy,
@@ -20,7 +21,7 @@ const {
   verifyBotRunnerRecoveryContract,
   verifyExactIngressPolicy,
   verifyHaproxyClusterRole,
-  verifyLegacyAbsentColdRebindProfile,
+  verifyLegacyColdRebindProfile,
   verifyManifestResourceIdentities,
   verifyManifestResourceInventory,
   verifyNoYamlIndirections,
@@ -28,7 +29,7 @@ const {
   verifyReticulumBotRunnerAuthorityContract
 } = require("./verify-manifest-contracts");
 const {
-  LEGACY_ABSENT_COLD_REBIND_PROFILE,
+  isLegacyColdRebindProfile,
   targetProfileFromEnvironment
 } = require("./legacy-absent-cold-rebind-profile");
 
@@ -163,10 +164,10 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   });
   verifyNoYamlIndirections(documents, YAML).forEach(fail);
   const resources = documents.map(document => document.toJS()).filter(Boolean);
-  const legacyProfile = targetProfile === LEGACY_ABSENT_COLD_REBIND_PROFILE;
+  const legacyProfile = isLegacyColdRebindProfile(targetProfile);
   verifyManifestResourceIdentities(resources).forEach(fail);
   if (legacyProfile) {
-    verifyLegacyAbsentColdRebindProfile(resources).forEach(fail);
+    verifyLegacyColdRebindProfile(resources, targetProfile).forEach(fail);
   } else {
     verifyManifestResourceInventory(resources).forEach(fail);
   }
@@ -761,6 +762,7 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
 
   if (!legacyProfile) {
     verifyBotImagePullSecret(resources, manifestNamespace).forEach(fail);
+    verifyWorkloadImagePullSecrets(resources, manifestNamespace).forEach(fail);
     verifyBotRunnerControlPlaneResources(resources, manifestNamespace).forEach(fail);
     verifyBotRunnerAdmissionResources(resources, manifestNamespace).forEach(fail);
     const botRunnerDefaultDeny = findExactResource(
@@ -922,7 +924,7 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   if (!errors.length) {
     console.log(
       legacyProfile
-        ? `Manifest verification passed for ${LEGACY_ABSENT_COLD_REBIND_PROFILE} (${resources.length} resources).`
+        ? `Manifest verification passed for ${targetProfile} (${resources.length} resources).`
         : `Manifest verification passed (${resources.length} resources).`
     );
   }

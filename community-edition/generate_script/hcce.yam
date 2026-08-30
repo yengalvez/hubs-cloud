@@ -384,7 +384,7 @@ data:
     # ^^^ has to be string or elixir throws (ArgumentError) argument error:erlang.byte_size(#), but why
 
     [ret."Elixir.RetWeb.Email"]
-    from = "noreply@<HUB_DOMAIN>"
+    from = "<SMTP_FROM_ADDRESS>"
 
     [ret."Elixir.Ret.Mailer"]
     relay = "<SMTP_SERVER>"
@@ -613,6 +613,8 @@ spec:
             secretKeyRef:
               name: configs
               key: SMTP_PASS
+        - name: turkeyCfg_SMTP_FROM_ADDRESS
+          value: "$SMTP_FROM_ADDRESS"
         - name: turkeyCfg_ADM_EMAIL
           valueFrom:
             secretKeyRef:
@@ -1150,7 +1152,7 @@ spec:
     expression: >-
       variables.activationPhase != 'bootstrap' && variables.recoveryPhase != 'restore-fence'
   validations:
-  - expression: request.subResource == ''
+  - expression: "!has(request.subResource) || request.subResource == ''"
     message: runner Pod eviction, executable access, ephemeral-container injection and in-place resize subresources are disabled; use the guarded stop or break-glass workflow
     reason: Forbidden
   - expression: >-
@@ -1662,7 +1664,7 @@ spec:
   - name: recoveryOperator
     expression: "!request.userInfo.username.startsWith('system:serviceaccount:')"
   validations:
-  - expression: request.subResource == ''
+  - expression: "!has(request.subResource) || request.subResource == ''"
     message: durable runner identities cannot be evicted, entered, proxied, injected with ephemeral containers or resized through Pod subresources
     reason: Forbidden
   - expression: >-
@@ -1784,7 +1786,7 @@ spec:
   - expression: request.operation != 'DELETE'
     message: the fence-aware bot-orchestrator Deployment is durable; DELETE and Deployment DeleteCollection require explicit break-glass removal of this policy
     reason: Forbidden
-  - expression: request.subResource != 'scale'
+  - expression: "!has(request.subResource) || request.subResource != 'scale'"
     message: the fence-aware bot-orchestrator replica count cannot be changed through deployments/scale; regenerate and apply the complete guarded manifest
     reason: Forbidden
   - expression: >-
@@ -1813,7 +1815,7 @@ spec:
        has(object.spec.template.spec.containers[0].env) &&
        object.spec.template.spec.containers[0].env.exists(e, e.name == 'BOT_RUNNER_IMAGE' && has(e.value) && e.value == '$BOT_RUNNER_IMAGE') &&
        object.spec.template.spec.containers[0].env.exists(e, e.name == 'BOT_RUNNER_RECOVERY_EPOCH' && has(e.value) && e.value == object.metadata.annotations['yenhubs.org/bot-runner-recovery-epoch']) &&
-       object.spec.template.spec.containers[0].env.exists(e, e.name == 'KUBERNETES_RUNNER_NAMESPACE' && has(e.value) && e.value == 'hcce-bot-runners'))
+       object.spec.template.spec.containers[0].env.exists(e, e.name == 'RUNNER_POD_NAMESPACE' && has(e.value) && e.value == 'hcce-bot-runners'))
     message: bot-orchestrator CREATE and UPDATE require the durable intent-fence protocol and exact isolated-parent shape
     reason: Forbidden
 ---

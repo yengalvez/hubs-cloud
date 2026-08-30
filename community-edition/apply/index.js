@@ -5,6 +5,10 @@ const path = require("node:path");
 const { isDeepStrictEqual } = require("node:util");
 const utils = require("../utils");
 const {
+  LEGACY_ACTIVE_COLD_REBIND_PROFILE,
+  LEGACY_ABSENT_COLD_REBIND_PROFILE
+} = require("../generate_script/legacy-absent-cold-rebind-profile");
+const {
   KubernetesRunnerManager,
   guardPodDocumentForIdentity,
   requireCompletePodList
@@ -46,6 +50,7 @@ const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemWithTypeMeta,
   namespacedWatchObjectIsValid,
@@ -93,6 +98,7 @@ const {
   exactRecoveryOperationFencePolicy,
   exactRunnerProtocolBinding,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationLock,
   parentFencePolicyProtectsLiveOrTarget,
@@ -102,6 +108,7 @@ const {
   recoveryConsumersAreQuiesced,
   recoveryOperationFenceNamespaceSelector,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   readActivationPlanText,
   runBestEffortFenceSteps,
   uniqueRunnerPods
@@ -115,6 +122,7 @@ const config = utils.readConfig(process.env.HCCE_INPUT_VALUES_PATH);
 const parentNamespace = config.Namespace;
 const plan = readActivationPlanText(manifestText);
 const legacyAbsentGreenfield = plan.activationPhase === "legacy-absent";
+const legacyActiveCompatibility = plan.activationPhase === "legacy-active";
 const waitTimeoutMs = 180_000;
 const stablePodAbsenceWindowMs = 61_000;
 const stableWatchAcquisitionTimeoutMs = waitTimeoutMs * 3;
@@ -127,6 +135,8 @@ const leaseHeartbeatPath = path.resolve(__dirname, "operation-lease.js");
 const manifestVerifierPath = path.resolve(__dirname, "../generate_script/verify-generated-manifest.js");
 let operationLeaseGuard = null;
 let failClosedRefenceRequired = false;
+let legacyFailClosedRefenceRequired = false;
+let legacyCompatibilityFenceSnapshot = null;
 let recoveryLockIdentityGuard = null;
 let pristineLegacyCutoverRequired = false;
 let cutoverPreflightClassification = null;
@@ -387,7 +397,9 @@ function liveParentIsQuiesced() {
   const deployment = kubectlJson([
     "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
   ]);
-  const pods = kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]);
+  const pods = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+  ]);
   return parentIsQuiesced(deployment, pods);
 }
 
@@ -811,9 +823,11 @@ function pristineLegacyCutoverLiveEvidence() {
     liveDeployment,
     runnerNamespace,
     isolatedResources,
-    parentPodList: kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]),
+    parentPodList: kubectlJson([
+      "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+    ]),
     parentReplicaSetList: kubectlJson([
-      "-n", parentNamespace, "get", "replicasets", "-o", "json"
+      "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
     ]),
     authority
   };
@@ -1013,7 +1027,7 @@ function verifyPristineLegacyCutoverPreflight() {
 
 function verifyLegacyAbsentGreenfieldPreflight(commandMode) {
   if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
-  if (process.env.HCCE_TARGET_PROFILE !== "cold-rebind-legacy-absent-v1") {
+  if (process.env.HCCE_TARGET_PROFILE !== LEGACY_ABSENT_COLD_REBIND_PROFILE) {
     throw new Error("legacy_absent_greenfield_profile_required");
   }
   const observedNamespace = kubectlAbsentOnlyJson([
@@ -1022,7 +1036,7 @@ function verifyLegacyAbsentGreenfieldPreflight(commandMode) {
   if (observedNamespace !== null) {
     if (
       observedNamespace?.metadata?.annotations?.["yenhubs.org/target-profile"] !==
-        "cold-rebind-legacy-absent-v1" ||
+        LEGACY_ABSENT_COLD_REBIND_PROFILE ||
       observedNamespace?.metadata?.deletionTimestamp !== undefined
     ) {
       throw new Error("legacy_absent_greenfield_existing_namespace_not_exact");
@@ -1045,6 +1059,79 @@ function verifyLegacyAbsentGreenfieldPreflight(commandMode) {
   ], "legacy-absent-runner-namespace-preflight");
   if (observedRunnerNamespace !== null) {
     throw new Error("legacy_absent_greenfield_requires_absent_runner_namespace");
+  }
+}
+
+function legacyDurableControlPlaneIsAbsent() {
+  const namespaced = [
+    ["serviceaccount", parentNamespace, "bot-orchestrator"],
+    ["role", parentNamespace, "bot-orchestrator-runner-pods"],
+    ["rolebinding", parentNamespace, "bot-orchestrator-runner-pods"],
+    ["networkpolicy", parentNamespace, "bot-orchestrator-ingress"]
+  ];
+  for (const [kind, namespace, name] of namespaced) {
+    if (kubectlAbsentOnlyJson([
+      "-n", namespace, "get", kind, name, "-o", "json"
+    ], `legacy-active-${kind}-${name}`) !== null) return false;
+  }
+  for (const name of [
+    ADMISSION_POLICY_NAME,
+    PARENT_FENCE_POLICY_NAME,
+    RUNNER_PROTOCOL_POLICY_NAME,
+    CUTOVER_JOURNAL_POLICY_NAME,
+    RECOVERY_OPERATION_FENCE_POLICY_NAME
+  ]) {
+    if (kubectlAbsentOnlyJson([
+      "get", "validatingadmissionpolicy", name, "-o", "json"
+    ], `legacy-active-policy-${name}`) !== null) return false;
+    if (kubectlAbsentOnlyJson([
+      "get", "validatingadmissionpolicybinding", name, "-o", "json"
+    ], `legacy-active-binding-${name}`) !== null) return false;
+  }
+  return kubectlAbsentOnlyJson([
+    "get", "namespace", RUNNER_NAMESPACE, "-o", "json"
+  ], "legacy-active-runner-namespace") === null;
+}
+
+function verifyLegacyActiveCompatibilityPreflight(commandMode) {
+  if (commandMode !== "apply") throw new Error("legacy_active_compatibility_apply_only");
+  if (process.env.HCCE_TARGET_PROFILE !== LEGACY_ACTIVE_COLD_REBIND_PROFILE) {
+    throw new Error("legacy_active_compatibility_profile_required");
+  }
+  const observedNamespace = kubectlAbsentOnlyJson([
+    "get", "namespace", parentNamespace, "-o", "json"
+  ], "legacy-active-parent-namespace-preflight");
+  if (
+    observedNamespace === null ||
+    observedNamespace?.metadata?.deletionTimestamp !== undefined ||
+    ![
+      LEGACY_ABSENT_COLD_REBIND_PROFILE,
+      LEGACY_ACTIVE_COLD_REBIND_PROFILE
+    ].includes(observedNamespace?.metadata?.annotations?.["yenhubs.org/target-profile"])
+  ) {
+    throw new Error("legacy_active_compatibility_requires_exact_legacy_namespace");
+  }
+  if (!legacyDurableControlPlaneIsAbsent() || recoveryLockExists()) {
+    throw new Error("legacy_active_compatibility_requires_absent_durable_control_plane");
+  }
+  const liveDeployments = legacyAbsentDeploymentList();
+  const expectedNames = expectedDeployments().map(resource => resource.metadata.name).sort();
+  const actualNames = Array.isArray(liveDeployments?.items)
+    ? liveDeployments.items.map(deployment => deployment?.metadata?.name).sort()
+    : [];
+  const consumerReplicas = (liveDeployments?.items || [])
+    .filter(deployment => RECOVERY_CONSUMERS.includes(deployment?.metadata?.name))
+    .map(deployment => Number(deployment?.spec?.replicas || 0));
+  const allStopped = consumerReplicas.length === RECOVERY_CONSUMERS.length &&
+    consumerReplicas.every(replicas => replicas === 0);
+  const allActive = consumerReplicas.length === RECOVERY_CONSUMERS.length &&
+    consumerReplicas.every(replicas => replicas === 1);
+  if (
+    liveDeployments?.kind !== "DeploymentList" ||
+    JSON.stringify(actualNames) !== JSON.stringify(expectedNames) ||
+    (!allStopped && !allActive)
+  ) {
+    throw new Error("legacy_active_compatibility_live_runtime_not_exact_boundary");
   }
 }
 
@@ -1176,9 +1263,12 @@ function liveEffectiveRbacIsExact(runnerAuthorityEnabled) {
 }
 
 function listPodsBySelector(namespace, selector) {
-  const args = ["-n", namespace, "get", "pods"];
-  if (selector) args.push("-l", selector);
-  args.push("-o", "json");
+  const args = [
+    "--request-timeout=30s",
+    "get",
+    "--raw",
+    podListRawPath(namespace, selector || "")
+  ];
   const result = runLeaseGuardedRead(() => spawnSync(
     "kubectl",
     contextArgs(args),
@@ -1651,13 +1741,13 @@ async function waitForStableFirstCutoverParentAbsence(label, finalPredicate) {
 
 function liveRecoveryConsumersAreQuiesced() {
   const deployments = kubectlJson([
-    "-n", parentNamespace, "get", "deployments", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
   ]);
   const pods = kubectlJson([
-    "-n", parentNamespace, "get", "pods", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
   ]);
   const replicaSets = kubectlJson([
-    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
   ]);
   return recoveryConsumersAreQuiesced(deployments, pods, replicaSets);
 }
@@ -1728,9 +1818,16 @@ function admissionProbePod() {
 
 function admissionDenialProbe() {
   const username = `system:serviceaccount:${parentNamespace}:bot-orchestrator`;
+  // RBAC is verified independently by exactRunnerAuthority(). Give this
+  // server-side dry-run an authorization-only group so it always reaches the
+  // admission policy; the policy must still reject the bare ServiceAccount
+  // principal because it has no bound parent Pod identity extras.
   const result = runLeaseGuardedRead(() => spawnSync(
     "kubectl",
-    contextArgs(["create", "--dry-run=server", "-f", "-", `--as=${username}`]),
+    contextArgs([
+      "create", "--dry-run=server", "-f", "-", `--as=${username}`,
+      "--as-group=system:masters"
+    ]),
     {
       input: JSON.stringify(admissionProbePod()),
       encoding: "utf8",
@@ -1975,7 +2072,8 @@ function applyResource(resource) {
     resource?.metadata?.namespace === parentNamespace &&
     resource?.metadata?.name === "bot-orchestrator" &&
     Number(resource?.spec?.replicas || 0) > 0;
-  if (startsRunnerParent && !exactRunnerAuthority(true)) {
+  const startsDurableRunnerParent = startsRunnerParent && !legacyActiveCompatibility;
+  if (startsDurableRunnerParent && !exactRunnerAuthority(true)) {
     throw new Error("effective_rbac_not_exact_before_parent_start");
   }
   const applied = runLeaseGuardedMutation(
@@ -1991,7 +2089,7 @@ function applyResource(resource) {
     )
   );
   if (applied.status !== 0) throw new Error(`kubectl_resource_apply_failed:${applied.status}`);
-  if (startsRunnerParent && !exactRunnerAuthority(true)) {
+  if (startsDurableRunnerParent && !exactRunnerAuthority(true)) {
     throw new Error("effective_rbac_changed_during_parent_start");
   }
 }
@@ -2163,9 +2261,11 @@ function liveFirstCutoverParentIsQuiesced(journal) {
     "-n", parentNamespace, "get", "deployment", "bot-orchestrator", "-o", "json"
   ], "first-cutover-parent-deployment-quiescence");
   if (deployment === null) return false;
-  const pods = kubectlJson(["-n", parentNamespace, "get", "pods", "-o", "json"]);
+  const pods = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", podListRawPath(parentNamespace)
+  ]);
   const replicaSets = kubectlJson([
-    "-n", parentNamespace, "get", "replicasets", "-o", "json"
+    "--request-timeout=30s", "get", "--raw", replicaSetListRawPath(parentNamespace)
   ]);
   return parentIsQuiesced(
     deployment,
@@ -2346,9 +2446,70 @@ function expectedDeployments() {
   );
 }
 
+function normalizedDeploymentTargetSnapshot() {
+  const liveDeployments = legacyAbsentDeploymentList();
+  if (
+    liveDeployments?.apiVersion !== "apps/v1" ||
+    liveDeployments?.kind !== "DeploymentList" ||
+    !Array.isArray(liveDeployments.items)
+  ) throw new Error("deployment_target_snapshot_live_inventory_invalid");
+  const typedItems = liveDeployments.items.map(deployment =>
+    namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+  );
+  if (typedItems.some(deployment => deployment === null)) {
+    throw new Error("deployment_target_snapshot_live_item_invalid");
+  }
+  const liveByName = new Map(
+    typedItems.map(deployment => [deployment.metadata.name, deployment])
+  );
+  const expected = expectedDeployments();
+  if (
+    liveByName.size > expected.length ||
+    [...liveByName.keys()].some(name => !expected.some(resource => resource.metadata.name === name))
+  ) throw new Error("deployment_target_snapshot_live_inventory_unexpected");
+
+  return expected.map(deployment => {
+    const initialLive = liveByName.get(deployment.metadata.name) || null;
+    const pair = initialLive === null
+      ? {
+          live: null,
+          normalized: serverNormalizedCutoverDeployment(deployment, null)
+        }
+      : stableServerNormalizedDeployment(deployment, initialLive);
+    if (pair === null || pair.normalized === null) {
+      throw new Error(`deployment_target_snapshot_normalization_failed:${deployment.metadata.name}`);
+    }
+    return {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      uid: pair.live?.metadata?.uid || null,
+      metadata: {
+        name: deployment.metadata.name,
+        namespace: parentNamespace,
+        annotations: pair.normalized?.metadata?.annotations || {},
+        labels: pair.normalized?.metadata?.labels || {}
+      },
+      spec: pair.normalized.spec
+    };
+  });
+}
+
+function legacyCompatibilityFenceTargetSnapshot(activeSnapshot) {
+  return activeSnapshot.map(deployment => {
+    const fenced = structuredClone(deployment);
+    if (RECOVERY_CONSUMERS.includes(fenced.metadata.name)) fenced.spec.replicas = 0;
+    return fenced;
+  });
+}
+
+function liveDeploymentsMatchTargetSnapshot(snapshot) {
+  assertOperationLeaseProcessHealthy();
+  return exactDeploymentTargetSnapshot(legacyAbsentDeploymentList(), snapshot);
+}
+
 function legacyAbsentDeploymentList() {
   return kubectlJson([
-    "get", "--raw", `/apis/apps/v1/namespaces/${parentNamespace}/deployments`
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
   ]);
 }
 
@@ -2356,14 +2517,19 @@ function legacyAbsentDeploymentsMatchGeneratedDesiredState() {
   assertOperationLeaseProcessHealthy();
   const deployments = legacyAbsentDeploymentList();
   const expected = expectedDeployments();
+  const typedItems = Array.isArray(deployments?.items)
+    ? deployments.items.map(deployment =>
+        namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+      )
+    : [];
   const liveByName = new Map(
-    Array.isArray(deployments?.items)
-      ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
-      : []
+    typedItems.filter(deployment => deployment !== null)
+      .map(deployment => [deployment.metadata.name, deployment])
   );
   if (
     deployments?.apiVersion !== "apps/v1" ||
     deployments?.kind !== "DeploymentList" ||
+    typedItems.some(deployment => deployment === null) ||
     liveByName.size !== expected.length ||
     expected.some(deployment => !liveByName.has(deployment.metadata.name))
   ) {
@@ -2371,8 +2537,8 @@ function legacyAbsentDeploymentsMatchGeneratedDesiredState() {
   }
   return expected.every(deployment => {
     const live = liveByName.get(deployment.metadata.name);
-    const normalized = serverNormalizedDeployment(deployment, live);
-    return normalized !== null && exactDeploymentDesiredState(live, normalized);
+    const pair = stableServerNormalizedDeployment(deployment, live);
+    return pair !== null && exactDeploymentDesiredState(pair.live, pair.normalized);
   });
 }
 
@@ -2417,6 +2583,16 @@ function serverNormalizedDeployment(expected, live) {
   }
 }
 
+function stableServerNormalizedDeployment(expected, initialLive) {
+  return retryServerNormalizedDeployment({
+    initialLive,
+    normalize: live => serverNormalizedDeployment(expected, live),
+    readCurrent: () => kubectlAbsentOnlyJson([
+      "-n", parentNamespace, "get", "deployment", expected.metadata.name, "-o", "json"
+    ], `deployment-normalization-${expected.metadata.name}`)
+  });
+}
+
 function serverNormalizedCutoverDeployment(expected, live) {
   if (live !== null) return serverNormalizedDeployment(expected, live);
   const candidate = structuredClone(expected);
@@ -2436,14 +2612,21 @@ function serverNormalizedCutoverDeployment(expected, live) {
 
 function deploymentsMatchExpectedDesiredState(expected, { exactInventory = false } = {}) {
   assertOperationLeaseProcessHealthy();
-  const deployments = kubectlJson(["-n", parentNamespace, "get", "deployment", "-o", "json"]);
+  const deployments = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
+  ]);
+  const typedItems = Array.isArray(deployments?.items)
+    ? deployments.items.map(deployment =>
+        namespacedListItemWithTypeMeta(deployment, "Deployment", "apps/v1", parentNamespace)
+      )
+    : [];
   const liveByName = new Map(
-    Array.isArray(deployments?.items)
-      ? deployments.items.map(deployment => [deployment?.metadata?.name, deployment])
-      : []
+    typedItems.filter(deployment => deployment !== null)
+      .map(deployment => [deployment.metadata.name, deployment])
   );
   if (
     deployments?.kind !== "DeploymentList" ||
+    typedItems.some(deployment => deployment === null) ||
     (exactInventory && liveByName.size !== expected.length) ||
     expected.some(deployment => !liveByName.has(deployment.metadata.name))
   ) {
@@ -2451,8 +2634,8 @@ function deploymentsMatchExpectedDesiredState(expected, { exactInventory = false
   }
   return expected.every(deployment => {
     const live = liveByName.get(deployment.metadata.name);
-    const normalized = serverNormalizedDeployment(deployment, live);
-    return normalized !== null && exactDeploymentDesiredState(live, normalized);
+    const pair = stableServerNormalizedDeployment(deployment, live);
+    return pair !== null && exactDeploymentDesiredState(pair.live, pair.normalized);
   });
 }
 
@@ -2461,7 +2644,9 @@ function deploymentsMatchGeneratedDesiredState() {
 }
 
 function deploymentsAreReady() {
-  const deployments = kubectlJson(["-n", parentNamespace, "get", "deployment", "-o", "json"]);
+  const deployments = kubectlJson([
+    "--request-timeout=30s", "get", "--raw", deploymentListRawPath(parentNamespace)
+  ]);
   const expectedNames = expectedDeployments().map(resource => resource.metadata.name).sort();
   const actualNames = Array.isArray(deployments?.items)
     ? deployments.items.map(deployment => deployment?.metadata?.name).sort()
@@ -2578,6 +2763,56 @@ function recoveryFenceDeployments() {
 
 function recoveryFenceDeploymentsAreExact() {
   return deploymentsMatchExpectedDesiredState(recoveryFenceDeployments());
+}
+
+function legacyCompatibilityFenceDeployments() {
+  return RECOVERY_CONSUMERS.map(name => {
+    const deployment = plan.resources.find(resource =>
+      resource?.apiVersion === "apps/v1" &&
+      resource?.kind === "Deployment" &&
+      resource?.metadata?.namespace === parentNamespace &&
+      resource?.metadata?.name === name
+    );
+    if (!deployment) throw new Error(`legacy_compatibility_deployment_missing:${name}`);
+    return { ...deployment, spec: { ...deployment.spec, replicas: 0 } };
+  });
+}
+
+function legacyCompatibilityFenceDeploymentsAreExact() {
+  return deploymentsMatchExpectedDesiredState(legacyCompatibilityFenceDeployments());
+}
+
+async function refenceLegacyCompatibilityRuntime() {
+  if (legacyCompatibilityFenceSnapshot === null) {
+    throw new Error("legacy_compatibility_refence_snapshot_missing");
+  }
+  const failures = await retryBestEffortFenceAttempt(
+    async () => runBestEffortFenceSteps(
+      legacyCompatibilityFenceDeployments().map(deployment => ({
+        name: `deployment:${deployment.metadata.name}`,
+        action: async () => applyResource(deployment)
+      }))
+    ),
+    { maxAttempts: 3, beforeRetry: async () => sleep(1_000) }
+  );
+  try {
+    await waitFor("legacy_compatibility_consumers_quiesced", liveRecoveryConsumersAreQuiesced);
+  } catch (_error) {
+    failures.push("recovery-consumers-quiesced");
+  }
+  try {
+    await waitFor(
+      "legacy_compatibility_deployment_fences_exact",
+      () => liveDeploymentsMatchTargetSnapshot(legacyCompatibilityFenceSnapshot)
+    );
+  } catch (_error) {
+    failures.push("deployment-fences-exact");
+  }
+  if (failures.length > 0) {
+    throw new Error(`legacy_compatibility_refence_incomplete:${[...new Set(failures)].join(",")}`);
+  }
+  legacyFailClosedRefenceRequired = false;
+  legacyCompatibilityFenceSnapshot = null;
 }
 
 function activeStagingFenceDeployments() {
@@ -2772,6 +3007,28 @@ async function emergencyRefenceAfterFailedActivation() {
     await refenceActiveReapplyForStaging();
   }
   failClosedRefenceRequired = false;
+}
+
+async function applyLegacyActiveCompatibility() {
+  if (recoveryLockExists() || !legacyDurableControlPlaneIsAbsent()) {
+    throw new Error("legacy_active_compatibility_precondition_changed_under_lease");
+  }
+  verifyLegacyActiveCompatibilityPreflight("apply");
+  const targetSnapshot = normalizedDeploymentTargetSnapshot();
+  legacyCompatibilityFenceSnapshot = legacyCompatibilityFenceTargetSnapshot(targetSnapshot);
+  legacyFailClosedRefenceRequired = true;
+  applyManifest();
+  await waitFor(
+    "legacy_active_deployments_exact",
+    () => liveDeploymentsMatchTargetSnapshot(targetSnapshot)
+  );
+  await waitFor("legacy_active_deployments_ready", legacyAbsentDeploymentsAreReady);
+  if (recoveryLockExists() || !legacyDurableControlPlaneIsAbsent()) {
+    throw new Error("legacy_active_compatibility_control_plane_appeared");
+  }
+  legacyFailClosedRefenceRequired = false;
+  legacyCompatibilityFenceSnapshot = null;
+  console.log("legacy-active compatibility gate passed; all deployments ready without durable bot migration");
 }
 
 async function applyRestoreFence() {
@@ -3009,6 +3266,18 @@ async function applyActiveTransition(mode) {
     await waitFor("parent_quiesced_before_activation", liveParentIsQuiesced);
     await waitFor("runner_runtime_quiesced_before_activation", runnerRuntimeIsQuiesced);
     await waitFor("runner_admission_observed_before_activation", liveAdmissionIsObserved);
+    await prepareExactPreGrantControlPlane();
+    await waitForAdmissionDenialProbe();
+    await runWithStablePodAbsence(
+      "stable_pod_absence_before_active_runner_authority",
+      async () => {
+        if (recoveryLockExists()) {
+          throw new Error("active_lock_appeared_before_runner_grant");
+        }
+        applyResource(runnerRole());
+      },
+      async () => neutralizeRunnerAuthority()
+    );
     await waitFor("runner_control_plane_exact_before_activation", liveRunnerControlPlaneIsExact);
     if (!exactRunnerAuthority(true)) throw new Error("admission_runner_rbac_not_effective");
     await waitForAdmissionDenialProbe();
@@ -3078,11 +3347,19 @@ async function applyUnderOperationLease(commandMode) {
   if (legacyAbsentGreenfield) {
     if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
     if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_present");
+    const targetSnapshot = normalizedDeploymentTargetSnapshot();
     applyManifest();
-    await waitFor("legacy_absent_deployments_exact", legacyAbsentDeploymentsMatchGeneratedDesiredState);
+    await waitFor(
+      "legacy_absent_deployments_exact",
+      () => liveDeploymentsMatchTargetSnapshot(targetSnapshot)
+    );
     await waitFor("legacy_absent_deployments_ready", legacyAbsentDeploymentsAreReady);
     if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_appeared");
     console.log("legacy-absent greenfield gate passed; five consumers remain stopped");
+    return;
+  }
+  if (legacyActiveCompatibility) {
+    await applyLegacyActiveCompatibility();
     return;
   }
   verifyCutoverPreflightUnderLease();
@@ -3134,6 +3411,9 @@ async function main() {
   if (legacyAbsentGreenfield) {
     verifyLegacyAbsentGreenfieldPreflight(commandMode);
     cutoverPreflightClassification = "legacy-absent-greenfield";
+  } else if (legacyActiveCompatibility) {
+    verifyLegacyActiveCompatibilityPreflight(commandMode);
+    cutoverPreflightClassification = "legacy-active-compatibility";
   } else if (commandMode === "emergency-refence") {
     verifyEmergencyRefencePreflight();
   } else {
@@ -3156,7 +3436,20 @@ async function main() {
     await applyUnderOperationLease(commandMode);
   } catch (error) {
     failure = error;
-    if (failClosedRefenceRequired) {
+    if (legacyFailClosedRefenceRequired) {
+      try {
+        if (operationLeaseGuard?.heartbeatLost) {
+          await recoverOperationLeaseForFailClosedCleanup();
+        } else {
+          assertOperationLeaseHeld();
+        }
+        await refenceLegacyCompatibilityRuntime();
+      } catch (refenceError) {
+        failure = new Error(
+          `operation_lease_lost_and_legacy_refence_failed:${error.message}:${refenceError.message}`
+        );
+      }
+    } else if (failClosedRefenceRequired) {
       try {
         if (operationLeaseGuard?.heartbeatLost) {
           await recoverOperationLeaseForFailClosedCleanup();

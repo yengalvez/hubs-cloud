@@ -14,6 +14,7 @@ const {
   decideApplyMode,
   exactAdmissionBinding,
   exactDeploymentDesiredState,
+  exactDeploymentTargetSnapshot,
   exactFoundationalNamespace,
   exactRecoveryOperationFenceBinding,
   exactRecoveryOperationFencePolicy,
@@ -25,12 +26,14 @@ const {
   podIsRecoveryConsumer,
   recoveryConsumersAreQuiesced,
   retryBestEffortFenceAttempt,
+  retryServerNormalizedDeployment,
   runBestEffortFenceSteps
 } = require("./runner-activation");
 const {
   PodWatchEvidence,
   ReplicaSetWatchEvidence,
   completeWatchListResourceVersion,
+  deploymentListRawPath,
   forbiddenPod,
   namespacedListItemIsValid,
   namespacedListItemWithTypeMeta,
@@ -675,8 +678,17 @@ test("stable window resets with injected time and never treats a gap as continuo
 test("event-backed pod evidence catches transient Pods and fails closed on resourceVersion 410", () => {
   assert.equal(podListRawPath("hcce"), "/api/v1/namespaces/hcce/pods");
   assert.equal(
+    podListRawPath("hcce-bot-runners", "yenhubs.org/managed-by=bot-orchestrator"),
+    "/api/v1/namespaces/hcce-bot-runners/pods?labelSelector=" +
+      "yenhubs.org%2Fmanaged-by%3Dbot-orchestrator"
+  );
+  assert.equal(
     replicaSetListRawPath("hcce"),
     "/apis/apps/v1/namespaces/hcce/replicasets"
+  );
+  assert.equal(
+    deploymentListRawPath("hcce"),
+    "/apis/apps/v1/namespaces/hcce/deployments"
   );
   const completePods = {
     apiVersion: "v1",
@@ -1074,6 +1086,88 @@ test("reentry requires the server-normalized Deployment spec, image, and recover
   }
 });
 
+test("server normalization retries a stale status resourceVersion but rejects replacement", () => {
+  const live = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      uid: "deployment-uid",
+      resourceVersion: "10"
+    },
+    spec: { replicas: 1 }
+  };
+  const refreshed = structuredClone(live);
+  refreshed.metadata.resourceVersion = "11";
+  const normalized = structuredClone(refreshed);
+  const attempts = [];
+  const accepted = retryServerNormalizedDeployment({
+    initialLive: live,
+    normalize: current => {
+      attempts.push(current.metadata.resourceVersion);
+      return current.metadata.resourceVersion === "11" ? normalized : null;
+    },
+    readCurrent: () => refreshed
+  });
+  assert.deepEqual(attempts, ["10", "11"]);
+  assert.equal(accepted.live, refreshed);
+  assert.equal(accepted.normalized, normalized);
+
+  const replacement = structuredClone(refreshed);
+  replacement.metadata.uid = "replacement-uid";
+  assert.equal(retryServerNormalizedDeployment({
+    initialLive: live,
+    normalize: () => null,
+    readCurrent: () => replacement
+  }), null);
+});
+
+test("deployment target snapshots ignore status churn but reject spec drift and replacement", () => {
+  const expected = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    uid: "deployment-uid",
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      labels: { app: "reticulum" },
+      annotations: { "yenhubs.org/target": "legacy-active" }
+    },
+    spec: { replicas: 1, selector: { matchLabels: { app: "reticulum" } } }
+  };
+  const live = {
+    metadata: {
+      name: "reticulum",
+      namespace: "hcce",
+      uid: "deployment-uid",
+      resourceVersion: "50",
+      labels: { app: "reticulum" },
+      annotations: {
+        "yenhubs.org/target": "legacy-active",
+        "deployment.kubernetes.io/revision": "9"
+      }
+    },
+    spec: structuredClone(expected.spec),
+    status: { observedGeneration: 4, readyReplicas: 0 }
+  };
+  const list = { apiVersion: "apps/v1", kind: "DeploymentList", items: [live] };
+  assert.equal(exactDeploymentTargetSnapshot(list, [expected]), true);
+
+  const statusChurn = structuredClone(list);
+  statusChurn.items[0].metadata.resourceVersion = "51";
+  statusChurn.items[0].status.readyReplicas = 1;
+  assert.equal(exactDeploymentTargetSnapshot(statusChurn, [expected]), true);
+
+  const specDrift = structuredClone(statusChurn);
+  specDrift.items[0].spec.replicas = 0;
+  assert.equal(exactDeploymentTargetSnapshot(specDrift, [expected]), false);
+
+  const replacement = structuredClone(statusChurn);
+  replacement.items[0].metadata.uid = "replacement-uid";
+  assert.equal(exactDeploymentTargetSnapshot(replacement, [expected]), false);
+});
+
 test("clean-install Lease bootstrap accepts only the exact active parent Namespace", () => {
   const expected = {
     apiVersion: "v1",
@@ -1193,6 +1287,18 @@ test("watch handoffs require an in-band causal bookmark and retain the proven su
   );
   assert.match(rawLists, /get", "--raw", podListRawPath\(namespace\)/);
   assert.match(rawLists, /completeWatchListResourceVersion\(podList, "PodList", "v1"\)/);
+
+  const cutoverPreflight = source.slice(
+    source.indexOf("function pristineLegacyCutoverLiveEvidence"),
+    source.indexOf("function verifyPristineLegacyCutoverEvidence")
+  );
+  assert.match(
+    cutoverPreflight,
+    /get", "--raw", podListRawPath\(parentNamespace\)/
+  );
+  assert.doesNotMatch(source, /"get", "pods", "-o", "json"/);
+  assert.doesNotMatch(source, /"get", "replicasets", "-o", "json"/);
+  assert.doesNotMatch(source, /"get", "deployment", "-o", "json"/);
 
   const successor = source.slice(
     source.indexOf("function startBookmarkedSuccessorWatch"),
@@ -1334,6 +1440,65 @@ test("active reapply with control-plane drift refences and requires the staged b
     liveRecovery: "active",
     lockState: null
   }), "active");
+});
+
+test("admission to active reconciles the target control plane while authority is inert", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const branch = source.slice(
+    source.indexOf("} else if (live.activationPhase === \"admission\""),
+    source.indexOf("} else {", source.indexOf("} else if (live.activationPhase === \"admission\""))
+  );
+  const prepare = branch.indexOf("await prepareExactPreGrantControlPlane()");
+  const stable = branch.indexOf('"stable_pod_absence_before_active_runner_authority"');
+  const grant = branch.indexOf("applyResource(runnerRole())");
+  const exact = branch.indexOf(
+    'waitFor("runner_control_plane_exact_before_activation", liveRunnerControlPlaneIsExact)'
+  );
+  assert.ok(prepare >= 0 && prepare < stable);
+  assert.ok(stable < grant && grant < exact);
+  assert.match(branch, /active_lock_appeared_before_runner_grant/);
+  assert.match(branch, /async \(\) => neutralizeRunnerAuthority\(\)/);
+  assert.match(branch, /await waitForAdmissionDenialProbe\(\)/);
+});
+
+test("the admission canary reaches policy evaluation independently of RBAC propagation", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  const probe = source.slice(
+    source.indexOf("function admissionDenialProbe()"),
+    source.indexOf("function recoveryOperationParentWriterProbePod()")
+  );
+  assert.match(probe, /--as-group=system:masters/);
+  assert.match(probe, /exactRunnerAuthority\(\)/);
+  assert.match(probe, /phase-bound parent or shape-limited recovery operator principal/);
+  assert.match(probe, /!diagnostic\.includes\("violates PodSecurity"\)/);
+});
+
+test("legacy-active compatibility is gated, exact, and fail-closed without durable bot migration", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "index.js"), "utf8");
+  assert.match(source, /LEGACY_ACTIVE_COLD_REBIND_PROFILE/);
+  assert.match(source, /function verifyLegacyActiveCompatibilityPreflight\(/);
+  assert.match(source, /legacyDurableControlPlaneIsAbsent\(\)/);
+  assert.match(source, /legacy_active_compatibility_live_runtime_not_exact_boundary/);
+  assert.match(source, /async function applyLegacyActiveCompatibility\(\)/);
+  assert.match(source, /legacy_active_deployments_exact/);
+  assert.match(source, /legacy_active_deployments_ready/);
+  assert.match(
+    source,
+    /const startsDurableRunnerParent = startsRunnerParent && !legacyActiveCompatibility;/
+  );
+  assert.match(source, /if \(startsDurableRunnerParent && !exactRunnerAuthority\(true\)\)/);
+  assert.match(source, /async function refenceLegacyCompatibilityRuntime\(\)/);
+  assert.match(source, /legacy_compatibility_consumers_quiesced/);
+  assert.match(source, /legacy_compatibility_deployment_fences_exact/);
+  assert.match(source, /legacy_compatibility_refence_incomplete/);
+  const mainCatch = source.slice(
+    source.indexOf("let failure = null;"),
+    source.indexOf("try {\n    await releaseOperationLeaseGuard();")
+  );
+  assert.ok(
+    mainCatch.indexOf("legacyFailClosedRefenceRequired") <
+      mainCatch.indexOf("failClosedRefenceRequired")
+  );
 });
 
 test("live control-plane exactness rejects terminating, owner-bound, finalized, and immutable Secrets", () => {
