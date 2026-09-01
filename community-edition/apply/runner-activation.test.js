@@ -1074,6 +1074,13 @@ test("reentry requires the server-normalized Deployment spec, image, and recover
     }
   };
   assert.equal(exactDeploymentDesiredState(structuredClone(expected), expected), true);
+  const rolloutRestarted = structuredClone(expected);
+  rolloutRestarted.spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] =
+    "2026-09-01T12:34:56Z";
+  assert.equal(exactDeploymentDesiredState(rolloutRestarted, expected), true);
+  const unknownPodAnnotation = structuredClone(expected);
+  unknownPodAnnotation.spec.template.metadata.annotations["example.invalid/drift"] = "true";
+  assert.equal(exactDeploymentDesiredState(unknownPodAnnotation, expected), false);
   for (const mutate of [
     value => { value.spec.template.spec.containers[0].image = "ghcr.io/example/bot@sha256:def"; },
     value => { value.spec.template.metadata.annotations["yenhubs.org/bot-runner-recovery-epoch"] = sourceEpoch; },

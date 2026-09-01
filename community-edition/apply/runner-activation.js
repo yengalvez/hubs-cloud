@@ -836,13 +836,23 @@ function exactDeploymentDesiredState(live, normalizedExpected) {
   const expectedLabels = normalizedExpected?.metadata?.labels || {};
   const liveAnnotations = live?.metadata?.annotations || {};
   const liveLabels = live?.metadata?.labels || {};
+  const comparableSpec = value => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const spec = structuredClone(value);
+    const podAnnotations = spec?.template?.metadata?.annotations;
+    if (podAnnotations && typeof podAnnotations === "object" && !Array.isArray(podAnnotations)) {
+      delete podAnnotations["kubectl.kubernetes.io/restartedAt"];
+      if (Object.keys(podAnnotations).length === 0) delete spec.template.metadata.annotations;
+    }
+    return spec;
+  };
   return live?.apiVersion === "apps/v1" &&
     live?.kind === "Deployment" &&
     live?.metadata?.name === normalizedExpected?.metadata?.name &&
     live?.metadata?.namespace === normalizedExpected?.metadata?.namespace &&
     Object.entries(expectedAnnotations).every(([key, value]) => liveAnnotations[key] === value) &&
     Object.entries(expectedLabels).every(([key, value]) => liveLabels[key] === value) &&
-    isDeepStrictEqual(live?.spec, normalizedExpected?.spec);
+    isDeepStrictEqual(comparableSpec(live?.spec), comparableSpec(normalizedExpected?.spec));
 }
 
 function retryServerNormalizedDeployment({
