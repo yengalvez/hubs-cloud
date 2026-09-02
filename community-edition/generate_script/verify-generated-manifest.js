@@ -26,7 +26,8 @@ const {
   verifyManifestResourceInventory,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
-  verifyReticulumBotRunnerAuthorityContract
+  verifyReticulumBotRunnerAuthorityContract,
+  verifyReticulumStorageSecurityContext
 } = require("./verify-manifest-contracts");
 const {
   isLegacyColdRebindProfile,
@@ -204,6 +205,7 @@ if (!stdinMode && !fs.existsSync(manifestPath)) {
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
     container => container.name === "reticulum"
   );
+  verifyReticulumStorageSecurityContext(reticulum?.spec?.template?.spec).forEach(fail);
   const reticulumEnv = Array.isArray(reticulumContainer?.env) ? reticulumContainer.env : [];
   const runtimeConfig = retConfig?.data?.["config.toml.template"] || "";
   const runtimePlaceholders = [...runtimeConfig.matchAll(/<([A-Z][A-Z0-9_]*)>/g)].map(match => match[1]);

@@ -125,6 +125,11 @@ const BOT_ORCHESTRATOR_SECURITY_CONTEXT = Object.freeze({
   seccompProfile: Object.freeze({ type: "RuntimeDefault" })
 });
 
+const RETICULUM_STORAGE_POD_SECURITY_CONTEXT = Object.freeze({
+  fsGroup: 1000,
+  fsGroupChangePolicy: "Always"
+});
+
 const BOT_ORCHESTRATOR_RUNTIME_ENV = Object.freeze({
   RUNNER_AUTOSTART: "true",
   RUNNER_BACKEND: "ghost",
@@ -654,6 +659,9 @@ function verifyLegacyColdRebindProfile(resources, targetProfile) {
   }
 
   const reticulum = findExactResource(resources, "apps", "Deployment", namespace, "reticulum");
+  verifyReticulumStorageSecurityContext(reticulum?.spec?.template?.spec).forEach(error => {
+    errors.push(error);
+  });
   const reticulumContainer = reticulum?.spec?.template?.spec?.containers?.find(
     container => container.name === "reticulum"
   );
@@ -765,6 +773,18 @@ function verifyBotOrchestratorSecurityContext(container) {
     : [
         "bot-orchestrator securityContext must exactly match the audited non-root, " +
         "read-only, no-escalation, drop-ALL and RuntimeDefault contract"
+      ];
+}
+
+function verifyReticulumStorageSecurityContext(podSpec) {
+  return exactStructuredValue(
+    podSpec && podSpec.securityContext,
+    RETICULUM_STORAGE_POD_SECURITY_CONTEXT
+  )
+    ? []
+    : [
+        "reticulum pod securityContext must exactly enforce fsGroup=1000 and " +
+        "fsGroupChangePolicy=Always for durable ret-pvc writes"
       ];
 }
 
@@ -1725,6 +1745,7 @@ module.exports = {
   BOT_ORCHESTRATOR_ALLOWED_ENV_NAMES,
   BOT_ORCHESTRATOR_RUNTIME_ENV,
   BOT_ORCHESTRATOR_SECURITY_CONTEXT,
+  RETICULUM_STORAGE_POD_SECURITY_CONTEXT,
   BOT_RUNNER_ADMISSION_TEMPLATE_SHA256,
   EXPECTED_API_VERSION_BY_GROUP,
   HAPROXY_CLUSTER_ROLE,
@@ -1762,5 +1783,6 @@ module.exports = {
   verifyLegacyColdRebindProfile,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
-  verifyReticulumBotRunnerAuthorityContract
+  verifyReticulumBotRunnerAuthorityContract,
+  verifyReticulumStorageSecurityContext
 };

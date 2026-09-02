@@ -47,6 +47,28 @@ test("generator and verifier support dynamic and retained manual storage only", 
     const verified = runNode(verifierPath, { HCCE_MANIFEST_PATH: outputPath });
     assert.equal(verified.status, 0, verified.stderr);
     assert.match(verified.stdout, new RegExp(`\\(${expectedResources} resources\\)`));
+
+    const resources = YAML.parseAllDocuments(fs.readFileSync(outputPath, "utf8"))
+      .map(document => document.toJS())
+      .filter(Boolean);
+    const reticulum = resources.find(
+      resource => resource.kind === "Deployment" && resource.metadata?.name === "reticulum"
+    );
+    assert.deepEqual(reticulum.spec.template.spec.securityContext, {
+      fsGroup: 1000,
+      fsGroupChangePolicy: "Always"
+    });
+
+    if (storageClass === "do-block-storage") {
+      delete reticulum.spec.template.spec.securityContext.fsGroupChangePolicy;
+      fs.writeFileSync(
+        outputPath,
+        resources.map(resource => YAML.stringify(resource)).join("---\n")
+      );
+      const rejectedPermissions = runNode(verifierPath, { HCCE_MANIFEST_PATH: outputPath });
+      assert.notEqual(rejectedPermissions.status, 0);
+      assert.match(rejectedPermissions.stderr, /fsGroup=1000.*fsGroupChangePolicy=Always/);
+    }
   }
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "hcce-storage-disabled-"));
