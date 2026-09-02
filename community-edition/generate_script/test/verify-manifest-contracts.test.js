@@ -30,7 +30,8 @@ const {
   verifyManifestResourceInventory,
   verifyNoYamlIndirections,
   verifyNoReticulumHorizontalPodAutoscaler,
-  verifyReticulumBotRunnerAuthorityContract
+  verifyReticulumBotRunnerAuthorityContract,
+  verifyReticulumStorageSecurityContext
 } = require("../verify-manifest-contracts");
 
 function validContainer() {
@@ -266,6 +267,27 @@ test("requires the exact fail-closed bot securityContext", () => {
     const container = validBotContainer();
     mutate(container);
     assert.notDeepEqual(verifyBotOrchestratorSecurityContext(container), []);
+  }
+});
+
+test("requires the exact Reticulum storage fsGroup contract", () => {
+  const validPodSpec = {
+    securityContext: {
+      fsGroup: 1000,
+      fsGroupChangePolicy: "Always"
+    }
+  };
+  assert.deepEqual(verifyReticulumStorageSecurityContext(validPodSpec), []);
+
+  for (const mutate of [
+    podSpec => { delete podSpec.securityContext; },
+    podSpec => { podSpec.securityContext.fsGroup = 1001; },
+    podSpec => { podSpec.securityContext.fsGroupChangePolicy = "OnRootMismatch"; },
+    podSpec => { podSpec.securityContext.supplementalGroups = [1000]; }
+  ]) {
+    const podSpec = clone(validPodSpec);
+    mutate(podSpec);
+    assert.notDeepEqual(verifyReticulumStorageSecurityContext(podSpec), []);
   }
 });
 

@@ -493,6 +493,9 @@ spec:
         yenhubs.org/db-credential-checksum: "$DB_CREDENTIAL_CHECKSUM"
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: Always
       volumes:
       - name: storage
         hostPath:
