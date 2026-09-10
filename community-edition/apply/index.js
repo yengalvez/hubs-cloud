@@ -4,6 +4,7 @@ const { readFileSync } = require("node:fs");
 const path = require("node:path");
 const { isDeepStrictEqual } = require("node:util");
 const utils = require("../utils");
+const { verifyClientImageOnly } = require("./client-image-only");
 const {
   LEGACY_ACTIVE_COLD_REBIND_PROFILE,
   LEGACY_ABSENT_COLD_REBIND_PROFILE
@@ -131,6 +132,8 @@ const watchServerTimeoutSeconds = 600;
 const watchProcessGraceSeconds = 10;
 const maxWatchBufferBytes = 4 * 1024 * 1024;
 const kubectlContext = String(process.env.KUBECTL_CONTEXT || "");
+const clientImageOnlyCheck = process.env.HCCE_APPLY_PROFILE === "client-image-only-check";
+const clientImageOnly = clientImageOnlyCheck || process.env.HCCE_APPLY_PROFILE === "client-image-only";
 const leaseHeartbeatPath = path.resolve(__dirname, "operation-lease.js");
 const manifestVerifierPath = path.resolve(__dirname, "../generate_script/verify-generated-manifest.js");
 let operationLeaseGuard = null;
@@ -340,6 +343,7 @@ async function ensureFoundationalNamespaceForLease() {
   const expected = foundationalNamespaceResource();
   let live = kubectlOptionalJson(["get", "namespace", parentNamespace, "-o", "json"]);
   if (live === null) {
+    if (clientImageOnly) throw new Error("client_image_only_namespace_disappeared");
     const applied = spawnSync(
       "kubectl",
       contextArgs(["--request-timeout=30s", "apply", "-f", "-"]),
@@ -2421,6 +2425,35 @@ async function prepareExactPreGrantControlPlane() {
 }
 
 function applyManifest() {
+  if (clientImageOnly) {
+    const { imagePatch: patch, namespacePatch } = prepareClientImageOnlyPatch();
+    const result = runLeaseGuardedMutation(assertOperationLeaseHeld, () => spawnSync(
+      "kubectl", contextArgs(["--request-timeout=30s", "-n", parentNamespace,
+        "patch", "deployment", "hubs", "--type=json", "-p", JSON.stringify(patch), "-o", "name"]),
+      { stdio: ["ignore", "pipe", "pipe"], timeout: MUTATION_TIMEOUT_MS }
+    ));
+    if (result.status !== 0) throw new Error("client_image_only_CAS_failed");
+    const observed = kubectlJson(["-n", parentNamespace, "get", "deployment", "hubs", "-o", "json"]);
+    if (observed?.metadata?.uid !== patch[0].value ||
+        observed?.spec?.template?.spec?.containers?.[0]?.image !== process.env.HCCE_CLIENT_TO_IMAGE) {
+      throw new Error("client_image_only_readback_failed");
+    }
+    if (namespacePatch) {
+      const result = runLeaseGuardedMutation(assertOperationLeaseHeld, () => spawnSync(
+        "kubectl", contextArgs(["--request-timeout=30s", "patch", "namespace", parentNamespace,
+          "--type=json", "-p", JSON.stringify(namespacePatch), "-o", "name"]),
+        { stdio: ["ignore", "pipe", "pipe"], timeout: MUTATION_TIMEOUT_MS }
+      ));
+      if (result.status !== 0) throw new Error("client_image_changed_namespace_binding_CAS_failed");
+      const namespace = kubectlJson(["get", "namespace", parentNamespace, "-o", "json"]);
+      if (namespace?.metadata?.uid !== namespacePatch[0].value ||
+          namespace?.metadata?.annotations?.["yenhubs.org/target-image-map-sha256"] !== namespacePatch[3].value) {
+        throw new Error("client_image_changed_namespace_binding_readback_failed");
+      }
+    }
+    console.log("client image and derived inventory binding changed with UID/resourceVersion preconditions");
+    return;
+  }
   applyResourcesSequentially(plan.resources, resource => {
     if (
       resource?.apiVersion === "admissionregistration.k8s.io/v1" &&
@@ -2436,6 +2469,76 @@ function applyManifest() {
     }
     applyResource(resource);
   });
+}
+
+function requireClientImageOnlyActiveRuntime() {
+  if (!clientImageOnly) return;
+  if (plan.recoveryPhase !== (legacyActiveCompatibility ? "legacy-active" : "active") ||
+      !["active", "legacy-active"].includes(plan.activationPhase) || recoveryLockExists()) {
+    throw new Error("client_image_only_requires_active_runtime");
+  }
+  const namespace = kubectlAbsentOnlyJson(["get", "namespace", parentNamespace, "-o", "json"],
+    "client-image-only-namespace");
+  if (!namespace?.metadata?.uid || namespace.metadata.deletionTimestamp) {
+    throw new Error("client_image_only_requires_existing_namespace");
+  }
+  const deployments = kubectlJson(["-n", parentNamespace, "get", "deployments", "-o", "json"]);
+  for (const name of RECOVERY_CONSUMERS) {
+    const matches = deployments?.items?.filter(item => item.metadata?.name === name);
+    if (matches?.length !== 1 || matches[0].spec?.replicas !== 1 ||
+        matches[0].status?.readyReplicas !== 1 || matches[0].metadata?.deletionTimestamp) {
+      throw new Error("client_image_only_requires_all_consumers_active");
+    }
+  }
+  if (!legacyActiveCompatibility) {
+    const live = liveState();
+    if (live.activationPhase !== "active" || live.recoveryPhase !== "active") {
+      throw new Error("client_image_only_cannot_transition_control_plane");
+    }
+  }
+}
+
+function prepareClientImageOnlyPatch() {
+  if (operationLeaseGuard) assertOperationLeaseHeld();
+  else if (!clientImageOnlyCheck) throw new Error("client_image_only_requires_operation_lease");
+  requireClientImageOnlyActiveRuntime();
+  const live = [], proposed = [];
+  for (const resource of plan.resources) {
+    const input = JSON.stringify(resource);
+    // These outputs may contain Secrets: capture in memory, never inherit stderr
+    // or report subprocess errors/objects. Server dry-run is not a persistent write.
+    for (const [args, sink] of [
+      [["get", "-f", "-", "-o", "json"], live],
+      [["apply", "--dry-run=server", "-f", "-", "-o", "json"], proposed]
+    ]) {
+      const result = runLeaseGuardedRead(() => spawnSync("kubectl",
+        contextArgs(["--request-timeout=30s", ...args]),
+        { input, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: kubectlReadTimeoutMs }));
+      if (result.status !== 0) throw new Error("client_image_only_inventory_unavailable");
+      try {
+        const parsed = JSON.parse(result.stdout);
+        // `kubectl get -f -` returns a v1 List even for one stdin object.
+        // Do not silently discard missing or additional inventory entries.
+        if (parsed?.apiVersion === "v1" && parsed.kind === "List") {
+          if (!Array.isArray(parsed.items) || parsed.items.length !== 1) {
+            throw new Error("singleton_inventory_required");
+          }
+          sink.push(parsed.items[0]);
+        } else sink.push(parsed);
+      }
+      catch { throw new Error("client_image_only_inventory_invalid"); }
+    }
+  }
+  try {
+    return verifyClientImageOnly({ resources: plan.resources, live, proposed, namespace: parentNamespace,
+      fromImage: process.env.HCCE_CLIENT_FROM_IMAGE, toImage: process.env.HCCE_CLIENT_TO_IMAGE });
+  } catch (error) {
+    if (Number.isInteger(error.resourceIndex) && Array.isArray(error.sections)) {
+      throw new Error(`client_image_only_boundary_rejected:resource_index=${error.resourceIndex}:sections=${error.sections.join(',')}`);
+    }
+    if (error.boundaryReason) throw new Error(`client_image_only_boundary_rejected:${error.boundaryReason}`);
+    throw error;
+  }
 }
 
 function expectedDeployments() {
@@ -3344,6 +3447,8 @@ async function applyActive(mode) {
 
 async function applyUnderOperationLease(commandMode) {
   assertOperationLeaseHeld();
+  // Reject scope drift before enabling emergency refencing or any apply effect.
+  if (clientImageOnly) prepareClientImageOnlyPatch();
   if (legacyAbsentGreenfield) {
     if (commandMode !== "apply") throw new Error("legacy_absent_greenfield_apply_only");
     if (recoveryLockExists()) throw new Error("legacy_absent_greenfield_recovery_lock_present");
@@ -3406,8 +3511,11 @@ async function applyUnderOperationLease(commandMode) {
 
 async function main() {
   const commandMode = requestedCommandMode(process.argv.slice(2));
+  if (process.env.HCCE_APPLY_PROFILE && !clientImageOnly) throw new Error("unknown_apply_profile");
+  if (clientImageOnly && commandMode !== "apply") throw new Error("client_image_only_apply_required");
   verifyManifestBeforeClusterMutation();
   requirePinnedKubectlContext();
+  requireClientImageOnlyActiveRuntime();
   if (legacyAbsentGreenfield) {
     verifyLegacyAbsentGreenfieldPreflight(commandMode);
     cutoverPreflightClassification = "legacy-absent-greenfield";
@@ -3418,6 +3526,11 @@ async function main() {
     verifyEmergencyRefencePreflight();
   } else {
     verifyPristineLegacyCutoverPreflight();
+  }
+  if (clientImageOnlyCheck) {
+    prepareClientImageOnlyPatch();
+    console.log("client image-only dry-run passed; no Lease acquired and no persistent mutation; apply revalidates under Lease");
+    return;
   }
   const foundationalNamespace = await ensureFoundationalNamespaceForLease();
   if (
