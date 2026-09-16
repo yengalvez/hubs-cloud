@@ -181,6 +181,22 @@ test("existing permanent fences survive reconciliation", async () => {
   assert.equal(api.calls.some(call => call[0] === "delete"), false);
 });
 
+test("terminating intents remain pending without repeat DELETE and armed ones still require a fence", async () => {
+  for (const state of ["unarmed", "armed"]) {
+    const intent = guard("intent", state);
+    intent.metadata.deletionTimestamp = "2026-09-16T10:00:00Z";
+    intent.metadata.deletionGracePeriodSeconds = 0;
+    const api = fakeApi([intent]);
+    api.sleep = async () => { api.pods.delete(intent.metadata.name); };
+    const inventory = completeRunnerNamespaceInventory(await api.listPods());
+    assert.equal(inventory.intents.get(identity.name).record.terminating, true);
+    const result = await reconcileRunnerNamespace(api, { retryDelayMs: 0 });
+    assert.equal(result.intents, 0);
+    assert.equal(result.fences, state === "armed" ? 1 : 0);
+    assert.equal(api.calls.some(call => call[0] === "delete"), false);
+  }
+});
+
 test("unknown, malformed, paginated, and partial inventories fail closed", async t => {
   const cases = [
     {

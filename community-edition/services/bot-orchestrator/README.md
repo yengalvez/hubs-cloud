@@ -26,6 +26,14 @@ envelope before exact Pod validation; conflicting explicit types, pagination,
 unknown Pods and altered guard contracts still fail closed. Tests use the raw
 API shape rather than the enriched `kubectl get -o json` representation.
 
+An exact intent can remain observable briefly after its zero-grace DELETE.
+Cleanup-only readers accept that pending state without declaring absence or
+reissuing DELETE; the live runner remains usable. Creation readers remain
+strict and the final arm step rejects terminating reservations. An ambiguous
+armed intent still requires a permanent fence; terminating fences are never
+valid stop proof. Unarmed cleanup uses both UID and resourceVersion so a
+concurrent arm cannot be removed from a stale observation.
+
 ## Private image-pull credential
 
 The generated `bot-images-pull` Secret is required for both digest-pinned bot

@@ -148,6 +148,26 @@ class AmbiguousCreateApi extends FakeApi {
   }
 }
 
+class DelayedIntentDeleteApi extends FakeApi {
+  async request(method, requestPath, body, options) {
+    const name = decodeURIComponent(new URL(requestPath, "https://kubernetes.invalid").pathname.split("/").at(-1));
+    const pod = this.pods.get(name);
+    if (method === "DELETE" && pod?.metadata?.labels?.app === "bot-runner-intent") {
+      this.calls.push({ method, path: requestPath, body, options });
+      if (body?.preconditions?.uid !== pod.metadata.uid ||
+          (body?.preconditions?.resourceVersion !== undefined &&
+           body.preconditions.resourceVersion !== pod.metadata.resourceVersion)) {
+        throw Object.assign(new Error("uid precondition failed"), { status: 409 });
+      }
+      pod.metadata.deletionTimestamp = "2026-09-16T10:00:00Z";
+      pod.metadata.deletionGracePeriodSeconds = 0;
+      pod.metadata.resourceVersion = String(++this.resourceVersion);
+      return structuredClone(pod);
+    }
+    return super.request(method, requestPath, body, options);
+  }
+}
+
 function manager(api = new FakeApi(), overrides = {}) {
   const podManager = new KubernetesRunnerManager({
     api,
@@ -188,6 +208,103 @@ test("typed PodList restores omitted TypeMeta without mutating entries or accept
   for (const invalidEnvelope of [{ apiVersion: "v2" }, { apiVersion: undefined }, { kind: "List" }]) {
     assert.throws(() => requireCompletePodList({ ...list, ...invalidEnvelope }), /runner_pod_list_invalid/);
   }
+});
+
+test("a confirmed runner survives an exact intent whose zero-grace deletion is still observable", async () => {
+  const api = new DelayedIntentDeleteApi();
+  const podManager = manager(api);
+  const errors = [];
+  podManager.on("fatal", error => errors.push(error.message));
+  const handle = podManager.create("delayed-intent-deletion", generation);
+  handle.on("error", error => errors.push(error.message));
+  await new Promise(resolve => handle.once("spawn", resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(errors, [], "a deleting reservation is not a broken runner contract");
+  const intent = podManager.createIntents.get(handle.name);
+  assert.ok(intent, "keep the intent until absence is actually observed");
+  assert.equal(await podManager.deleteIntent(intent), false);
+  await podManager.reconcile();
+  assert.equal(handle.podReady, true);
+  assert.equal(podManager.guardCapacitySnapshot().intents, 1);
+  api.pods.delete(intent.intentName);
+  await podManager.reconcile();
+  assert.equal(podManager.createIntents.has(handle.name), false);
+  assert.equal(handle.podReady, true);
+  assert.deepEqual(errors, []);
+});
+
+test("terminating intents are observation-only and fences retain the strict contract", async () => {
+  const api = new FakeApi();
+  const podManager = manager(api);
+  const identity = podManager.identity("terminating-contract", generation);
+  const intent = await api.request("POST", podManager.createPath(), podManager.guardPodDocument(identity, "intent"));
+  intent.metadata.deletionTimestamp = "2026-09-16T10:00:00Z";
+  intent.metadata.deletionGracePeriodSeconds = 0;
+  const original = structuredClone(intent);
+  assert.throws(() => podManager.guardRecordFromPod(intent, "intent"), /runner_guard_contract_invalid/);
+  assert.equal(podManager.guardRecordFromPod(intent, "intent", { allowTerminatingIntent: true }).terminating, true);
+  assert.deepEqual(intent, original);
+  for (const mutate of [
+    pod => { pod.metadata.deletionTimestamp = "invalid"; },
+    pod => { pod.metadata.deletionGracePeriodSeconds = 1; },
+    pod => { pod.metadata.finalizers = ["unexpected"]; },
+    pod => { delete pod.metadata.deletionTimestamp; },
+    pod => { pod.spec.containers[0].command = ["/bin/sh"]; }
+  ]) {
+    const invalid = structuredClone(intent);
+    mutate(invalid);
+    assert.throws(() => podManager.guardRecordFromPod(invalid, "intent", { allowTerminatingIntent: true }), /runner_guard_contract_invalid/);
+  }
+  const fence = await api.request("POST", podManager.createPath(), podManager.guardPodDocument(identity, "fence"));
+  fence.metadata.deletionTimestamp = intent.metadata.deletionTimestamp;
+  fence.metadata.deletionGracePeriodSeconds = 0;
+  assert.throws(() => podManager.guardRecordFromPod(fence, "fence", { allowTerminatingIntent: true }), /runner_guard_contract_invalid/);
+});
+
+test("an intent terminating before the final arm emits neither CAS nor runner POST", async () => {
+  class TerminatingBeforeArmApi extends FakeApi {
+    async request(method, requestPath, body, options) {
+      if (method === "GET" && new URL(requestPath, "https://kubernetes.invalid").pathname.endsWith("/pods")) {
+        for (const pod of this.pods.values()) {
+          if (pod.metadata.labels.app === "bot-runner-intent") {
+            pod.metadata.deletionTimestamp = "2026-09-16T10:00:00Z";
+            pod.metadata.deletionGracePeriodSeconds = 0;
+          }
+        }
+      }
+      return super.request(method, requestPath, body, options);
+    }
+  }
+  const api = new TerminatingBeforeArmApi();
+  const podManager = manager(api);
+  const fatal = [];
+  podManager.on("fatal", error => fatal.push(error.message));
+  const handle = podManager.create("terminating-before-arm", generation);
+  handle.on("error", () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(fatal, []);
+  assert.equal(api.calls.some(call => call.method === "PATCH"), false);
+  assert.equal(api.calls.some(call => call.method === "POST" && call.body?.metadata?.labels?.app === "bot-runner"), false);
+  assert.equal(api.calls.some(call => call.method === "DELETE"), false);
+  assert.equal(handle.deleteRequested, true);
+});
+
+test("startup still fences an armed terminating intent and does not reissue its DELETE", async () => {
+  const api = new FakeApi();
+  const podManager = manager(api, { sleep: async () => {
+    for (const [name, pod] of api.pods) {
+      if (pod.metadata.labels.app === "bot-runner-intent" && pod.metadata.deletionTimestamp) api.pods.delete(name);
+    }
+  } });
+  const identity = podManager.identity("terminating-armed-orphan", generation);
+  await api.request("POST", podManager.createPath(), podManager.guardPodDocument(identity, "intent"));
+  const intent = api.pods.get(`bot-intent-${identity.name}`);
+  intent.metadata.annotations["yenhubs.org/intent-state"] = "armed";
+  intent.metadata.deletionTimestamp = "2026-09-16T10:00:00Z";
+  intent.metadata.deletionGracePeriodSeconds = 0;
+  await podManager.cleanupOrphans();
+  assert.equal(api.pods.get(identity.name).metadata.labels.app, "bot-runner-fence");
+  assert.equal(api.calls.some(call => call.method === "DELETE" && call.path.includes("bot-intent-")), false);
 });
 
 test("creates one hardened, bounded, room-hashed runner Pod without parent secrets", async () => {

@@ -16,7 +16,11 @@ function classifyRunnerNamespacePod(pod) {
       return { type: "fence", record: exactGuardRecordFromPod(pod, "fence"), pod };
     }
     if (app === INTENT_APP_LABEL) {
-      return { type: "intent", record: exactGuardRecordFromPod(pod, "intent"), pod };
+      return {
+        type: "intent",
+        record: exactGuardRecordFromPod(pod, "intent", RUNNER_NAMESPACE, { allowTerminatingIntent: true }),
+        pod
+      };
     }
     if (app === RUNNER_APP_LABEL) {
       return { type: "runner", record: exactManagedRunnerRecordFromPod(pod), pod };
@@ -105,6 +109,7 @@ async function reconcileRunnerNamespace(
     const protectedNames = new Set(inventory.fences.keys());
     for (const { record, pod } of inventory.intents.values()) {
       if (record.state === "unarmed") {
+        if (record.terminating) continue;
         try {
           await api.deletePodByUid(pod, { requireResourceVersion: true });
         } catch (error) {
@@ -116,6 +121,7 @@ async function reconcileRunnerNamespace(
       }
       const fence = await ensurePermanentFence(record, api, { retryDelayMs });
       protectedNames.add(fence.record.name);
+      if (record.terminating) continue;
       try {
         await api.deletePodByUid(pod, { requireResourceVersion: true });
       } catch (error) {

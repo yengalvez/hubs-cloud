@@ -682,7 +682,7 @@ class KubernetesRunnerManager extends EventEmitter {
     };
   }
 
-  guardRecordFromPod(pod, expectedType = null) {
+  guardRecordFromPod(pod, expectedType = null, { allowTerminatingIntent = false } = {}) {
     const labels = pod?.metadata?.labels;
     const app = labels?.app;
     const type = app === INTENT_APP_LABEL
@@ -706,10 +706,26 @@ class KubernetesRunnerManager extends EventEmitter {
       resourceVersion: pod?.metadata?.resourceVersion,
       state: type === "intent" ? pod?.metadata?.annotations?.[INTENT_STATE_ANNOTATION] : "fenced"
     };
-    if (!this.guardPodMatchesRecord(pod, record, type)) {
+    // DELETE can succeed before the API stops returning the same inert Pod.
+    // This is observation-only: creation readers remain strict, and a fence
+    // which is being deleted can never establish durable stop proof.
+    const timestamp = pod?.metadata?.deletionTimestamp;
+    const terminating = allowTerminatingIntent && type === "intent" &&
+      typeof timestamp === "string" &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(timestamp) &&
+      Number.isFinite(Date.parse(timestamp)) &&
+      (!Object.hasOwn(pod.metadata, "deletionGracePeriodSeconds") ||
+        pod.metadata.deletionGracePeriodSeconds === 0);
+    let observed = pod;
+    if (terminating) {
+      observed = { ...pod, metadata: { ...pod.metadata } };
+      delete observed.metadata.deletionTimestamp;
+      delete observed.metadata.deletionGracePeriodSeconds;
+    }
+    if (!this.guardPodMatchesRecord(observed, record, type)) {
       throw new Error("runner_guard_contract_invalid");
     }
-    return record;
+    return { ...record, terminating };
   }
 
   guardPodMatchesRecord(pod, record, type) {
@@ -904,6 +920,17 @@ class KubernetesRunnerManager extends EventEmitter {
       this.failHandleConfirmedAbsent(handle, "runner_intent_reservation_unverifiable");
       return;
     }
+    if (armedIntent.terminating) {
+      // An observable reservation is not necessarily usable authorization.
+      // Never arm or POST from a reservation whose deletion has started.
+      if (armedIntent.state === "armed") {
+        Object.assign(intent, { resourceVersion: armedIntent.resourceVersion, state: "armed", runnerPostIssued: true });
+        await this.ensureFence(intent);
+      } else {
+        await this.abandonUnarmedIntent(handle, intent, "runner_intent_terminating_before_arm");
+      }
+      return;
+    }
     if (armedGuardCount > MAX_GUARD_START_COUNT) {
       await this.abandonUnarmedIntent(handle, intent, "runner_guard_capacity_reserved");
       return;
@@ -999,38 +1026,38 @@ class KubernetesRunnerManager extends EventEmitter {
 
   async deleteIntent(intent) {
     if (!intent?.uid) return false;
-    try {
-      await this.deletePodByUid(intent.intentName, intent.uid, 0, intent.resourceVersion);
-    } catch (error) {
-      if (error?.status === 409) {
-        try {
-          const current = this.guardRecordFromPod(
-            await this.api.request("GET", this.podsPath(`/${encodePathSegment(intent.intentName)}`)),
-            "intent"
-          );
-          if (!this.guardIdentityMatches(current, intent) || current.uid !== intent.uid) {
-            throw new Error("runner_intent_uid_replaced");
-          }
-          intent.resourceVersion = current.resourceVersion;
-          intent.state = current.state;
-          return false;
-        } catch (readError) {
-          if (readError?.status !== 404) throw readError;
-          this.createIntents.delete(intent.name);
-          return true;
-        }
-      }
-      // A lost DELETE response is ambiguous. The exact GET below, rather than
-      // the transport outcome, decides whether the UID is still present.
-    }
-    try {
-      const remaining = this.guardRecordFromPod(
+    const observe = async () => {
+      const current = this.guardRecordFromPod(
         await this.api.request("GET", this.podsPath(`/${encodePathSegment(intent.intentName)}`)),
-        "intent"
+        "intent",
+        { allowTerminatingIntent: true }
       );
-      if (!this.guardIdentityMatches(remaining, intent) || remaining.uid !== intent.uid) {
+      if (!this.guardIdentityMatches(current, intent) || current.uid !== intent.uid) {
         throw new Error("runner_intent_uid_replaced");
       }
+      Object.assign(intent, {
+        resourceVersion: current.resourceVersion,
+        state: current.state,
+        terminating: current.terminating
+      });
+      return current;
+    };
+    try {
+      const current = await observe();
+      if (current.terminating) return false;
+      if (current.state === "armed" && !intent.runnerCreateConfirmed && !this.fences.has(intent.name)) {
+        // A newer armed observation requires fencing, not a blind retry of
+        // the earlier unarmed deletion with its refreshed resourceVersion.
+        intent.runnerPostIssued = true;
+        return false;
+      }
+      try {
+        await this.deletePodByUid(intent.intentName, intent.uid, 0, current.resourceVersion);
+      } catch (_error) {
+        // Only the exact GET resolves a lost response or CAS conflict. Never
+        // issue a second DELETE from a changed observation in this operation.
+      }
+      await observe();
       return false;
     } catch (error) {
       if (error?.status !== 404) throw error;
@@ -1328,7 +1355,7 @@ class KubernetesRunnerManager extends EventEmitter {
       if (app !== INTENT_APP_LABEL && app !== FENCE_APP_LABEL) {
         throw new Error("runner_managed_pod_type_invalid");
       }
-      const record = this.guardRecordFromPod(pod);
+      const record = this.guardRecordFromPod(pod, null, { allowTerminatingIntent: true });
       const collection = record.type === "intent" ? intents : fences;
       if (collection.has(record.name)) throw new Error("runner_guard_identity_ambiguous");
       collection.set(record.name, { ...record, pod });
@@ -1732,7 +1759,13 @@ class KubernetesRunnerManager extends EventEmitter {
         continue;
       }
       if (observedIntent.state === "unarmed") {
-        await this.deletePodByUid(observedIntent.intentName, observedIntent.uid, 0);
+        if (!observedIntent.terminating) {
+          try {
+            await this.deletePodByUid(observedIntent.intentName, observedIntent.uid, 0, observedIntent.resourceVersion);
+          } catch (error) {
+            if (error?.status !== 409) throw error;
+          }
+        }
       } else {
         await this.ensureFence({ ...observedIntent, runnerPostIssued: true });
       }
@@ -1798,7 +1831,13 @@ class KubernetesRunnerManager extends EventEmitter {
       let allIntentsProtected = true;
       for (const intent of inventory.intents.values()) {
         if (intent.state === "unarmed") {
-          await this.deletePodByUid(intent.intentName, intent.uid, 0);
+          if (!intent.terminating) {
+            try {
+              await this.deletePodByUid(intent.intentName, intent.uid, 0, intent.resourceVersion);
+            } catch (error) {
+              if (error?.status !== 409) throw error;
+            }
+          }
         } else {
           await this.ensureFence({ ...intent, runnerPostIssued: true });
         }
@@ -1845,10 +1884,10 @@ class KubernetesRunnerManager extends EventEmitter {
   }
 }
 
-function exactGuardRecordFromPod(pod, expectedType, namespace = RUNNER_NAMESPACE) {
+function exactGuardRecordFromPod(pod, expectedType, namespace = RUNNER_NAMESPACE, options = {}) {
   const verifier = Object.create(KubernetesRunnerManager.prototype);
   verifier.namespace = namespace;
-  return verifier.guardRecordFromPod(pod, expectedType);
+  return verifier.guardRecordFromPod(pod, expectedType, options);
 }
 
 function exactManagedRunnerRecordFromPod(pod, namespace = RUNNER_NAMESPACE) {
