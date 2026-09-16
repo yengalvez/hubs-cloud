@@ -1463,6 +1463,15 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
           }
         ],
         ports: [{ protocol: "TCP", port: 443 }]
+      },
+      {
+        to: [{
+          namespaceSelector: {
+            matchLabels: { "kubernetes.io/metadata.name": parentNamespace }
+          },
+          podSelector: { matchLabels: { app: "haproxy" } }
+        }],
+        ports: [{ protocol: "TCP", port: 4443 }]
       }
     ]
   };
@@ -1478,7 +1487,7 @@ function verifyBotRunnerNetworkPolicy(policy, parentNamespace = "$Namespace") {
     canonicalizeUnorderedArrays(expected)
   )
     ? []
-    : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, and public-443 egress contract"];
+    : ["NetworkPolicy/bot-runner-egress must exactly match the audited parent, DNS, public-443, and same-namespace HAProxy-4443 egress contract"];
 }
 
 const BOT_RUNNER_ADMISSION_TEMPLATE_SHA256 = "32fdb20e835772493257ecc221797b06e749d1b4189b0dfd89db1e9932630f24";

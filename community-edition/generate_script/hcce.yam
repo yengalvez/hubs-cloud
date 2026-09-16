@@ -2962,6 +2962,18 @@ spec:
     ports:
     - protocol: TCP
       port: 443
+  # In-cluster public HTTPS is translated by the LoadBalancer to this exact
+  # HAProxy backend. Cilium evaluates egress after that translation.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: $Namespace
+      podSelector:
+        matchLabels:
+          app: haproxy
+    ports:
+    - protocol: TCP
+      port: 4443
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

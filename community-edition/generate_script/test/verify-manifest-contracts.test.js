@@ -583,6 +583,27 @@ test("keeps exact minimal ServiceAccounts, namespaced Pod RBAC, and runner Netwo
   assert.deepEqual(verifyBotRunnerDefaultDenyNetworkPolicy(defaultDeny), []);
   assert.deepEqual(verifyBotRunnerNetworkPolicy(policy, "$Namespace"), []);
 
+  const hairpin = policy.spec.egress.find(rule => rule.to?.[0]?.podSelector?.matchLabels?.app === "haproxy");
+  assert.deepEqual(hairpin, {
+    to: [{
+      namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "$Namespace" } },
+      podSelector: { matchLabels: { app: "haproxy" } }
+    }],
+    ports: [{ protocol: "TCP", port: 4443 }]
+  });
+  for (const mutate of [
+    rule => { delete rule.to[0].podSelector; },
+    rule => { delete rule.to[0].namespaceSelector; },
+    rule => { rule.to[0].podSelector.matchLabels.app = "reticulum"; },
+    rule => { rule.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] = "other"; },
+    rule => { rule.ports[0].port = 4001; },
+    rule => { rule.ports.push({ protocol: "TCP", port: 8080 }); }
+  ]) {
+    const invalid = clone(policy);
+    mutate(invalid.spec.egress.find(rule => rule.to?.[0]?.podSelector?.matchLabels?.app === "haproxy"));
+    assert.notDeepEqual(verifyBotRunnerNetworkPolicy(invalid, "$Namespace"), []);
+  }
+
   const expandedRole = clone(resources);
   expandedRole
     .find(resource => resource.kind === "Role" &&

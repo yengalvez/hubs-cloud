@@ -15,6 +15,12 @@ credentials and URL suffixes remain forbidden. A cross-component regression
 constructs the client from the actual generated Pod environment. Startup logs
 retain only allowlisted control error codes, never credential or message data.
 
+Runner network isolation also permits only TCP 4443 to `app=haproxy` in the
+parent namespace: the public LoadBalancer translates HTTPS 443 to that backend
+before Cilium evaluates egress. Public-443 alone cannot reach the room from an
+isolated runner. Other private destinations remain denied; TLS and the public
+room hostname are unchanged.
+
 Dispatch `.github/workflows/bot-images-build-push.yml` from an accepted commit
 on `master` to build both images with the same `sha-<commit>` source tag and
 SBOM/provenance attestations. Record their immutable GHCR
