@@ -17,7 +17,8 @@ const {
   PARENT_UID_ANNOTATION,
   ROOM_KEY_LABEL,
   RUNNER_PROTOCOL_LABEL,
-  RUNNER_PROTOCOL_VALUE
+  RUNNER_PROTOCOL_VALUE,
+  requireCompletePodList
 } = require("../kubernetes-runner-manager");
 const {
   createRunnerGenerationToken,
@@ -71,7 +72,12 @@ class FakeApi {
         apiVersion: "v1",
         kind: "PodList",
         metadata: { resourceVersion: String(++this.resourceVersion) },
-        items: items.map(pod => structuredClone(pod))
+        items: items.map(pod => {
+          const item = structuredClone(pod);
+          delete item.apiVersion;
+          delete item.kind;
+          return item;
+        })
       };
     }
     if (method === "PATCH") {
@@ -166,6 +172,23 @@ function manager(api = new FakeApi(), overrides = {}) {
   });
   return podManager;
 }
+
+test("typed PodList restores omitted TypeMeta without mutating entries or accepting conflicts", () => {
+  const item = { metadata: { name: "example" }, spec: { containers: [] } };
+  const list = { apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "42" }, items: [item] };
+  const result = requireCompletePodList(list);
+  assert.deepEqual(result.items, [{ ...item, apiVersion: "v1", kind: "Pod" }]);
+  assert.equal(result.resourceVersion, "42");
+  assert.equal(Object.hasOwn(item, "apiVersion"), false);
+  assert.equal(Object.hasOwn(item, "kind"), false);
+  assert.deepEqual(requireCompletePodList({ ...list, items: result.items }), result);
+  for (const invalid of [null, [], { kind: "Secret" }, { apiVersion: "v2" }, { kind: null }]) {
+    assert.throws(() => requireCompletePodList({ ...list, items: [invalid] }), /runner_pod_list_item_invalid/);
+  }
+  for (const invalidEnvelope of [{ apiVersion: "v2" }, { apiVersion: undefined }, { kind: "List" }]) {
+    assert.throws(() => requireCompletePodList({ ...list, ...invalidEnvelope }), /runner_pod_list_invalid/);
+  }
+});
 
 test("creates one hardened, bounded, room-hashed runner Pod without parent secrets", async () => {
   const api = new FakeApi();

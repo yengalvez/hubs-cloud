@@ -215,6 +215,7 @@ function requirePodList(response) {
     !response ||
     typeof response !== "object" ||
     Array.isArray(response) ||
+    response.apiVersion !== "v1" ||
     response.kind !== "PodList" ||
     !Array.isArray(response.items)
   ) {
@@ -239,7 +240,20 @@ function requireCompletePodList(response) {
   ) {
     throw new Error("runner_pod_list_incomplete");
   }
-  return { items, resourceVersion: metadata.resourceVersion };
+  // Kubernetes omits TypeMeta on entries in a typed LIST. Derive only those
+  // two fields from the verified v1/PodList envelope; never overwrite an
+  // explicitly conflicting type or relax the per-Pod contract checks.
+  const typedItems = items.map(pod => {
+    if (
+      !pod || typeof pod !== "object" || Array.isArray(pod) ||
+      (Object.hasOwn(pod, "apiVersion") && pod.apiVersion !== "v1") ||
+      (Object.hasOwn(pod, "kind") && pod.kind !== "Pod")
+    ) {
+      throw new Error("runner_pod_list_item_invalid");
+    }
+    return { ...pod, apiVersion: "v1", kind: "Pod" };
+  });
+  return { items: typedItems, resourceVersion: metadata.resourceVersion };
 }
 
 function podIsTerminal(pod) {

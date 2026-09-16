@@ -20,6 +20,12 @@ parent final stage contains Express and its transitive dependencies; the runner
 final stage contains only the ghost networking/navigation dependencies. CI
 builds both Dockerfiles independently before changes can merge.
 
+Kubernetes typed `v1/PodList` responses omit `apiVersion` and `kind` on their
+entries. The complete-list reader derives only this TypeMeta from the verified
+envelope before exact Pod validation; conflicting explicit types, pagination,
+unknown Pods and altered guard contracts still fail closed. Tests use the raw
+API shape rather than the enriched `kubectl get -o json` representation.
+
 ## Private image-pull credential
 
 The generated `bot-images-pull` Secret is required for both digest-pinned bot

@@ -186,7 +186,7 @@ test("unknown, malformed, paginated, and partial inventories fail closed", async
     {
       name: "unknown",
       list: {
-        kind: "PodList", metadata: { resourceVersion: "1" },
+        apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1" },
         items: [{ metadata: { name: "unknown", labels: { app: "other" } } }]
       },
       error: /runner_namespace_unknown_pod/
@@ -194,20 +194,20 @@ test("unknown, malformed, paginated, and partial inventories fail closed", async
     {
       name: "malformed",
       list: {
-        kind: "PodList", metadata: { resourceVersion: "1" },
+        apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1" },
         items: [{ ...guard("fence"), spec: { containers: [] } }]
       },
       error: /runner_namespace_pod_contract_invalid/
     },
     {
       name: "paginated",
-      list: { kind: "PodList", metadata: { resourceVersion: "1", continue: "token" }, items: [] },
+      list: { apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1", continue: "token" }, items: [] },
       error: /runner_pod_list_incomplete/
     },
     {
       name: "remaining",
       list: {
-        kind: "PodList", metadata: { resourceVersion: "1", remainingItemCount: 1 }, items: []
+        apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1", remainingItemCount: 1 }, items: []
       },
       error: /runner_pod_list_incomplete/
     }
@@ -233,6 +233,7 @@ test("complete inventory rejects duplicate guard identities", () => {
   const first = guard("fence", "fenced", "one", "1");
   const second = guard("fence", "fenced", "two", "2");
   assert.throws(() => completeRunnerNamespaceInventory({
+    apiVersion: "v1",
     kind: "PodList",
     metadata: { resourceVersion: "3" },
     items: [first, second]

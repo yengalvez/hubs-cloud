@@ -302,9 +302,9 @@ test("the live pristine gate requires legacy annotations, zero control plane, ze
     ...exact, isolatedResources: []
   }), /isolated_control_plane_present/);
   for (const parentPodList of [
-    { kind: "PodList", items: [] },
-    { kind: "PodList", metadata: { resourceVersion: "1", continue: "next" }, items: [] },
-    { kind: "PodList", metadata: { resourceVersion: "1", remainingItemCount: 1 }, items: [] }
+    { apiVersion: "v1", kind: "PodList", items: [] },
+    { apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1", continue: "next" }, items: [] },
+    { apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "1", remainingItemCount: 1 }, items: [] }
   ]) {
     assert.throws(() => verifyPristineLegacyCutoverGate({
       ...exact, parentPodList
