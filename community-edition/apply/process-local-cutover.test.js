@@ -24,6 +24,7 @@ const {
 const NOW = Date.parse("2026-07-19T12:00:00.000Z");
 const CONTEXT = "do-ams3-yenhubs";
 const NAMESPACE = "hcce";
+const { COLD_REBIND_CUTOVER_PROFILE, coldRebindResourceDigest } = require("./cold-rebind-cutover");
 
 function unsignedAttestation(overrides = {}) {
   return {
@@ -130,6 +131,64 @@ function exactGateInput(key, overrides = {}) {
     ...overrides
   };
 }
+
+function coldRebindInput() {
+  const key = crypto.randomBytes(32);
+  const input = exactGateInput(key);
+  input.liveNamespace.metadata.annotations = { "yenhubs.org/target-profile": "cold-rebind-legacy-active-v1" };
+  input.targetManifestSha256 = "a".repeat(64);
+  input.baselineManifestSha256 = "b".repeat(64);
+  input.baselineResourceSha256 = "c".repeat(64);
+  input.attestation = {
+    schemaVersion: 1, profileId: COLD_REBIND_CUTOVER_PROFILE, expectedKubeContext: CONTEXT,
+    namespace: NAMESPACE, namespaceUid: "namespace-uid", capturedAt: "2026-07-19T11:59:00.000Z",
+    checkpointManifestSha256: "d".repeat(64), targetManifestSha256: input.targetManifestSha256,
+    baselineManifestSha256: input.baselineManifestSha256, baselineResourceSha256: input.baselineResourceSha256,
+    botOrchestratorDeployment: { name: "bot-orchestrator", uid: "deployment-uid", resourceVersion: "100" }
+  };
+  input.attestation.hmacSha256 = crypto.createHmac("sha256", key).update(canonicalJson(input.attestation)).digest("hex");
+  return input;
+}
+
+test("cold-rebind has an honest separate profile and retains the pristine isolation gate", () => {
+  assert.equal(verifyPristineLegacyCutoverGate(coldRebindInput()).deploymentUid, "deployment-uid");
+  for (const change of [
+    input => { input.targetManifestSha256 = "e".repeat(64); },
+    input => { input.baselineManifestSha256 = "e".repeat(64); },
+    input => { input.baselineResourceSha256 = "e".repeat(64); },
+    input => { input.liveNamespace.metadata.uid = "replaced"; },
+    input => { input.liveDeployment.metadata.resourceVersion = "101"; },
+    input => { input.now = () => NOW + 300001; },
+    input => { input.authority.runner.create = true; },
+    input => { input.runnerNamespace = {}; },
+    input => { input.key = crypto.randomBytes(32); },
+    input => { input.attestation.checkpointManifestSha256 = "e".repeat(64); }
+  ]) {
+    const input = coldRebindInput(); change(input);
+    assert.throws(() => verifyPristineLegacyCutoverGate(input));
+  }
+});
+
+test("cold-rebind inventory hash binds credentials, UIDs and specs but not status churn", () => {
+  const list = { kind: "List", items: Array.from({ length: 44 }, (_, i) => ({
+    apiVersion: i < 12 ? "apps/v1" : "v1", kind: i < 12 ? "Deployment" : "Secret",
+    metadata: { name: `resource-${i}`, namespace: NAMESPACE, uid: `uid-${i}`, resourceVersion: "1" },
+    ...(i < 12 ? { spec: { replicas: 1 } } : { data: { test: "ZmFrZQ==" } })
+  })) };
+  const original = coldRebindResourceDigest(list);
+  list.items[0].status = { availableReplicas: 1 };
+  list.items[0].metadata.resourceVersion = "2";
+  assert.equal(coldRebindResourceDigest(list), original);
+  for (const change of [
+    copy => { copy.items[12].data.test = "Y2hhbmdlZA=="; },
+    copy => { copy.items[0].spec.replicas = 0; },
+    copy => { copy.items[0].metadata.uid = "replaced"; }
+  ]) {
+    const copy = structuredClone(list); change(copy);
+    assert.notEqual(coldRebindResourceDigest(copy), original);
+  }
+  assert.throws(() => coldRebindResourceDigest({ ...list, items: list.items.slice(1) }));
+});
 
 test("authenticated pristine cutover receipt binds the AUD065 report and exact live identities", () => {
   const key = crypto.randomBytes(32);

@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const { COLD_REBIND_CUTOVER_PROFILE, verifyColdRebindCutoverAttestation } = require("./cold-rebind-cutover");
 
 const {
   requireCompletePodList
@@ -123,6 +124,12 @@ function readPrivateCutoverKey(keyPath) {
   });
 }
 
+function readPrivateCutoverBaseline(baselinePath) {
+  return readPrivateBytes(baselinePath, {
+    minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, label: "cold_rebind_baseline"
+  });
+}
+
 function verifyAttestationHmac(attestation, key) {
   if (!Buffer.isBuffer(key) || key.length < MIN_KEY_BYTES || key.length > MAX_KEY_BYTES) {
     throw new Error("process_local_cutover_key_invalid");
@@ -141,8 +148,12 @@ function verifyAttestationHmac(attestation, key) {
 
 function verifyProcessLocalCutoverAttestation(
   attestation,
-  { key, namespace, expectedKubeContext, liveNamespace, liveDeployment, now = () => Date.now() }
+  options
 ) {
+  if (attestation?.profileId === COLD_REBIND_CUTOVER_PROFILE) {
+    return verifyColdRebindCutoverAttestation(attestation, options, verifyAttestationHmac, activeCutoverNamespace);
+  }
+  const { key, namespace, expectedKubeContext, liveNamespace, liveDeployment, now = () => Date.now() } = options;
   if (!exactKeys(attestation, [
     "schemaVersion",
     "profileId",
@@ -428,6 +439,9 @@ function verifyPristineLegacyCutoverGate({
   isolatedResources,
   parentPodList,
   authority,
+  targetManifestSha256,
+  baselineManifestSha256,
+  baselineResourceSha256,
   now
 }) {
   verifyProcessLocalCutoverAttestation(attestation, {
@@ -436,6 +450,9 @@ function verifyPristineLegacyCutoverGate({
     expectedKubeContext,
     liveNamespace,
     liveDeployment,
+    targetManifestSha256,
+    baselineManifestSha256,
+    baselineResourceSha256,
     now
   });
   const annotations = liveDeployment?.metadata?.annotations || {};
@@ -479,6 +496,7 @@ module.exports = {
   parentPodCanExerciseRunnerAuthority,
   readPrivateCutoverAttestation,
   readPrivateCutoverKey,
+  readPrivateCutoverBaseline,
   verifyAttestationHmac,
   verifyCleanInstallCutoverGate,
   verifyJournalCutoverIsolationGate,

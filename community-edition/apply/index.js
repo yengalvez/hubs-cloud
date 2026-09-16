@@ -25,10 +25,12 @@ const {
   executeCutoverRevalidation,
   readPrivateCutoverAttestation,
   readPrivateCutoverKey,
+  readPrivateCutoverBaseline,
   verifyCleanInstallCutoverGate,
   verifyJournalCutoverIsolationGate,
   verifyPristineLegacyCutoverGate
 } = require("./process-local-cutover");
+const { COLD_REBIND_CUTOVER_PROFILE, coldRebindResourceDigest } = require("./cold-rebind-cutover");
 const {
   CUTOVER_JOURNAL_NAME,
   advanceCutoverJournalTransition,
@@ -843,11 +845,35 @@ function verifyPristineLegacyCutoverEvidence() {
   );
   const key = readPrivateCutoverKey(process.env.PROCESS_LOCAL_CUTOVER_KEY_PATH);
   const evidence = pristineLegacyCutoverLiveEvidence();
+  let coldRebindEvidence = {};
+  if (attestation.profileId === COLD_REBIND_CUTOVER_PROFILE) {
+    const baseline = readPrivateCutoverBaseline(process.env.COLD_REBIND_BASELINE_MANIFEST_PATH);
+    const list = runLeaseGuardedRead(() => {
+      // Recheck the exact preserved baseline here as well as in the producer.
+      // This runs both before and under the operation Lease; an intervening
+      // credential/configuration change must not become an authorized snapshot.
+      const diff = spawnSync("kubectl", contextArgs(["diff", "-f", "-"]), {
+        input: baseline, encoding: "utf8", timeout: kubectlReadTimeoutMs, maxBuffer: 32 * 1024 * 1024
+      });
+      if (diff.status !== 0) throw new Error("cold_rebind_live_baseline_drift");
+      const result = spawnSync("kubectl", contextArgs(["get", "-f", "-", "-o", "json"]), {
+        input: baseline, encoding: "utf8", timeout: kubectlReadTimeoutMs, maxBuffer: 32 * 1024 * 1024
+      });
+      if (result.status !== 0) throw new Error("cold_rebind_inventory_read_failed");
+      return JSON.parse(result.stdout);
+    });
+    coldRebindEvidence = {
+      targetManifestSha256: manifestSha256,
+      baselineManifestSha256: createHash("sha256").update(baseline).digest("hex"),
+      baselineResourceSha256: coldRebindResourceDigest(list)
+    };
+  }
   const result = verifyPristineLegacyCutoverGate({
     attestation,
     key,
     namespace: parentNamespace,
     expectedKubeContext: kubectlContext,
+    ...coldRebindEvidence,
     ...evidence
   });
   cutoverKey = key;

@@ -295,6 +295,22 @@ that a production rollout is executable yet.
 
 ## Compatible rollout and rollback order
 
+### Current cold-rebind baseline
+
+The separate `yenhubs-cold-rebind-runner-cutover-v1` receipt supports a live
+`cold-rebind-legacy-active-v1` installation without pretending it is the
+historical AUD-065 credential-rotation campaign. The root producer is
+`deployment/write-cold-rebind-cutover-attestation.mjs`. It validates the
+generated baseline and target, reverses the audited runner transformation to
+prove preservation of unrelated resources and existing credentials, requires a
+joint rehashed checkpoint bound to the live namespace/PVC, and signs the exact
+baseline inventory plus target manifest. The private baseline path is passed
+as `COLD_REBIND_BASELINE_MANIFEST_PATH`; the existing attestation/key variables
+are unchanged. Apply repeats zero-diff and inventory checks before and under
+the operation Lease. The existing isolation, journal, crash-resume and
+bootstrap/admission/active gates remain mandatory. This profile adds no
+credential-rotation claim and is not a shortcut for an unrelated baseline.
+
 Deploy Reticulum first. The new Reticulum accepts both the legacy runner key
 and generation-token v1, so this is the only compatible transition window.
 Verify Reticulum readiness and a generation-token authentication probe before
