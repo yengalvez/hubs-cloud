@@ -21,6 +21,13 @@ before Cilium evaluates egress. Public-443 alone cannot reach the room from an
 isolated runner. Other private destinations remain denied; TLS and the public
 room hostname are unchanged.
 
+An authenticated runtime status may arrive before kubelet marks the Pod Ready.
+The watchdog allows only the existing bounded startup grace for this first
+readiness observation; public `/ready` stays closed. The manager remembers any
+successful readiness observation, so later readiness loss is not granted a new
+startup window. Disconnects, stale status and the original startup deadline
+still trigger recovery.
+
 Dispatch `.github/workflows/bot-images-build-push.yml` from an accepted commit
 on `master` to build both images with the same `sha-<commit>` source tag and
 SBOM/provenance attestations. Record their immutable GHCR

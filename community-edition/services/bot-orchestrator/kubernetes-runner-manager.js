@@ -316,6 +316,7 @@ class RunnerPodHandle extends EventEmitter {
     this.connected = true;
     this.podUid = null;
     this.podReady = false;
+    this.podReadyObserved = false;
     this.pendingMessage = null;
     this.finished = false;
     this.createSettled = false;
@@ -1095,6 +1096,7 @@ class KubernetesRunnerManager extends EventEmitter {
     }
     handle.podUid = pod.metadata.uid;
     handle.podReady = podIsReady(pod);
+    if (handle.podReady) handle.podReadyObserved = true;
     if (handle.deleteRequested) {
       this.deleteHandle(handle, handle.deleteSignal || "SIGTERM").catch(error => {
         this.reportHandleError(handle, error?.message || "runner_pod_delete_failed");
@@ -1698,6 +1700,7 @@ class KubernetesRunnerManager extends EventEmitter {
     }
 
     handle.podReady = podIsReady(pod);
+    if (handle.podReady) handle.podReadyObserved = true;
     return "active";
   }
 

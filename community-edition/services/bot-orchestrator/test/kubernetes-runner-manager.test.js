@@ -193,6 +193,21 @@ function manager(api = new FakeApi(), overrides = {}) {
   return podManager;
 }
 
+test("Pod readiness history remains true after a previously ready Pod becomes unready", async () => {
+  const api = new FakeApi();
+  const podManager = manager(api);
+  const handle = podManager.create("readiness-observation", generation);
+  handle.on("error", error => { throw error; });
+  assert.equal(handle.podReadyObserved, false);
+  await new Promise(resolve => handle.once("spawn", resolve));
+  assert.equal(handle.podReadyObserved, true);
+  const pod = api.pods.get(handle.name);
+  pod.status.containerStatuses[0].ready = false;
+  await podManager.reconcile();
+  assert.equal(handle.podReady, false);
+  assert.equal(handle.podReadyObserved, true);
+});
+
 test("the real runner Pod environment is accepted by the runner control client", () => {
   const { createRunnerControlClient } = require("../runner-control-client");
   const podManager = manager();

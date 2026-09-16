@@ -1430,6 +1430,34 @@ test("the real readiness endpoint exposes the fail-closed production contract", 
   }
 });
 
+test("initial Kubernetes readiness observation has a bounded startup grace without reporting ready", () => {
+  const now = 100_000;
+  const info = {
+    ...validRunningGhostProcessState(),
+    isolation: "kubernetes_pod",
+    startedAt: now - 4_000,
+    lastRuntimeStatusAt: now,
+    pendingConfigFingerprint: null
+  };
+  Object.assign(info.process, { podUid: "runner-pod", podReady: false, podReadyObserved: false });
+  assert.equal(internals.runnerRecoveryReason(info, now, { startupGraceMs: 60_000 }), null);
+  assert.equal(internals.ghostRunnerProcessStateReason(info), "runner_pod_not_ready");
+  assert.equal(internals.runnerRecoveryReason(info, now + 56_000, { startupGraceMs: 60_000 }), "runner_pod_not_ready");
+  info.process.podReadyObserved = true;
+  assert.equal(internals.runnerRecoveryReason(info, now), "runner_pod_not_ready");
+  delete info.process.podReadyObserved;
+  assert.equal(internals.runnerRecoveryReason(info, now), "runner_pod_not_ready");
+  info.process.podReadyObserved = false;
+  info.startedAt = now + 1;
+  assert.equal(internals.runnerRecoveryReason(info, now), "runner_pod_not_ready");
+  info.startedAt = now - 4_000;
+  info.process.connected = false;
+  assert.equal(internals.runnerRecoveryReason(info, now), "config_channel_disconnected");
+  info.process.connected = true;
+  info.lastRuntimeStatusAt = now - 2_000;
+  assert.equal(internals.runnerRecoveryReason(info, now, { staleRestartMs: 1_000 }), "runtime_status_stale");
+});
+
 test("runner watchdog bounds config, startup, stale-status and terminal spawn failures", () => {
   const now = 100_000;
   const starting = overrides => ({

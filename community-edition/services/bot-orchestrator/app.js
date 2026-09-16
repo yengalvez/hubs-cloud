@@ -2348,7 +2348,14 @@ function runnerRecoveryReason(
 
   if (info.lifecycle === "running") {
     const processStateReason = ghostRunnerProcessStateReason(info);
-    if (processStateReason) return processStateReason;
+    // The authenticated runtime can report before kubelet's readiness probe
+    // and the manager's next observation. Do not kill that initial startup.
+    // Public readiness remains closed; a previously ready Pod gets no grace.
+    const awaitingInitialPodReadiness = processStateReason === "runner_pod_not_ready" &&
+      hasOwnDataProperty(child, "podReadyObserved") && child.podReadyObserved === false &&
+      Number.isFinite(info.startedAt) && info.startedAt > 0 && info.startedAt <= nowMs &&
+      nowMs - info.startedAt < startupGraceMs;
+    if (processStateReason && !awaitingInitialPodReadiness) return processStateReason;
   }
 
   if (
