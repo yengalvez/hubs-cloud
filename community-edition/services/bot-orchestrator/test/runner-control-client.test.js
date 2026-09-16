@@ -1,9 +1,39 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const { createRunnerControlClient } = require("../runner-control-client");
+const { createRunnerControlClient, validControlConfiguration } = require("../runner-control-client");
 
 const generation = "11111111-1111-4111-8111-111111111111";
+
+test("runner control accepts only the local service or its exact namespace-qualified cluster address", () => {
+  const base = {
+    token: "v1.payload.signature",
+    podUid: "22222222-2222-4222-8222-222222222222",
+    processGeneration: generation
+  };
+  for (const controlUrl of [
+    "http://bot-orchestrator:5001",
+    "http://bot-orchestrator.hcce.svc.cluster.local:5001",
+    "http://bot-orchestrator.client-2.svc.cluster.local:5001",
+    `http://bot-orchestrator.${"a".repeat(63)}.svc.cluster.local:5001`
+  ]) assert.equal(validControlConfiguration({ ...base, controlUrl }), true, controlUrl);
+  for (const controlUrl of [
+    undefined, null, {}, "http://other.hcce.svc.cluster.local:5001",
+    "https://bot-orchestrator.hcce.svc.cluster.local:5001",
+    "http://bot-orchestrator.hcce.svc.cluster.local:5002",
+    "http://bot-orchestrator.hcce.svc.cluster.local:5001/",
+    "http://bot-orchestrator.hcce.svc.cluster.local:5001?x=1",
+    "http://bot-orchestrator.hcce.svc.cluster.local:5001#x",
+    "http://user@bot-orchestrator.hcce.svc.cluster.local:5001",
+    "http://bot-orchestrator.hcce.svc.cluster.local.evil:5001",
+    "http://bot-orchestrator.-hcce.svc.cluster.local:5001",
+    "http://bot-orchestrator.hcce-.svc.cluster.local:5001",
+    "http://bot-orchestrator.HCCE.svc.cluster.local:5001",
+    "http://bot-orchestrator.hcce.other.svc.cluster.local:5001",
+    `http://bot-orchestrator.${"a".repeat(64)}.svc.cluster.local:5001`,
+    "http://bot-orchestrator.hcce.svc.cluster.local:5001\n"
+  ]) assert.equal(validControlConfiguration({ ...base, controlUrl }), false, String(controlUrl));
+});
 
 test("runner control sends the scoped credential and Pod UID only in headers", async () => {
   const requests = [];

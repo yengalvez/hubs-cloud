@@ -121,6 +121,9 @@ function redactUrlForLog(value) {
 
 function errorCodeForLog(error) {
   const message = error && typeof error.message === "string" ? error.message : "";
+  if (/^runner_control_(?:configuration_invalid|response_too_large|invalid_json|config_invalid|status_invalid|status_too_large|status_\d{1,3})$/.test(message)) {
+    return message;
+  }
   if (
     /^(?:http_\d{3}|missing_date_header|invalid_date_header|(?:scene|gltf|glb|navmesh|featured|bot_spawn|authenticated)_[a-z0-9_]+|required_navmesh_unavailable)$/.test(
       message

@@ -1014,6 +1014,9 @@ test("scene URL logging strips query parameters and fragments", () => {
   assert.equal(redacted.includes("private"), false);
   assert.equal(internals.redactUrlForLog("not a URL"), "invalid-url");
   assert.equal(internals.errorCodeForLog(new Error("scene_http_403")), "scene_http_403");
+  assert.equal(internals.errorCodeForLog(new Error("runner_control_configuration_invalid")), "runner_control_configuration_invalid");
+  assert.equal(internals.errorCodeForLog(new Error("runner_control_status_403")), "runner_control_status_403");
+  assert.equal(internals.errorCodeForLog(new Error("runner_control_secret_payload")), "Error");
   assert.equal(
     internals.errorCodeForLog(new Error("fetch failed for https://example.invalid/?token=secret")),
     "Error"

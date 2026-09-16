@@ -193,6 +193,20 @@ function manager(api = new FakeApi(), overrides = {}) {
   return podManager;
 }
 
+test("the real runner Pod environment is accepted by the runner control client", () => {
+  const { createRunnerControlClient } = require("../runner-control-client");
+  const podManager = manager();
+  const pod = podManager.podDocument(podManager.identity("control-contract", generation));
+  const env = Object.fromEntries(pod.spec.containers[0].env.map(entry => [entry.name, entry.value]));
+  assert.doesNotThrow(() => createRunnerControlClient({
+    controlUrl: env.RUNNER_CONTROL_URL,
+    token: env.BOT_RUNNER_GENERATION_TOKEN,
+    podUid: "22222222-2222-4222-8222-222222222222",
+    processGeneration: env.RUNNER_PROCESS_GENERATION,
+    fetchImpl: async () => { throw new Error("network_not_expected"); }
+  }));
+});
+
 test("typed PodList restores omitted TypeMeta without mutating entries or accepting conflicts", () => {
   const item = { metadata: { name: "example" }, spec: { containers: [] } };
   const list = { apiVersion: "v1", kind: "PodList", metadata: { resourceVersion: "42" }, items: [item] };

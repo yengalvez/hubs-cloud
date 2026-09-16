@@ -1,7 +1,12 @@
 const MAX_CONTROL_RESPONSE_BYTES = 32 * 1024;
 
 function validControlConfiguration({ controlUrl, token, podUid, processGeneration }) {
-  return controlUrl === "http://bot-orchestrator:5001" &&
+  // Isolated runner Pods use the parent's namespace-qualified Service. Keep
+  // the legacy local address, but never accept another host, port or URL suffix.
+  const validControlUrl = typeof controlUrl === "string" &&
+    (controlUrl === "http://bot-orchestrator:5001" ||
+      /^http:\/\/bot-orchestrator\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.svc\.cluster\.local:5001(?![\s\S])/.test(controlUrl));
+  return validControlUrl &&
     typeof token === "string" &&
     token.startsWith("v1.") &&
     Buffer.byteLength(token, "utf8") <= 2048 &&

@@ -6,7 +6,14 @@ Production runner mode uses two images built from this directory:
   the bot-orchestrator credential and the Kubernetes Pod lifecycle.
 - `Dockerfile.runner` is the ghost data plane. It contains no Chromium and runs
   as UID/GID 10001. It receives one generation-scoped runner credential and no
-  parent, provider, legacy runner or Kubernetes credential.
+parent, provider, legacy runner or Kubernetes credential.
+
+The runner control client accepts the fixed local Service address and the exact
+`http://bot-orchestrator.<namespace>.svc.cluster.local:5001` address emitted by
+the Kubernetes manager. Namespace DNS labels are bounded; other hosts, ports,
+credentials and URL suffixes remain forbidden. A cross-component regression
+constructs the client from the actual generated Pod environment. Startup logs
+retain only allowlisted control error codes, never credential or message data.
 
 Dispatch `.github/workflows/bot-images-build-push.yml` from an accepted commit
 on `master` to build both images with the same `sha-<commit>` source tag and
